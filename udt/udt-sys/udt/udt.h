@@ -1,0 +1,248 @@
+/*****************************************************************************
+Copyright (c) 2001 - 2011, The Board of Trustees of the University of Illinois.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+* Redistributions of source code must retain the above
+  copyright notice, this list of conditions and the
+  following disclaimer.
+
+* Redistributions in binary form must reproduce the
+  above copyright notice, this list of conditions
+  and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+* Neither the name of the University of Illinois
+  nor the names of its contributors may be used to
+  endorse or promote products derived from this
+  software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*****************************************************************************/
+
+/*****************************************************************************
+written by
+   Yunhong Gu, last updated 01/18/2011
+*****************************************************************************/
+
+#ifndef __UDT_H__
+#define __UDT_H__
+
+
+#ifndef WINDOWS
+   #include <sys/types.h>
+   #include <sys/socket.h>
+   #include <netinet/in.h>
+#else
+   #include <stdint.h>
+   #include <ws2tcpip.h>
+   #include <windows.h>
+#endif
+#include <set>
+#include <string>
+#include <vector>
+
+// #include "udt-sys/src/lib.rs.h"
+namespace rpoll { struct RPoll; }
+
+
+////////////////////////////////////////////////////////////////////////////////
+
+#ifdef WINDOWS
+  typedef SOCKET SYSSOCKET;
+  #define UDT_API
+#else
+   typedef int SYSSOCKET;
+   #define UDT_API __attribute__ ((visibility("default")))
+#endif
+
+typedef SYSSOCKET UDPSOCKET;
+typedef int UDTSOCKET;
+
+////////////////////////////////////////////////////////////////////////////////
+
+typedef std::set<UDTSOCKET> ud_set;
+#define UD_CLR(u, uset) ((uset)->erase(u))
+#define UD_ISSET(u, uset) ((uset)->find(u) != (uset)->end())
+#define UD_SET(u, uset) ((uset)->insert(u))
+#define UD_ZERO(uset) ((uset)->clear())
+
+enum EPOLLOpt
+{
+   // this values are defined same as linux epoll.h
+   // so that if system values are used by mistake, they should have the same effect
+   UDT_EPOLL_IN = 0x1,
+   UDT_EPOLL_OUT = 0x4
+};
+
+enum UDTSTATUS {INIT = 1, OPENED, LISTENING, CONNECTING, CONNECTED, BROKEN, CLOSING, CLOSED, NONEXIST};
+
+////////////////////////////////////////////////////////////////////////////////
+
+enum UDTOpt
+{
+   UDT_MSS,             // the Maximum Transfer Unit
+   // UDT_SNDSYN,          // if sending is blocking
+   UDT_CONNSYN = 2,          // if receiving is blocking
+   UDT_CC,              // custom congestion control algorithm
+   UDT_FC,		// Flight flag size (window size)
+   UDT_SNDBUF,          // maximum buffer in sending queue
+   UDT_RCVBUF,          // UDT receiving buffer size
+   // UDT_LINGER,          // waiting for unsent data when closing
+   UDP_SNDBUF = 8,          // UDP sending buffer size
+   UDP_RCVBUF,          // UDP receiving buffer size
+   UDT_MAXMSG,          // maximum datagram message size
+   UDT_MSGTTL,          // time-to-live of a datagram message
+   UDT_RENDEZVOUS,      // rendezvous connection mode
+   // UDT_SNDTIMEO,        // send() timeout
+   // UDT_RCVTIMEO,        // recv() timeout
+   UDT_REUSEADDR = 15,	// reuse an existing port or create a new one
+   UDT_MAXBW,		// maximum bandwidth (bytes per second) that the connection can use
+   UDT_STATE,		// current socket state, see UDTSTATUS, read only
+   UDT_EVENT,		// current avalable events associated with the socket
+   UDT_SNDDATA,		// size of data in the sending buffer
+   UDT_RCVDATA		// size of data available for recv
+};
+
+////////////////////////////////////////////////////////////////////////////////
+
+struct CPerfMon;
+
+////////////////////////////////////////////////////////////////////////////////
+
+class UDT_API CUDTException
+{
+public:
+   CUDTException(int major = 0, int minor = 0, int err = -1);
+   ~CUDTException();
+
+   CUDTException(const CUDTException&) = default;
+   CUDTException& operator=(const CUDTException&) = default;
+
+      // Functionality:
+      //    Get the description of the exception.
+      // Parameters:
+      //    None.
+      // Returned value:
+      //    Text message for the exception description.
+
+   const std::string &getErrorMessage();
+
+      // Functionality:
+      //    Get the system errno for the exception.
+      // Parameters:
+      //    None.
+      // Returned value:
+      //    errno.
+
+   int getErrorCode() const;
+
+      // Functionality:
+      //    Clear the error code.
+      // Parameters:
+      //    None.
+      // Returned value:
+      //    None.
+
+   void clear();
+
+private:
+   int m_iMajor;        // major exception categories
+
+// 0: correct condition
+// 1: network setup exception
+// 2: network connection broken
+// 3: memory exception
+// 4: file exception
+// 5: method not supported
+// 6+: undefined error
+
+   int m_iMinor;		// for specific error reasons
+   int m_iErrno;		// errno returned by the system if there is any
+   std::string m_strMsg;	// text error message
+
+   std::string m_strAPI;	// the name of UDT function that returns the error
+   std::string m_strDebug;	// debug information, set to the original place that causes the error
+
+public: // Error Code
+   static const int SUCCESS;
+   static const int ECONNSETUP;
+   static const int ENOSERVER;
+   static const int ECONNREJ;
+   static const int ESOCKFAIL;
+   static const int ESECFAIL;
+   static const int ECONNLOST;
+   static const int ENOCONN;
+   static const int ETHREAD;
+   static const int ENOBUF;
+   static const int EINVOP;
+   static const int EBOUNDSOCK;
+   static const int ECONNSOCK;
+   static const int EINVPARAM;
+   static const int EINVSOCK;
+   static const int EUNBOUNDSOCK;
+   static const int ENOLISTEN;
+   static const int ERDVNOSERV;
+   static const int ERDVUNBOUND;
+   static const int ESTREAMILL;
+   static const int EDGRAMILL;
+   static const int EDUPLISTEN;
+   static const int ELARGEMSG;
+   static const int EASYNCSND;
+   static const int EASYNCRCV;
+   static const int EPEERERR;
+   static const int EUNKNOWN;
+};
+
+////////////////////////////////////////////////////////////////////////////////
+
+namespace UDT
+{
+
+typedef CUDTException ERRORINFO;
+typedef UDTOpt SOCKOPT;
+typedef CPerfMon TRACEINFO;
+typedef ud_set UDSET;
+
+UDT_API extern const UDTSOCKET INVALID_SOCK;
+#undef ERROR
+UDT_API extern const int ERROR;
+
+UDT_API int startup();
+UDT_API int cleanup();
+UDT_API UDTSOCKET socket(int af, int type, int protocol);
+UDT_API int bind(UDTSOCKET u, const struct sockaddr* name, int namelen);
+UDT_API int listen(UDTSOCKET u, int backlog);
+UDT_API UDTSOCKET accept(UDTSOCKET u, struct sockaddr* addr, int* addrlen);
+UDT_API int connect(UDTSOCKET u, const struct sockaddr* name, int namelen);
+UDT_API int close(UDTSOCKET u);
+UDT_API int getpeername(UDTSOCKET u, struct sockaddr* name, int* namelen);
+UDT_API int getsockname(UDTSOCKET u, struct sockaddr* name, int* namelen);
+UDT_API int getsockopt(UDTSOCKET u, int level, SOCKOPT optname, void* optval, int* optlen);
+UDT_API int setsockopt(UDTSOCKET u, int level, SOCKOPT optname, const void* optval, int optlen);
+UDT_API int sendmsg(UDTSOCKET u, const char* buf, int len, int ttl = -1, bool inorder = false);
+UDT_API int recvmsg(UDTSOCKET u, char* buf, int len);
+
+UDT_API const rpoll::RPoll &getrpoll();
+UDT_API ERRORINFO& getlasterror();
+UDT_API int getlasterror_code();
+UDT_API const std::string &getlasterror_desc();
+UDT_API int perfmon(UDTSOCKET u, TRACEINFO& perf, bool clear = true);
+UDT_API UDTSTATUS getsockstate(UDTSOCKET u);
+
+}  // namespace UDT
+
+#endif
