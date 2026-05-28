@@ -119,7 +119,7 @@ fn decode_ctrl_body(hdr: &ControlHeader, payload: Bytes) -> Option<ControlBody> 
 }
 
 fn decode_nak_list(payload: &[u8]) -> Option<NakList> {
-    if payload.len() % 4 != 0 {
+    if !payload.len().is_multiple_of(4) {
         return None;
     }
     let mut ranges = Vec::new();
@@ -149,6 +149,7 @@ fn decode_nak_list(payload: &[u8]) -> Option<NakList> {
 
 /// Encode a full data packet into `dst`.
 /// Header is big-endian (network byte order); payload is raw application bytes.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_data(
     seq_no: SeqNo,
     boundary: MsgBoundary,
@@ -388,7 +389,7 @@ mod tests {
             req_type: req_type::CONNECT,
             socket_id: 1,
             cookie: 0,
-            peer_ip: [127 | (0 << 8) | (0 << 16) | (1 << 24), 0, 0, 0],
+            peer_ip: [127, 0, 0, 0], // 127.0.0.1 LE: first word = 127
         };
         let pkt = Packet::Control {
             header: ControlHeader {

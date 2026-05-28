@@ -39,6 +39,7 @@ impl SeqNo {
         SeqNo(self.0.wrapping_sub(1) & SEQ_MAX)
     }
 
+    #[allow(clippy::should_implement_trait)] // `Add::add` would require a different signature
     #[inline]
     pub fn add(self, n: u32) -> Self {
         SeqNo((self.0 + n) & SEQ_MAX)

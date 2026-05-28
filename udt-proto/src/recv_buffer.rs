@@ -83,27 +83,23 @@ impl RecvBuffer {
             self.msg_ready += 1;
         } else if boundary.is_last() {
             // Walk backward: is the First (and all middles) already there?
-            if let Some(first) = self.find_first_of_msg(off, msg_no) {
-                if self.all_slots_filled(first, off) {
+            if let Some(first) = self.find_first_of_msg(off, msg_no)
+                && self.all_slots_filled(first, off) {
                     self.msg_ready += 1;
                 }
-            }
         } else if boundary.is_first() {
             // Walk forward: is the Last (and all middles) already there?
-            if let Some(last) = self.find_last_of_msg(off, msg_no) {
-                if self.all_slots_filled(off, last) {
+            if let Some(last) = self.find_last_of_msg(off, msg_no)
+                && self.all_slots_filled(off, last) {
                     self.msg_ready += 1;
                 }
-            }
         } else {
             // Middle: check if both First and Last are present with a complete run.
-            if let Some(first) = self.find_first_of_msg(off, msg_no) {
-                if let Some(last) = self.find_last_of_msg(off, msg_no) {
-                    if self.all_slots_filled(first, last) {
+            if let Some(first) = self.find_first_of_msg(off, msg_no)
+                && let Some(last) = self.find_last_of_msg(off, msg_no)
+                    && self.all_slots_filled(first, last) {
                         self.msg_ready += 1;
                     }
-                }
-            }
         }
         true
     }
@@ -236,14 +232,13 @@ impl RecvBuffer {
         let mut found_last = false;
         for off in 0..self.max_off {
             let phys = off % self.capacity;
-            if let Some(s) = &self.slots[phys] {
-                if s.msg_no == msg_no {
+            if let Some(s) = &self.slots[phys]
+                && s.msg_no == msg_no {
                     if s.boundary.is_last() {
                         found_last = true;
                     }
                     self.slots[phys] = None;
                 }
-            }
         }
         if found_last {
             // Decrement msg_ready if we're removing a complete message

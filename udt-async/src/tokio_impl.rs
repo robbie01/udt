@@ -239,7 +239,7 @@ impl Endpoint {
 
         // Register the route *before* spawning so no incoming packet is missed.
         self.mux_tx.send(MuxCmd::RegisterRoute { peer, tx: datagram_tx })
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "endpoint closed"))?;
+            .map_err(|_| io::Error::other("endpoint closed"))?;
 
         let socket_id = next_socket_id();
         let isn = SeqNo::new(rand::random::<u32>() & 0x7FFF_FFFF);
@@ -272,7 +272,7 @@ impl Endpoint {
         let secret: u64 = rand::random();
         let socket_id = next_socket_id();
         self.mux_tx.send(MuxCmd::StartListener { accept_tx, secret, socket_id })
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "endpoint closed"))?;
+            .map_err(|_| io::Error::other("endpoint closed"))?;
         Ok(Listener { accept_rx, local_addr: self.local_addr })
     }
 
@@ -316,10 +316,10 @@ async fn run_endpoint_mux(
 
     loop {
         // Prune stale listener (Listener struct was dropped by the caller).
-        if let Some((_, accept_tx)) = &listener {
-            if accept_tx.is_closed() {
-                listener = None;
-            }
+        if let Some((_, accept_tx)) = &listener
+            && accept_tx.is_closed()
+        {
+            listener = None;
         }
         // Prune stale routes (connection drivers that have already exited).
         routes.retain(|_, tx| !tx.is_closed());
@@ -389,7 +389,7 @@ async fn run_endpoint_mux(
                                     routes.insert(from, datagram_tx);
                                     tokio::spawn(run_conn_driver(
                                         Arc::clone(&socket),
-                                        conn,
+                                        *conn,
                                         from,
                                         Some(datagram_rx),
                                         send_rx,

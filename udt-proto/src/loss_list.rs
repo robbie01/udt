@@ -49,11 +49,10 @@ impl SndLossList {
     /// Remove all entries with seq_no <= ack (sender received ACK up to this point).
     pub fn remove_up_to(&mut self, ack: SeqNo) {
         self.ranges.retain(|&(_, e)| e > ack);
-        if let Some((s, _)) = self.ranges.first_mut() {
-            if *s <= ack {
+        if let Some((s, _)) = self.ranges.first_mut()
+            && *s <= ack {
                 *s = ack.next();
             }
-        }
     }
 
     /// Pop the lowest sequence number for retransmission.

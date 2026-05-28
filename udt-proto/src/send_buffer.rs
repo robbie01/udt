@@ -49,6 +49,7 @@ impl SendBuffer {
 
     /// Enqueue a message. It is split into payload-sized blocks automatically.
     /// Returns `Err(())` if there is insufficient space.
+    #[allow(clippy::result_unit_err)]
     pub fn add(&mut self, data: &[u8], ttl_ms: Option<u32>, in_order: bool, now_us: u64) -> Result<(), ()> {
         let chunks = data.chunks(self.payload_size);
         let n_chunks = chunks.len();

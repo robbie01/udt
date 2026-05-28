@@ -170,6 +170,7 @@ impl Connection {
     }
 
     /// Already-connected socket (listener path after successful handshake).
+    #[allow(clippy::too_many_arguments)]
     pub fn new_connected(
         socket_id: u32,
         peer_id: u32,
@@ -599,9 +600,9 @@ impl Connection {
                     self.do_post_connect(hs, now_us, out);
                 }
             }
-            ConnState::Connected => {
+            ConnState::Connected
                 // Already connected; if rendezvous peer retransmits, ack with -2
-                if hs.req_type != req_type::RDVZ_DONE {
+                if hs.req_type != req_type::RDVZ_DONE => {
                     let mut resp = hs.clone();
                     resp.req_type = req_type::RDVZ_DONE;
                     resp.socket_id = self.socket_id as i32;
@@ -609,7 +610,6 @@ impl Connection {
                     codec::encode_handshake(&resp, self.ts(now_us), hs.socket_id as u32, &mut self.enc);
                     out.push(Output::SendDatagram(self.enc.clone().freeze()));
                 }
-            }
             _ => {}
         }
     }

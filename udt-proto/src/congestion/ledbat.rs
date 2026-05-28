@@ -117,7 +117,7 @@ impl CongestionControl for Ledbat {
     }
 
     fn on_ack(&mut self, _ack_seq: SeqNo, ctx: CcContext) -> CcOutput {
-        let delay_us = (ctx.rtt_us / 2) as u32;
+        let delay_us = ctx.rtt_us / 2;
         self.update_base_delay(delay_us, ctx.now_us);
         self.update_current_delay(delay_us);
 

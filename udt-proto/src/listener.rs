@@ -30,7 +30,7 @@ pub enum ListenerOutput {
     /// Send this datagram back to the peer that sent a datagram to us.
     SendTo { addr: PeerAddr, data: Bytes },
     /// A new incoming connection is fully established.
-    Accept(Connection, PeerAddr),
+    Accept(Box<Connection>, PeerAddr),
 }
 
 struct PendingConn {
@@ -154,7 +154,7 @@ impl ListenerState {
                 self.enc.clear();
                 codec::encode_handshake(&our_resp, ts, hs.socket_id as u32, &mut self.enc);
                 out.push(ListenerOutput::SendTo { addr: addr.clone(), data: self.enc.clone().freeze() });
-                out.push(ListenerOutput::Accept(conn, addr));
+                out.push(ListenerOutput::Accept(Box::new(conn), addr));
             } else if let Some(saved_resp) = self.accepted.get(&addr).cloned() {
                 // Duplicate req_type=-1: peer missed our response — resend it
                 self.enc.clear();

@@ -9,5 +9,6 @@ pub use tokio_impl::{
 /// Maximum application payload per UDT packet with the default MSS.
 ///
 /// Equal to `DEFAULT_MSS − UDP_OVERHEAD_V6 − UDT_HEADER_SIZE = 1436 bytes`.
+#[cfg(feature = "tokio")]
 pub const MAX_PAYLOAD_SIZE: usize =
     DEFAULT_MSS as usize - UDP_OVERHEAD_V6 as usize - UDT_HEADER_SIZE;

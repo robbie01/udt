@@ -164,7 +164,7 @@ impl CongestionControl for UdtCc {
         } else {
             self.dec_count += 1;
             self.nak_count += 1;
-            if self.dec_count < 5 && self.nak_count % self.dec_random == 0 {
+            if self.dec_count < 5 && self.nak_count.is_multiple_of(self.dec_random) {
                 self.pkt_snd_period_us = (self.pkt_snd_period_us * 1.125).ceil();
                 self.last_dec_seq = ctx.snd_curr_seq;
             }
