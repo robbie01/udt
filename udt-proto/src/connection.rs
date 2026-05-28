@@ -11,8 +11,24 @@ use crate::recv_buffer::RecvBuffer;
 use crate::packet::{AckFull, ControlBody, Packet};
 use crate::seq::{AckSeqNo, SeqNo, SEQ_MAX};
 
-const IP_AND_UDP_OVERHEAD: u32 = 48;
-const UDT_HEADER_SIZE: u32 = 16;
+/// Size of the fixed UDT packet header (4 × u32) that precedes every payload.
+pub const UDT_HEADER_SIZE: usize = 16;
+
+// Overhead subtracted from the wire MSS to get the payload size.
+//
+// The C++ UDT reference implementation uses a fixed value of 48 for both IPv4
+// and IPv6 (matching the larger IPv6 header size: 40 IP + 8 UDP = 48). We use
+// the same constant to stay wire-compatible.  Users working with jumbo-frame or
+// IPv4-only links may achieve slightly larger payloads with a custom MSS, but
+// the default is tuned for broad compatibility.
+const IP_AND_UDP_OVERHEAD: u32 = 48; // 40 (IPv6) + 8 (UDP) — used by C++ for all families
+
+// Default MSS advertised in the UDT handshake.
+//
+// This follows the C++ convention: MSS = IP-layer MTU (i.e., the Ethernet
+// payload including IP + UDP + UDT headers + data).  Standard Ethernet frames
+// carry up to 1500-byte IP payloads.  The resulting per-packet data payload is:
+//   1500 − IP_AND_UDP_OVERHEAD(48) − UDT_HEADER_SIZE(16) = 1436 bytes.
 const DEFAULT_MSS: u32 = 1500;
 const DEFAULT_FLIGHT_FLAG_SIZE: u32 = 25600;
 const DEFAULT_SND_BUF: usize = 8192;
@@ -20,7 +36,11 @@ const DEFAULT_RCV_BUF: usize = 8192;
 const SYN_US: u32 = 10_000;
 const LIGHT_ACK_INTERVAL: u32 = 64;
 const EXP_MAX: u32 = 16;
-const MIN_EXP_US: u64 = 300_000;
+/// Per-count minimum EXP interval (µs).  Mirrors C++ `m_ullMinExpInt = 300 000 µs`.
+const MIN_EXP_PER_COUNT_US: u64 = 300_000;
+/// After EXP_MAX expirations the connection is only torn down once it has been
+/// silent for this long in total (matches C++ `5 000 000 µs` guard).
+const EXP_HARD_TIMEOUT_US: u64 = 5_000_000;
 // Handshake re-send interval ≈ 250ms
 const HS_RESEND_US: u64 = 250_000;
 
@@ -66,6 +86,9 @@ pub struct Connection {
     snd_loss: SndLossList,
     snd_last_ack: SeqNo,
     snd_curr_seq: SeqNo,
+    /// When true, the application has finished sending (send channel closed). We
+    /// send a Shutdown once the send buffer drains (all data acknowledged).
+    snd_half_closed: bool,
 
     rcv_buf: Option<RecvBuffer>,
     rcv_loss: RcvLossList,
@@ -167,7 +190,9 @@ impl Connection {
     }
 
     fn skeleton(socket_id: u32, mss: u32, now_us: u64) -> Self {
-        let payload_size = mss.saturating_sub(IP_AND_UDP_OVERHEAD + UDT_HEADER_SIZE);
+        // mss is the IP-layer MTU (C++ wire convention).
+        // payload_size = mss − IP/UDP overhead − UDT header (matches C++ formula).
+        let payload_size = mss.saturating_sub(IP_AND_UDP_OVERHEAD + UDT_HEADER_SIZE as u32);
         Connection {
             socket_id,
             peer_id: 0,
@@ -180,6 +205,7 @@ impl Connection {
             snd_loss: SndLossList::new(DEFAULT_FLIGHT_FLAG_SIZE as usize * 2),
             snd_last_ack: SeqNo::new(0),
             snd_curr_seq: SeqNo::new(0),
+            snd_half_closed: false,
             rcv_buf: None,
             rcv_loss: RcvLossList::new(DEFAULT_FLIGHT_FLAG_SIZE as usize),
             ack_win: AckWindow::new(),
@@ -206,7 +232,7 @@ impl Connection {
 
     fn post_connect(&mut self, peer_isn: SeqNo, mss: u32, flow_wnd: u32, now_us: u64) {
         self.mss = mss;
-        self.payload_size = mss.saturating_sub(IP_AND_UDP_OVERHEAD + UDT_HEADER_SIZE);
+        self.payload_size = mss.saturating_sub(IP_AND_UDP_OVERHEAD + UDT_HEADER_SIZE as u32);
         self.flow_wnd = flow_wnd;
         // Start one before ISN so first pack_data increments to ISN (matching C++ behaviour).
         self.snd_curr_seq = self.local_isn.prev();
@@ -277,6 +303,12 @@ impl Connection {
             }
         }
 
+        // Graceful half-close: shut down once the send buffer drains.
+        if self.snd_half_closed && self.snd_buf_is_empty() {
+            self.shutdown(now_us, out);
+            return;
+        }
+
         // ACK
         if now_us >= self.next_ack_us {
             self.emit_ack(now_us, out);
@@ -289,18 +321,44 @@ impl Connection {
             self.next_nak_us = now_us + self.nak_int_us();
         }
 
-        // EXP
-        let exp_int = MIN_EXP_US.max(self.exp_count as u64 * SYN_US as u64 + self.rtt_us as u64);
-        if now_us.saturating_sub(self.last_rsp_us) > exp_int {
-            let ctx = self.cc_ctx(now_us);
-            let o = self.cc.on_timeout(ctx);
-            self.apply_cc(o);
-            self.exp_count += 1;
-            if self.exp_count > EXP_MAX {
+        // EXP — mirrors C++ checkTimers() logic.
+        //
+        // Interval formula (matching C++):
+        //   exp_int = max(count × MIN_EXP_PER_COUNT,
+        //                 count × (RTT + 4×RTTVar) + SYN)
+        //
+        // After firing, `last_rsp_us` is reset to now so the timer does NOT
+        // immediately re-fire (the C++ does the same: `m_ullLastRspTime = currtime`).
+        //
+        // Disconnect only when BOTH:
+        //   • exp_count > EXP_MAX (16 expirations), AND
+        //   • silence since last fire > EXP_HARD_TIMEOUT_US (5 s)
+        let exp_int = {
+            let rtt_based = self.exp_count as u64
+                * (self.rtt_us as u64 + 4 * self.rtt_var_us as u64)
+                + SYN_US as u64;
+            let min_based = self.exp_count as u64 * MIN_EXP_PER_COUNT_US;
+            rtt_based.max(min_based)
+        };
+        if now_us >= self.last_rsp_us + exp_int {
+            // Hard timeout: peer has been silent for too long.
+            if self.exp_count > EXP_MAX
+                && now_us.saturating_sub(self.last_rsp_us) > EXP_HARD_TIMEOUT_US
+            {
                 self.state = ConnState::Closed;
                 out.push(Output::Disconnected(DisconnectReason::Timeout));
                 return;
             }
+
+            let ctx = self.cc_ctx(now_us);
+            let o = self.cc.on_timeout(ctx);
+            self.apply_cc(o);
+            self.exp_count += 1;
+
+            // Reset last_rsp_us so this EXP interval does not re-fire immediately
+            // on the next on_timer call (C++: `m_ullLastRspTime = currtime`).
+            self.last_rsp_us = now_us;
+
             // Keep-alive to prevent peer's EXP
             self.enc.clear();
             codec::encode_keepalive(self.ts(now_us), self.peer_id, &mut self.enc);
@@ -337,9 +395,14 @@ impl Connection {
             ConnState::Connected => {
                 let mut t = self.next_ack_us.min(self.next_snd_us);
                 if !self.rcv_loss.is_empty() { t = t.min(self.next_nak_us); }
-                let exp = self.last_rsp_us + MIN_EXP_US.max(
-                    self.exp_count as u64 * SYN_US as u64 + self.rtt_us as u64
-                );
+                let exp_int = {
+                    let rtt_based = self.exp_count as u64
+                        * (self.rtt_us as u64 + 4 * self.rtt_var_us as u64)
+                        + SYN_US as u64;
+                    let min_based = self.exp_count as u64 * MIN_EXP_PER_COUNT_US;
+                    rtt_based.max(min_based)
+                };
+                let exp = self.last_rsp_us + exp_int;
                 Some(t.min(exp))
             }
         }
@@ -352,6 +415,26 @@ impl Connection {
         out.push(Output::SendDatagram(self.enc.clone().freeze()));
         self.state = ConnState::Closed;
         out.push(Output::Disconnected(DisconnectReason::LocalClose));
+    }
+
+    /// Graceful half-close: the application has finished sending.
+    ///
+    /// If the send buffer is already empty, shuts down immediately.
+    /// Otherwise sets a flag so `on_timer` will send the Shutdown once
+    /// all queued data has been acknowledged by the peer.
+    pub fn half_close(&mut self, now_us: u64, out: &mut Vec<Output>) {
+        if !matches!(self.state, ConnState::Connected) { return; }
+        if self.snd_buf.as_ref().map(|b| b.is_empty()).unwrap_or(true) {
+            self.shutdown(now_us, out);
+        } else {
+            self.snd_half_closed = true;
+        }
+    }
+
+    /// Returns true when all sent data has been acknowledged by the peer
+    /// (or when no send buffer has been allocated yet).
+    pub fn snd_buf_is_empty(&self) -> bool {
+        self.snd_buf.as_ref().map(|b| b.is_empty()).unwrap_or(true)
     }
 
     pub fn socket_id(&self) -> u32 { self.socket_id }
@@ -479,6 +562,22 @@ impl Connection {
 
                 // Regular connect from peer: reject
                 if recv_req_type == req_type::CONNECT { return; }
+
+                // RDVZ_DONE (-2): peer already completed; complete on our side too.
+                //
+                // This happens when we were the slow side: peer received our -1,
+                // completed, and is now sending RDVZ_DONE to acknowledge our late -1
+                // retransmissions.  Use the cached peer handshake for post_connect.
+                if recv_req_type == req_type::RDVZ_DONE {
+                    let cached_hs = if let ConnState::Connecting { last_peer_hs, .. } = &self.state {
+                        last_peer_hs.clone()
+                    } else { None };
+                    if let Some(peer_hs) = cached_hs {
+                        self.do_post_connect(peer_hs, now_us, out);
+                    }
+                    // If no cached hs yet, drop the packet; peer will retransmit RDVZ_DONE.
+                    return;
+                }
 
                 if local_req_type == req_type::RENDEZVOUS || recv_req_type == req_type::RENDEZVOUS {
                     // At least one side still at 0 → advance to -1

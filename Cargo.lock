@@ -1360,6 +1360,7 @@ name = "udt-integration-tests"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "futures",
  "tokio",
  "udt-async",
  "udt-compat",
