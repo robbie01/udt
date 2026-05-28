@@ -6,6 +6,7 @@ struct Slot {
     payload: Bytes,
     boundary: MsgBoundary,
     msg_no: MsgNo,
+    #[allow(dead_code)] // stored for future in-order delivery enforcement
     in_order: bool,
 }
 

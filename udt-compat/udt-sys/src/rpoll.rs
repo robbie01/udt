@@ -28,10 +28,10 @@ impl RPoll {
         let ent = self.evts.entry_sync(socket).or_default();
         if value {
             if events.contains(Event::IN) {
-                ent.readable.notify_waiters();
+                ent.readable.notify_one();
             }
             if events.contains(Event::OUT) {
-                ent.writable.notify_waiters();
+                ent.writable.notify_one();
             }
         }
     }

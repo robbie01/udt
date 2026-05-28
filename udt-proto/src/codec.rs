@@ -6,8 +6,11 @@ use crate::packet::{
     DataHeader, MsgBoundary, NakList, Packet,
 };
 
-// The UDT packet header is 4 × u32, all in host byte order (== little-endian on x86/x86_64).
-// There is no htonl/ntohl in the original C++ source — raw bit operations on uint32_t.
+// The UDT wire format uses NETWORK BYTE ORDER (big-endian) for:
+//   • All 4 header words (both data and control packets)
+//   • All 4-byte words in the bodies of CONTROL packets
+// Data packet payloads are raw application bytes with no byte-order conversion.
+// This matches what C++ channel.cpp does with htonl/ntohl before/after sendmsg/recvmsg.
 
 /// Decode a single UDT packet from a datagram.
 /// The returned `Bytes` for data payloads slices into the provided `datagram`
@@ -16,10 +19,10 @@ pub fn decode(datagram: Bytes) -> Option<Packet> {
     if datagram.len() < 16 {
         return None;
     }
-    let word0 = read_le_u32(&datagram[0..4]);
-    let word1 = read_le_u32(&datagram[4..8]);
-    let word2 = read_le_u32(&datagram[8..12]);
-    let word3 = read_le_u32(&datagram[12..16]);
+    let word0 = read_be_u32(&datagram[0..4]);
+    let word1 = read_be_u32(&datagram[4..8]);
+    let word2 = read_be_u32(&datagram[8..12]);
+    let word3 = read_be_u32(&datagram[12..16]);
 
     if word0 >> 31 == 0 {
         // Data packet
@@ -68,14 +71,14 @@ fn decode_ctrl_body(hdr: &ControlHeader, payload: Bytes) -> Option<ControlBody> 
             if payload.len() < 4 {
                 return None;
             }
-            let data_ack = SeqNo::new(read_le_i32(&payload[0..4]) as u32);
+            let data_ack = SeqNo::new(read_be_i32(&payload[0..4]) as u32);
             let full = if payload.len() >= 24 {
                 Some(AckFull {
-                    rtt_us:        read_le_i32(&payload[4..8]),
-                    rtt_var_us:    read_le_i32(&payload[8..12]),
-                    avail_buf_pkts:read_le_i32(&payload[12..16]),
-                    rcv_rate_pps:  read_le_i32(&payload[16..20]),
-                    bandwidth_pps: read_le_i32(&payload[20..24]),
+                    rtt_us:        read_be_i32(&payload[4..8]),
+                    rtt_var_us:    read_be_i32(&payload[8..12]),
+                    avail_buf_pkts:read_be_i32(&payload[12..16]),
+                    rcv_rate_pps:  read_be_i32(&payload[16..20]),
+                    bandwidth_pps: read_be_i32(&payload[20..24]),
                 })
             } else {
                 None
@@ -98,8 +101,8 @@ fn decode_ctrl_body(hdr: &ControlHeader, payload: Bytes) -> Option<ControlBody> 
             if payload.len() < 8 {
                 return None;
             }
-            let first = SeqNo::new(read_le_i32(&payload[0..4]) as u32 & 0x7FFF_FFFF);
-            let last  = SeqNo::new(read_le_i32(&payload[4..8]) as u32 & 0x7FFF_FFFF);
+            let first = SeqNo::new(read_be_i32(&payload[0..4]) as u32 & 0x7FFF_FFFF);
+            let last  = SeqNo::new(read_be_i32(&payload[4..8]) as u32 & 0x7FFF_FFFF);
             Some(ControlBody::MsgDrop {
                 msg_no: MsgNo::new(hdr.additional_info),
                 first,
@@ -122,7 +125,7 @@ fn decode_nak_list(payload: &[u8]) -> Option<NakList> {
     let mut ranges = Vec::new();
     let mut i = 0;
     while i + 4 <= payload.len() {
-        let word = read_le_u32(&payload[i..i + 4]);
+        let word = read_be_u32(&payload[i..i + 4]);
         i += 4;
         if word >> 31 != 0 {
             // Start of a range; next word is the end
@@ -130,7 +133,7 @@ fn decode_nak_list(payload: &[u8]) -> Option<NakList> {
                 return None;
             }
             let start = SeqNo::new(word & 0x7FFF_FFFF);
-            let end_word = read_le_u32(&payload[i..i + 4]);
+            let end_word = read_be_u32(&payload[i..i + 4]);
             let end = SeqNo::new(end_word & 0x7FFF_FFFF);
             i += 4;
             ranges.push((start, end));
@@ -145,7 +148,7 @@ fn decode_nak_list(payload: &[u8]) -> Option<NakList> {
 // ── Encoder ─────────────────────────────────────────────────────────────────
 
 /// Encode a full data packet into `dst`.
-/// `header_words` are the 4 pre-built LE u32 words; `payload` is the data.
+/// Header is big-endian (network byte order); payload is raw application bytes.
 pub fn encode_data(
     seq_no: SeqNo,
     boundary: MsgBoundary,
@@ -160,10 +163,10 @@ pub fn encode_data(
     let word1 = (boundary.bits() << 30)
         | ((in_order as u32) << 29)
         | (msg_no.raw() & 0x1FFF_FFFF);
-    dst.put_u32_le(word0);
-    dst.put_u32_le(word1);
-    dst.put_u32_le(timestamp_us);
-    dst.put_u32_le(dst_socket_id);
+    dst.put_u32(word0);
+    dst.put_u32(word1);
+    dst.put_u32(timestamp_us);
+    dst.put_u32(dst_socket_id);
     dst.put_slice(payload);
 }
 
@@ -181,10 +184,10 @@ pub fn encode_data_header(
         | ((in_order as u32) << 29)
         | (msg_no.raw() & 0x1FFF_FFFF);
     let mut out = [0u8; 16];
-    out[0..4].copy_from_slice(&word0.to_le_bytes());
-    out[4..8].copy_from_slice(&word1.to_le_bytes());
-    out[8..12].copy_from_slice(&timestamp_us.to_le_bytes());
-    out[12..16].copy_from_slice(&dst_socket_id.to_le_bytes());
+    out[0..4].copy_from_slice(&word0.to_be_bytes());
+    out[4..8].copy_from_slice(&word1.to_be_bytes());
+    out[8..12].copy_from_slice(&timestamp_us.to_be_bytes());
+    out[12..16].copy_from_slice(&dst_socket_id.to_be_bytes());
     out
 }
 
@@ -204,10 +207,10 @@ pub fn encode_control(
     let word0 = 0x8000_0000u32
         | ((ctrl_type.type_bits() as u32) << 16)
         | ext_bits;
-    dst.put_u32_le(word0);
-    dst.put_u32_le(additional_info);
-    dst.put_u32_le(timestamp_us);
-    dst.put_u32_le(dst_socket_id);
+    dst.put_u32(word0);
+    dst.put_u32(additional_info);
+    dst.put_u32(timestamp_us);
+    dst.put_u32(dst_socket_id);
     dst.put_slice(payload);
 }
 
@@ -228,13 +231,13 @@ pub fn encode_ack(
     dst: &mut BytesMut,
 ) {
     let mut body = BytesMut::with_capacity(if full.is_some() { 24 } else { 4 });
-    body.put_i32_le(data_ack_seq.raw() as i32);
+    body.put_i32(data_ack_seq.raw() as i32);
     if let Some(f) = full {
-        body.put_i32_le(f.rtt_us);
-        body.put_i32_le(f.rtt_var_us);
-        body.put_i32_le(f.avail_buf_pkts);
-        body.put_i32_le(f.rcv_rate_pps);
-        body.put_i32_le(f.bandwidth_pps);
+        body.put_i32(f.rtt_us);
+        body.put_i32(f.rtt_var_us);
+        body.put_i32(f.avail_buf_pkts);
+        body.put_i32(f.rcv_rate_pps);
+        body.put_i32(f.bandwidth_pps);
     }
     encode_control(ControlType::Ack, ack_sub_seq.raw(), timestamp_us, dst_socket_id, &body, dst);
 }
@@ -255,10 +258,10 @@ pub fn encode_nak(
     let mut body = BytesMut::with_capacity(ranges.len() * 8);
     for &(start, end) in ranges {
         if start == end {
-            body.put_u32_le(start.raw()); // single, bit31 clear
+            body.put_u32(start.raw()); // single, bit31 clear
         } else {
-            body.put_u32_le(start.raw() | 0x8000_0000); // range start, bit31 set
-            body.put_u32_le(end.raw());                  // range end, bit31 clear
+            body.put_u32(start.raw() | 0x8000_0000); // range start, bit31 set
+            body.put_u32(end.raw());                  // range end, bit31 clear
         }
     }
     encode_control(ControlType::Nak, 0, timestamp_us, dst_socket_id, &body, dst);
@@ -284,21 +287,21 @@ pub fn encode_msg_drop(
     dst: &mut BytesMut,
 ) {
     let mut body = [0u8; 8];
-    body[0..4].copy_from_slice(&(first.raw() as i32).to_le_bytes());
-    body[4..8].copy_from_slice(&(last.raw() as i32).to_le_bytes());
+    body[0..4].copy_from_slice(&(first.raw() as i32).to_be_bytes());
+    body[4..8].copy_from_slice(&(last.raw() as i32).to_be_bytes());
     encode_control(ControlType::MsgDrop, msg_no.raw(), timestamp_us, dst_socket_id, &body, dst);
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 #[inline]
-fn read_le_u32(b: &[u8]) -> u32 {
-    u32::from_le_bytes(b[..4].try_into().unwrap())
+fn read_be_u32(b: &[u8]) -> u32 {
+    u32::from_be_bytes(b[..4].try_into().unwrap())
 }
 
 #[inline]
-fn read_le_i32(b: &[u8]) -> i32 {
-    i32::from_le_bytes(b[..4].try_into().unwrap())
+fn read_be_i32(b: &[u8]) -> i32 {
+    i32::from_be_bytes(b[..4].try_into().unwrap())
 }
 
 #[cfg(test)]
@@ -552,7 +555,7 @@ mod tests {
         ] {
             let mut buf = BytesMut::new();
             encode_data(SeqNo::new(0), boundary, false, MsgNo::new(0), 0, 0, b"x", &mut buf);
-            let word1 = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+            let word1 = u32::from_be_bytes(buf[4..8].try_into().unwrap());
             assert_eq!(word1 >> 30, expected, "boundary {:?}", boundary);
         }
     }

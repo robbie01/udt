@@ -264,8 +264,12 @@ async fn run_conn_driver(
             tokio::select! {
                 maybe = drx.recv() => {
                     match maybe {
-                        Some(bytes) => conn.on_datagram(bytes, now_us(), &mut out),
-                        None => return, // listener dropped us
+                        Some(bytes) => {
+                            conn.on_datagram(bytes, now_us(), &mut out);
+                        }
+                        None => {
+                            return; // listener dropped us
+                        }
                     }
                 }
                 maybe_req = send_rx.recv() => {

@@ -31,7 +31,7 @@ impl Handshake {
         assert!(buf.len() >= HANDSHAKE_SIZE);
         let mut off = 0;
         let mut write_i32 = |v: i32| {
-            buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            buf[off..off + 4].copy_from_slice(&v.to_be_bytes());
             off += 4;
         };
         write_i32(self.version);
@@ -43,7 +43,7 @@ impl Handshake {
         write_i32(self.socket_id);
         write_i32(self.cookie);
         for &w in &self.peer_ip {
-            buf[off..off + 4].copy_from_slice(&w.to_le_bytes());
+            buf[off..off + 4].copy_from_slice(&w.to_be_bytes());
             off += 4;
         }
     }
@@ -55,7 +55,7 @@ impl Handshake {
         }
         let mut off = 0;
         let mut read_i32 = || {
-            let v = i32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
+            let v = i32::from_be_bytes(buf[off..off + 4].try_into().ok()?);
             off += 4;
             Some(v)
         };
@@ -69,7 +69,7 @@ impl Handshake {
         let cookie           = read_i32()?;
         let mut peer_ip = [0u32; 4];
         for slot in &mut peer_ip {
-            *slot = u32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
+            *slot = u32::from_be_bytes(buf[off..off + 4].try_into().ok()?);
             off += 4;
         }
         Some(Handshake { version, sock_type, isn, mss, flight_flag_size, req_type, socket_id, cookie, peer_ip })
@@ -104,14 +104,14 @@ mod tests {
     }
 
     #[test]
-    fn le_layout() {
+    fn be_layout() {
         let hs = sample();
         let mut buf = [0u8; HANDSHAKE_SIZE];
         hs.write_to(&mut buf);
-        // version=4 in LE: bytes [04, 00, 00, 00]
-        assert_eq!(&buf[0..4], &[4, 0, 0, 0]);
-        // sock_type=2 in LE: bytes [02, 00, 00, 00]
-        assert_eq!(&buf[4..8], &[2, 0, 0, 0]);
+        // version=4 in BE (network order): bytes [00, 00, 00, 04]
+        assert_eq!(&buf[0..4], &[0, 0, 0, 4]);
+        // sock_type=2 in BE: bytes [00, 00, 00, 02]
+        assert_eq!(&buf[4..8], &[0, 0, 0, 2]);
     }
 
     #[test]

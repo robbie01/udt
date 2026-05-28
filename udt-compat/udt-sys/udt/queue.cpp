@@ -885,6 +885,19 @@ void CRcvQueue::worker(CRcvQueue* self)
 
       id = unit->m_Packet.m_iID;
 
+      // Flush any new-entry registrations that arrived while we were blocked in recvfrom.
+      // This closes the race where a socket's first data packet arrives before the recv
+      // worker has had a chance to insert it into the routing hash.
+      while (self->ifNewEntry())
+      {
+         CUDT* ne = self->getNewEntry();
+         if (NULL != ne)
+         {
+            self->m_pRcvUList->insert(ne);
+            self->m_pHash->insert(ne->m_SocketID, ne);
+         }
+      }
+
       // ID 0 is for connection request, which should be passed to the listening socket or rendezvous sockets
       if (0 == id)
       {

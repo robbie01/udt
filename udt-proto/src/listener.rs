@@ -48,13 +48,11 @@ pub struct ListenerState {
     accepted: HashMap<PeerAddr, Handshake>, // peer addr → our final response hs
     /// Secret for cookie generation (random at listener creation).
     secret: u64,
-    /// Start time for timestamp-based cookie rotation (µs).
-    start_us: u64,
     enc: BytesMut,
 }
 
 impl ListenerState {
-    pub fn new(socket_id: u32, mss: u32, now_us: u64, secret: u64) -> Self {
+    pub fn new(socket_id: u32, mss: u32, _now_us: u64, secret: u64) -> Self {
         ListenerState {
             socket_id,
             mss,
@@ -62,7 +60,6 @@ impl ListenerState {
             pending: HashMap::new(),
             accepted: HashMap::new(),
             secret,
-            start_us: now_us,
             enc: BytesMut::with_capacity(mss as usize),
         }
     }

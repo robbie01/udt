@@ -128,17 +128,18 @@ mod tests {
         echo_exchange(a, b, &large(), 3).await;
     }
 
-    // ── Scenario 2: new listener + old connector (udt-compat connects) ───────
+    // ── Mixed (C++ <-> Rust) connection setup helpers ─────────────────────────
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn s2_new_listener_old_connector_small() {
+    /// Set up a Rust listener + C++ connector pair.
+    /// Returns (rust_server_sock, cpp_client_conn).
+    async fn new_s2_pair() -> (Socket, udt_compat::Connection) {
         use udt_compat::Endpoint as CppEndpoint;
 
         let ep = Endpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let server_addr = ep.local_addr().unwrap();
         let mut listener = ep.listen(4).unwrap();
 
-        let (mut server_sock, cpp_conn) = tokio::join!(
+        let (server_sock, cpp_conn) = tokio::join!(
             async { listener.accept().await.unwrap() },
             async {
                 let cpp_ep = Arc::new(CppEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap());
@@ -148,36 +149,19 @@ mod tests {
                     .expect("cpp connect failed")
             }
         );
-
-        let mut buf = vec![0u8; 65536];
-        for _ in 0..5 {
-            cpp_conn.send(SMALL).await.unwrap();
-            let n = tokio::time::timeout(Duration::from_secs(5), server_sock.recv(&mut buf))
-                .await
-                .expect("server recv timed out")
-                .unwrap();
-            assert_eq!(&buf[..n], SMALL);
-
-            server_sock.send(&buf[..n]).await.unwrap();
-            let n = tokio::time::timeout(Duration::from_secs(5), cpp_conn.recv(&mut buf))
-                .await
-                .expect("cpp recv timed out")
-                .unwrap();
-            assert_eq!(&buf[..n], SMALL);
-        }
+        (server_sock, cpp_conn)
     }
 
-    // ── Scenario 3: old listener + new connector ──────────────────────────────
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn s3_old_listener_new_connector_small() {
+    /// Set up a C++ listener + Rust connector pair.
+    /// Returns (cpp_server_conn, rust_client_sock).
+    async fn new_s3_pair() -> (udt_compat::Connection, Socket) {
         use udt_compat::Endpoint as CppEndpoint;
 
         let cpp_ep = Arc::new(CppEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap());
         let server_addr = cpp_ep.local_addr().unwrap();
         let cpp_listener = cpp_ep.listen(4).unwrap();
 
-        let (cpp_conn, mut client_sock) = tokio::join!(
+        let (cpp_conn, client_sock) = tokio::join!(
             async {
                 tokio::time::timeout(Duration::from_secs(5), cpp_listener.accept())
                     .await
@@ -192,29 +176,12 @@ mod tests {
                     .expect("connect failed")
             }
         );
-
-        let mut buf = vec![0u8; 65536];
-        for _ in 0..5 {
-            client_sock.send(SMALL).await.unwrap();
-            let n = tokio::time::timeout(Duration::from_secs(5), cpp_conn.recv(&mut buf))
-                .await
-                .expect("cpp recv timed out")
-                .unwrap();
-            assert_eq!(&buf[..n], SMALL);
-
-            cpp_conn.send(&buf[..n]).await.unwrap();
-            let n = tokio::time::timeout(Duration::from_secs(5), client_sock.recv(&mut buf))
-                .await
-                .expect("client recv timed out")
-                .unwrap();
-            assert_eq!(&buf[..n], SMALL);
-        }
+        (cpp_conn, client_sock)
     }
 
-    // ── Scenario 5: rendezvous old + new ──────────────────────────────────────
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn s5_rendezvous_old_new_small() {
+    /// Set up a C++ rendezvous + Rust rendezvous pair.
+    /// Returns (cpp_conn, rust_sock).
+    async fn new_s5_pair() -> (udt_compat::Connection, Socket) {
         use udt_compat::Endpoint as CppEndpoint;
 
         let cpp_ep = Arc::new(CppEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap());
@@ -222,7 +189,7 @@ mod tests {
         let cpp_addr = cpp_ep.local_addr().unwrap();
         let rust_addr = rust_ep.local_addr().unwrap();
 
-        let (cpp_conn, mut rust_sock) = tokio::join!(
+        let (cpp_conn, rust_sock) = tokio::join!(
             async {
                 tokio::time::timeout(Duration::from_secs(5), cpp_ep.connect(rust_addr, true))
                     .await
@@ -236,22 +203,132 @@ mod tests {
                     .expect("rust rendezvous failed")
             }
         );
+        (cpp_conn, rust_sock)
+    }
 
-        let mut buf = vec![0u8; 65536];
-        for _ in 0..5 {
-            rust_sock.send(SMALL).await.unwrap();
-            let n = tokio::time::timeout(Duration::from_secs(5), cpp_conn.recv(&mut buf))
+    /// Exchange `count` messages: C++ sends first, Rust echoes back.
+    async fn cpp_first_echo_exchange(
+        cpp_conn: udt_compat::Connection,
+        mut rust_sock: Socket,
+        payload: &[u8],
+        count: usize,
+    ) {
+        let mut buf = vec![0u8; 131072];
+        for _ in 0..count {
+            // C++ → Rust
+            tokio::time::timeout(Duration::from_secs(5), cpp_conn.send(payload))
                 .await
-                .expect("cpp recv timed out")
-                .unwrap();
-            assert_eq!(&buf[..n], SMALL);
-
-            cpp_conn.send(&buf[..n]).await.unwrap();
+                .expect("cpp send timed out")
+                .expect("cpp send failed");
             let n = tokio::time::timeout(Duration::from_secs(5), rust_sock.recv(&mut buf))
                 .await
                 .expect("rust recv timed out")
-                .unwrap();
-            assert_eq!(&buf[..n], SMALL);
+                .expect("rust recv failed");
+            assert_eq!(&buf[..n], payload, "rust received wrong data from cpp");
+
+            // Rust → C++ echo
+            tokio::time::timeout(Duration::from_secs(5), rust_sock.send(&buf[..n]))
+                .await
+                .expect("rust echo send timed out")
+                .expect("rust echo send failed");
+            let n = tokio::time::timeout(Duration::from_secs(5), cpp_conn.recv(&mut buf))
+                .await
+                .expect("cpp recv timed out")
+                .expect("cpp recv failed");
+            assert_eq!(&buf[..n], payload, "cpp received wrong echo from rust");
         }
+    }
+
+    /// Exchange `count` messages: Rust sends first, C++ echoes back.
+    async fn rust_first_echo_exchange(
+        mut rust_sock: Socket,
+        cpp_conn: udt_compat::Connection,
+        payload: &[u8],
+        count: usize,
+    ) {
+        let mut buf = vec![0u8; 131072];
+        for _ in 0..count {
+            // Rust → C++
+            tokio::time::timeout(Duration::from_secs(5), rust_sock.send(payload))
+                .await
+                .expect("rust send timed out")
+                .expect("rust send failed");
+            let n = tokio::time::timeout(Duration::from_secs(5), cpp_conn.recv(&mut buf))
+                .await
+                .expect("cpp recv timed out")
+                .expect("cpp recv failed");
+            assert_eq!(&buf[..n], payload, "cpp received wrong data from rust");
+
+            // C++ → Rust echo
+            tokio::time::timeout(Duration::from_secs(5), cpp_conn.send(&buf[..n]))
+                .await
+                .expect("cpp echo send timed out")
+                .expect("cpp echo send failed");
+            let n = tokio::time::timeout(Duration::from_secs(5), rust_sock.recv(&mut buf))
+                .await
+                .expect("rust recv timed out")
+                .expect("rust recv failed");
+            assert_eq!(&buf[..n], payload, "rust received wrong echo from cpp");
+        }
+    }
+
+    // ── Scenario 2: new listener + old connector (udt-compat connects) ───────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn s2_new_listener_old_connector_small() {
+        let (rust_sock, cpp_conn) = new_s2_pair().await;
+        cpp_first_echo_exchange(cpp_conn, rust_sock, SMALL, 5).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn s2_new_listener_old_connector_medium() {
+        let (rust_sock, cpp_conn) = new_s2_pair().await;
+        cpp_first_echo_exchange(cpp_conn, rust_sock, &medium(), 3).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn s2_new_listener_old_connector_large() {
+        let (rust_sock, cpp_conn) = new_s2_pair().await;
+        cpp_first_echo_exchange(cpp_conn, rust_sock, &large(), 2).await;
+    }
+
+    // ── Scenario 3: old listener + new connector ──────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn s3_old_listener_new_connector_small() {
+        let (cpp_conn, rust_sock) = new_s3_pair().await;
+        rust_first_echo_exchange(rust_sock, cpp_conn, SMALL, 5).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn s3_old_listener_new_connector_medium() {
+        let (cpp_conn, rust_sock) = new_s3_pair().await;
+        rust_first_echo_exchange(rust_sock, cpp_conn, &medium(), 3).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn s3_old_listener_new_connector_large() {
+        let (cpp_conn, rust_sock) = new_s3_pair().await;
+        rust_first_echo_exchange(rust_sock, cpp_conn, &large(), 2).await;
+    }
+
+    // ── Scenario 5: rendezvous old + new ──────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn s5_rendezvous_old_new_small() {
+        let (cpp_conn, rust_sock) = new_s5_pair().await;
+        rust_first_echo_exchange(rust_sock, cpp_conn, SMALL, 5).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn s5_rendezvous_old_new_medium() {
+        let (cpp_conn, rust_sock) = new_s5_pair().await;
+        rust_first_echo_exchange(rust_sock, cpp_conn, &medium(), 3).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn s5_rendezvous_old_new_large() {
+        let (cpp_conn, rust_sock) = new_s5_pair().await;
+        rust_first_echo_exchange(rust_sock, cpp_conn, &large(), 2).await;
     }
 }
