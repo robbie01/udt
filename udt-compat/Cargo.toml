@@ -1,5 +1,5 @@
 [package]
-name = "udt"
+name = "udt-compat"
 version.workspace = true
 edition.workspace = true
 

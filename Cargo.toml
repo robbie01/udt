@@ -1,8 +1,14 @@
 [workspace]
 resolver = "2"
-members = ["udt", "udt/udt-sys"]
+members = [
+    "udt-compat",
+    "udt-compat/udt-sys",
+    "udt-proto",
+    "udt-async",
+    "udt-compio",
+    "tests/integration",
+]
 
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
-
