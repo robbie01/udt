@@ -741,7 +741,14 @@ async fn run_conn_driver(
                             let _ = tx.send(());
                         }
                     }
-                    Output::Disconnected(_) => {
+                    Output::Disconnected(reason) => {
+                        if std::env::var_os("UDT_DEBUG").is_some() {
+                            eprintln!(
+                                "[conn {}] disconnected: {reason:?} {:?}",
+                                conn.debug_state().socket_id,
+                                conn.debug_state(),
+                            );
+                        }
                         done = true;
                     }
                 }

@@ -1,0 +1,23 @@
+[package]
+name = "udt-orig"
+version.workspace = true
+edition.workspace = true
+description = "Blocking-mode bindings to unmodified upstream UDT, for regression-testing the modified fork in udt-compat"
+
+# Declares the native library this crate provides. `udt-compat/udt-sys` claims
+# "udt". The distinct name is what makes Cargo complain if anything ever tries
+# to pull both native UDT builds into one link unit — see the note in lib.rs
+# about why they must never meet.
+links = "udt-orig"
+
+[dependencies]
+cxx = "1"
+libc = "0.2"
+cfg-if = "1"
+os_socketaddr = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["ws2def"] }
+
+[build-dependencies]
+cxx-build = "1"

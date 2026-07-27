@@ -6,7 +6,9 @@ members = [
     "udt-proto",
     "udt-async",
     "udt-compio",
+    "udt-orig",
     "tests/integration",
+    "tests/upstream-compat",
 ]
 
 [workspace.package]

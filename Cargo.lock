@@ -1368,6 +1368,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "udt-orig"
+version = "0.0.0"
+dependencies = [
+ "cfg-if",
+ "cxx",
+ "cxx-build",
+ "libc",
+ "os_socketaddr",
+ "winapi",
+]
+
+[[package]]
 name = "udt-proto"
 version = "0.0.0"
 dependencies = [
@@ -1387,6 +1399,15 @@ dependencies = [
  "range-set",
  "scc",
  "tokio",
+]
+
+[[package]]
+name = "udt-upstream-compat-tests"
+version = "0.0.0"
+dependencies = [
+ "tokio",
+ "udt-async",
+ "udt-orig",
 ]
 
 [[package]]
