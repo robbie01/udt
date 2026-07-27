@@ -1,10 +1,12 @@
 use std::io;
 
 #[allow(dead_code)]
+#[allow(unsafe_code)] // FFI into the C++ implementation
 pub unsafe fn udt_strerror() -> String {
     unsafe { udt_sys::getlasterror_desc() }.to_string_lossy().into_owned()
 }
 
+#[allow(unsafe_code)] // FFI into the C++ implementation
 pub unsafe fn udt_getlasterror() -> io::Error {
     let code = unsafe { udt_sys::getlasterror_code() };
     let kind = match code {

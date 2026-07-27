@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 mod instance;
 mod util;
 use std::{io, mem, net::SocketAddr, ptr, sync::Arc, time::Duration};
@@ -24,6 +26,7 @@ struct Socket {
 }
 
 impl Socket {
+    #[allow(unsafe_code)] // FFI into the C++ implementation
     fn local_addr_os(&self) -> io::Result<OsSocketAddr> {
         let mut addr = OsSocketAddr::new();
         let mut namelen = addr.len() as i32;
@@ -34,6 +37,7 @@ impl Socket {
         Ok(addr)
     }
 
+    #[allow(unsafe_code)] // FFI into the C++ implementation
     fn peer_addr_os(&self) -> io::Result<OsSocketAddr> {
         let mut addr = OsSocketAddr::new();
         let mut namelen = addr.len() as i32;
@@ -52,16 +56,19 @@ impl Socket {
         self.peer_addr_os().map(|addr| addr.into_addr().unwrap())
     }
 
+    #[allow(unsafe_code)] // FFI into the C++ implementation
     fn readable(&self) -> impl Future<Output = io::Result<()>> {
         let rpoll = unsafe { udt_sys::getrpoll() };
         rpoll.readable(self.inner).unwrap().map(|_| Ok(()))
     }
 
+    #[allow(unsafe_code)] // FFI into the C++ implementation
     fn writable(&self) -> impl Future<Output = io::Result<()>> {
         let rpoll = unsafe { udt_sys::getrpoll() };
         rpoll.writable(self.inner).unwrap().map(|_| Ok(()))
     }
 
+    #[allow(unsafe_code)] // FFI into the C++ implementation
     fn send_data(&self) -> u32 {
         let mut inflight = 0;
         let mut _optlen = 0;
@@ -77,6 +84,7 @@ impl Socket {
 }
 
 impl Drop for Socket {
+    #[allow(unsafe_code)] // FFI into the C++ implementation
     fn drop(&mut self) {
         unsafe { udt_sys::close(self.inner) };
     }
@@ -98,6 +106,7 @@ pub struct Connection {
 }
 
 impl Endpoint {
+    #[allow(unsafe_code)] // FFI into the C++ implementation
     pub fn bind(addr: SocketAddr) -> io::Result<Self> {
         let inst = Instance::default();
         let binding = unsafe { udt_sys::socket(
@@ -128,6 +137,7 @@ impl Endpoint {
         self.binding.local_addr()
     }
 
+    #[allow(unsafe_code)] // FFI into the C++ implementation
     fn listen_(&self, type_: i32, backlog: u32) -> io::Result<Socket> {
         let inst = Instance::default();
         let addr = self.binding.local_addr_os()?;
@@ -157,6 +167,7 @@ impl Endpoint {
         Ok(Socket { _inst: inst, inner: u})
     }
 
+    #[allow(unsafe_code)] // FFI into the C++ implementation
     fn connect_(&self, type_: i32, addr: SocketAddr, rendezvous: bool) -> io::Result<Socket> {
         let inst = Instance::default();
         let local_addr = self.binding.local_addr_os()?;
@@ -220,6 +231,7 @@ impl Listener {
         self.u.local_addr()
     }
 
+    #[allow(unsafe_code)] // FFI into the C++ implementation
     pub fn try_accept(&self) -> io::Result<Connection> {
         let inst = Instance::default();
         let u = unsafe { udt_sys::accept(self.u.inner, ptr::null_mut(), ptr::null_mut()) };
@@ -254,6 +266,7 @@ impl Connection {
         self.u.peer_addr()
     }
 
+    #[allow(unsafe_code)] // FFI into the C++ implementation
     pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         let res = unsafe { udt_sys::recvmsg(self.u.inner, buf.as_mut_ptr().cast(), buf.len().try_into().unwrap_or(i32::MAX)) };
         if res == -1 {
@@ -262,6 +275,7 @@ impl Connection {
         Ok(res.try_into().unwrap())
     }
 
+    #[allow(unsafe_code)] // FFI into the C++ implementation
     pub fn try_send_with(&self, buf: &[u8], ttl: Option<Duration>, inorder: bool) -> io::Result<usize> {
         // TODO: inorder=false has a flawed implementation. UDT still applies windowing
         // in order to avoid replay attacks, so if a large burst of reliable out-of-order

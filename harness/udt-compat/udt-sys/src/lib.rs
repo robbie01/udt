@@ -1,3 +1,8 @@
+// Raw FFI bindings. The cxx bridge below generates unsafe code, and every
+// declaration crossing into C++ is unsafe by construction, so this crate is
+// exempt rather than annotated item by item. Safe wrappers live in udt-compat.
+#![allow(unsafe_code)]
+
 mod rpoll;
 // mod list;
 

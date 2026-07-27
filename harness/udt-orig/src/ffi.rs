@@ -10,6 +10,10 @@
 //! upstream has `UDT_RCVSYN`, so copying its numbering would silently set the
 //! wrong option here.
 
+// This module is the FFI boundary: every declaration in it is necessarily
+// unsafe, so the allow sits here rather than on each item.
+#![allow(unsafe_code)]
+
 use std::os::raw::c_int;
 
 #[repr(transparent)]

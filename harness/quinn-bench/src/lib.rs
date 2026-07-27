@@ -16,6 +16,8 @@
 //! Run with:
 //! `cargo test -p quinn-bench --release -- --ignored --nocapture --test-threads=1`
 
+#![forbid(unsafe_code)]
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;

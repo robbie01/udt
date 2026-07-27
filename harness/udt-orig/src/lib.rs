@@ -42,6 +42,8 @@
 //! take 0.12 s instead stalled and failed with ECONNLOST. Leave the UDT-level
 //! timeouts at their infinite default and bound the wait from the Rust side.
 
+#![deny(unsafe_code)]
+
 use std::io;
 use std::mem;
 use std::net::SocketAddr;
@@ -71,6 +73,7 @@ static INSTANCES: Mutex<usize> = Mutex::new(0);
 struct Instance;
 
 impl Instance {
+    #[allow(unsafe_code)] // FFI into the C++ implementation
     fn acquire() -> Self {
         let mut n = INSTANCES.lock().unwrap();
         if *n == 0 {
@@ -82,6 +85,7 @@ impl Instance {
 }
 
 impl Drop for Instance {
+    #[allow(unsafe_code)] // FFI into the C++ implementation
     fn drop(&mut self) {
         let mut n = INSTANCES.lock().unwrap();
         *n -= 1;
@@ -91,6 +95,7 @@ impl Drop for Instance {
     }
 }
 
+#[allow(unsafe_code)] // FFI into the C++ implementation
 fn last_error() -> io::Error {
     let code = unsafe { ffi::getlasterror_code() };
     io::Error::other(format!("UDT error {code}"))
@@ -104,6 +109,7 @@ struct Sock {
 }
 
 impl Sock {
+    #[allow(unsafe_code)] // FFI into the C++ implementation
     fn new(af: i32) -> io::Result<Self> {
         let inst = Instance::acquire();
         let raw = unsafe { ffi::socket(af, SOCK_DGRAM, 0) };
@@ -119,6 +125,7 @@ impl Sock {
         Ok(s)
     }
 
+    #[allow(unsafe_code)] // FFI into the C++ implementation
     fn set_bool(&self, opt: ffi::SocketOption, value: bool) -> io::Result<()> {
         let res = unsafe {
             ffi::setsockopt(
@@ -132,12 +139,14 @@ impl Sock {
         if res == -1 { Err(last_error()) } else { Ok(()) }
     }
 
+    #[allow(unsafe_code)] // FFI into the C++ implementation
     fn bind(&self, addr: SocketAddr) -> io::Result<()> {
         let os: OsSocketAddr = addr.into();
         let res = unsafe { ffi::bind(self.raw, os.as_ptr().cast(), os.len() as i32) };
         if res == -1 { Err(last_error()) } else { Ok(()) }
     }
 
+    #[allow(unsafe_code)] // FFI into the C++ implementation
     fn local_addr(&self) -> io::Result<SocketAddr> {
         let mut os = OsSocketAddr::new();
         let mut len = os.len() as i32;
@@ -151,6 +160,7 @@ impl Sock {
 }
 
 impl Drop for Sock {
+    #[allow(unsafe_code)] // FFI into the C++ implementation
     fn drop(&mut self) {
         unsafe { ffi::close(self.raw) };
     }
@@ -187,6 +197,7 @@ impl Endpoint {
     }
 
     /// Start listening. Blocks in [`Listener::accept`].
+    #[allow(unsafe_code)] // FFI into the C++ implementation
     pub fn listen(&self, backlog: u32) -> io::Result<Listener> {
         let addr = self.binding.local_addr()?;
         let u = Sock::new(af_of(addr))?;
@@ -199,6 +210,7 @@ impl Endpoint {
     }
 
     /// Connect to `addr`. **Blocks** until the handshake completes or times out.
+    #[allow(unsafe_code)] // FFI into the C++ implementation
     pub fn connect(&self, addr: SocketAddr, rendezvous: bool) -> io::Result<Connection> {
         let local = self.binding.local_addr()?;
         let u = Sock::new(af_of(local))?;
@@ -225,6 +237,7 @@ impl Listener {
     }
 
     /// **Blocks** until a peer connects.
+    #[allow(unsafe_code)] // FFI into the C++ implementation
     pub fn accept(&self) -> io::Result<Connection> {
         let inst = Instance::acquire();
         let raw = unsafe { ffi::accept(self.u.raw, std::ptr::null_mut(), std::ptr::null_mut()) };
@@ -250,6 +263,7 @@ impl Connection {
     /// ones that are still in flight; `ttl` bounds how long it may be
     /// retransmitted. Both are exposed so the out-of-order and TTL paths can be
     /// exercised against upstream.
+    #[allow(unsafe_code)] // FFI into the C++ implementation
     pub fn send_with(&self, buf: &[u8], ttl: Option<Duration>, in_order: bool) -> io::Result<usize> {
         let res = unsafe {
             ffi::sendmsg(
@@ -272,6 +286,7 @@ impl Connection {
     }
 
     /// Receive one message. **Blocks** until one arrives.
+    #[allow(unsafe_code)] // FFI into the C++ implementation
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         let res = unsafe {
             ffi::recvmsg(

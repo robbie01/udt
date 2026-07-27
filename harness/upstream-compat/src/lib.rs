@@ -10,6 +10,8 @@
 //! so a stall fails the test instead of hanging the run; `udt-orig` also sets
 //! UDT-level send/receive timeouts as a second line of defence.
 
+#![forbid(unsafe_code)]
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
