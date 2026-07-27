@@ -9,6 +9,7 @@ use bytes::Bytes;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::batch;
 use udt_proto::{CcKind, Connection, Output, SendOutcome};
 use udt_proto::listener::{ListenerState, ListenerOutput, PeerAddr};
 use udt_proto::seq::SeqNo;
@@ -73,6 +74,10 @@ pub const DEFAULT_MSS: u32 = 1500;
 /// packets instead of paying it per packet.  The cap keeps one busy connection
 /// from starving the send path or the timer.
 const RECV_BATCH: usize = 64;
+
+/// Datagrams drained from a socket per wakeup before returning to the event
+/// loop, across however many batch calls that takes.
+const RECV_DRAIN_CAP: usize = 64;
 
 /// Kernel UDP send buffer, in bytes.  Matches C++ `m_iUDPSndBufSize`.
 const UDP_SND_BUF: usize = 65_536;
@@ -729,7 +734,20 @@ async fn run_conn_driver(
     mut connected_tx: Option<oneshot::Sender<()>>,
 ) {
     let mut out: Vec<Output> = Vec::new();
-    let mut recv_buf = vec![0u8; 65536];
+    // Batched IO. On platforms without segmentation offload this degrades to
+    // one datagram per call, i.e. exactly the previous behaviour.
+    let mut io = match batch::BatchIo::new(&socket) {
+        Ok(io) => io,
+        Err(_) => return,
+    };
+    // Consecutive datagrams awaiting a coalesced send.
+    let mut pending: Vec<Bytes> = Vec::new();
+    // Receive scratch: one buffer per datagram in a batch, each large enough to
+    // hold a GRO-coalesced run.
+    let gro = io.gro_segments().max(1);
+    let mut rx_storage: Vec<Vec<u8>> =
+        (0..batch::RECV_BATCH).map(|_| vec![0u8; 2048 * gro]).collect();
+    let mut rx_metas = vec![quinn_udp::RecvMeta::default(); batch::RECV_BATCH];
     // Pending flush barrier: resolved once snd_buf drains.
     let mut pending_flush: Option<oneshot::Sender<()>> = None;
     // Message awaiting send-buffer space; see `BlockedSend`.
@@ -745,9 +763,15 @@ async fn run_conn_driver(
         let mut done = false;
         while !out.is_empty() {
             for item in std::mem::take(&mut out) {
+                // Anything that is not a datagram ends the current run: flush
+                // first so ordering against the other side effects is preserved.
+                if !matches!(item, Output::SendDatagram(_)) && !pending.is_empty() {
+                    let _ = io.send_all(&socket, peer_addr, &pending).await;
+                    pending.clear();
+                }
                 match item {
                     Output::SendDatagram(bytes) => {
-                        let _ = socket.send_to(&bytes, peer_addr).await;
+                        pending.push(bytes);
                     }
                     Output::DataReady => {
                         while let Some(msg) = conn.recv_msg() {
@@ -782,8 +806,12 @@ async fn run_conn_driver(
         // Flush any SendDatagrams that were queued after a Disconnected.
         for leftover in std::mem::take(&mut out) {
             if let Output::SendDatagram(bytes) = leftover {
-                let _ = socket.send_to(&bytes, peer_addr).await;
+                pending.push(bytes);
             }
+        }
+        if !pending.is_empty() {
+            let _ = io.send_all(&socket, peer_addr, &pending).await;
+            pending.clear();
         }
 
         // Retry a message that previously found the send buffer full.  ACKs
@@ -860,29 +888,32 @@ async fn run_conn_driver(
         } else {
             // Active connection: reads from the dedicated per-connection socket.
             tokio::select! {
-                result = socket.recv_from(&mut recv_buf) => {
-                    match result {
-                        Ok((n, from)) => {
-                            if from == peer_addr {
-                                let bytes = Bytes::copy_from_slice(&recv_buf[..n]);
-                                conn.on_datagram(bytes, now_us(), &mut out);
+                result = io.recv_batch(&socket, &mut rx_storage, &mut rx_metas) => {
+                    let Ok(mut count) = result else { return };
+                    // One call may return several datagrams (recvmmsg), and each
+                    // buffer may itself hold several coalesced by generic
+                    // receive offload. Where the platform has neither, drain in
+                    // a loop so one wakeup does not cost one packet.
+                    let mut drained = 0;
+                    loop {
+                        for i in 0..count {
+                            if rx_metas[i].addr != peer_addr {
+                                continue;
                             }
-                            // Drain the socket in the same wakeup — see above.
-                            let mut batched = 1;
-                            while batched < RECV_BATCH {
-                                match socket.try_recv_from(&mut recv_buf) {
-                                    Ok((n, from)) => {
-                                        if from == peer_addr {
-                                            let bytes = Bytes::copy_from_slice(&recv_buf[..n]);
-                                            conn.on_datagram(bytes, now_us(), &mut out);
-                                        }
-                                        batched += 1;
-                                    }
-                                    Err(_) => break, // WouldBlock, or a real error we take next round
-                                }
+                            for dg in batch::split_gro(&rx_storage[i], &rx_metas[i]) {
+                                conn.on_datagram(
+                                    Bytes::copy_from_slice(dg), now_us(), &mut out,
+                                );
                             }
                         }
-                        Err(_) => return,
+                        drained += count;
+                        if drained >= RECV_DRAIN_CAP {
+                            break;
+                        }
+                        match io.try_recv_batch(&socket, &mut rx_storage, &mut rx_metas) {
+                            Ok(n) if n > 0 => count = n,
+                            _ => break,
+                        }
                     }
                 }
                 // Stop accepting new work while a message is waiting for buffer

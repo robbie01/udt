@@ -6,6 +6,8 @@
 #![forbid(unsafe_code)]
 
 #[cfg(feature = "tokio")]
+mod batch;
+#[cfg(feature = "tokio")]
 mod tokio_impl;
 #[cfg(feature = "tokio")]
 pub use tokio_impl::{
