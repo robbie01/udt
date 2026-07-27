@@ -1127,6 +1127,78 @@ mod tests {
         )
     }
 
+    /// Long-running single-connection transfer, for attaching a profiler.
+    ///
+    /// The ordinary `stream_rust_to_rust` finishes in well under a second, so a
+    /// sampling profiler catches mostly process startup. This repeats the
+    /// transfer for roughly ten seconds on one connection.
+    ///
+    /// `cargo test --release profile_stream -- --ignored --nocapture &`
+    /// then `sample <pid> 5 -file /tmp/prof.txt`
+    ///
+    /// # What the profile says (macOS, 2026-07)
+    ///
+    /// Discounting parked threads (`__psynch_cvwait`, which is idle time), the
+    /// non-idle profile is almost entirely system calls:
+    ///
+    /// ```text
+    /// __sendto           2430
+    /// __recvfrom         1074
+    /// kevent             1000
+    /// _platform_memmove   120
+    /// all udt_proto + udt_async code combined  ~200
+    /// ```
+    ///
+    /// Our own code — packet assembly, the receive ring, congestion control —
+    /// is a few percent. The per-packet copies and allocations that look
+    /// expensive when reading the source are not where the time goes, and
+    /// shaving them further would not move the number.
+    ///
+    /// Single-connection throughput is therefore a **syscall-rate ceiling**:
+    /// ~375 MB/s at a 1436-byte payload is ~260k packets/s, and every packet
+    /// costs one `sendto` on one side and one `recvfrom` on the other. The
+    /// two-connection benchmark reaches ~580 MB/s precisely because it spreads
+    /// those syscalls over more cores.
+    ///
+    /// Note `sendto` outnumbers `recvfrom` roughly 2:1: the receive path already
+    /// batches (`RECV_BATCH` drains everything queued per wakeup) while the send
+    /// path cannot — UDP is one datagram per call. Closing that asymmetry needs
+    /// `sendmmsg`/`recvmmsg`, which macOS does not have; on Linux it is the one
+    /// change with real headroom left. Raising the MSS would also cut packets
+    /// per byte, but changes what the benchmark measures and does not reflect a
+    /// 1500-byte-MTU path.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn profile_stream_rust_to_rust() {
+        const ROUNDS: usize = 12;
+        let (mut server, mut client) = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
+        let chunk = vec![0x5Au8; BENCH_CHUNK];
+
+        let start = std::time::Instant::now();
+        let mut total = 0usize;
+        for _ in 0..ROUNDS {
+            let c = chunk.clone();
+            let sender = tokio::spawn(async move {
+                let mut sent = 0usize;
+                while sent < BENCH_TOTAL {
+                    if client.send(&c).await.is_err() {
+                        break;
+                    }
+                    sent += BENCH_CHUNK;
+                }
+                client
+            });
+            let mut buf = vec![0u8; BENCH_CHUNK * 2];
+            let mut got = 0usize;
+            while got < BENCH_TOTAL {
+                got += server.recv(&mut buf).await.unwrap();
+            }
+            total += got;
+            client = sender.await.unwrap();
+        }
+        report("profile rust→rust", total, start.elapsed().as_secs_f64());
+    }
+
     // ── Streaming throughput ──────────────────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread")]
