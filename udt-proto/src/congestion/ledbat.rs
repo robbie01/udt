@@ -57,6 +57,25 @@ const INIT_CWND: f64 = 2.0;
 const SLOWDOWN_CWND: f64 = 2.0;
 /// Current-delay filter width, in samples.
 const FILTER: usize = 4;
+/// Slack above the flight size that the window may reach, in packets.
+/// RFC 6817 §2.4.2 `ALLOWED_INCREASE`; XNU's `tcp_ledbat_allowed_increase`.
+const ALLOWED_INCREASE: f64 = 8.0;
+/// How far the window may exceed the flight size, as a left shift.
+/// XNU's `tcp_ledbat_tether_shift`; 1 means "at most twice the flight size".
+const TETHER_SHIFT: u32 = 1;
+/// Floor on the interval between periodic slowdowns.
+///
+/// LEDBAT++ schedules slowdowns purely relative to RTT (next at 9x the
+/// slowdown's own duration, itself 2 RTT). That is sensible at internet RTTs —
+/// roughly a second apart at 50 ms — but degenerates on fast paths: at the
+/// ~60 us RTT of loopback it fires about a thousand times a second, so the flow
+/// spends its life pinned at two packets or ramping back, for no congestion
+/// signal at all. Clamping to wall-clock time reproduces the intended cadence
+/// instead of scaling it into absurdity.
+const MIN_SLOWDOWN_INTERVAL_US: u64 = 1_000_000;
+/// Ceiling, so a very long RTT cannot postpone base-delay re-measurement
+/// indefinitely.
+const MAX_SLOWDOWN_INTERVAL_US: u64 = 10_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -153,10 +172,28 @@ impl Ledbat {
         (ctx.rtt_us as u64).max(1)
     }
 
+    /// Clamp an RTT-derived slowdown interval to sane wall-clock bounds.
+    fn slowdown_gap(rtt_derived_us: u64) -> u64 {
+        rtt_derived_us.clamp(MIN_SLOWDOWN_INTERVAL_US, MAX_SLOWDOWN_INTERVAL_US)
+    }
+
+    /// Cap the window against what the application is actually using.
+    ///
+    /// Without this a flow that is application-limited — or on a path with no
+    /// queue to sense, such as loopback — grows its window without bound,
+    /// because the delay signal that would otherwise stop it never fires. The
+    /// window is then meaningless as a congestion estimate and the flow bursts
+    /// the moment the application has data. RFC 6817 §2.4.2; XNU applies the
+    /// same clamp in `tcp_ledbat_congestion_avd`.
+    fn tethered(&self, ctx: &CcContext) -> f64 {
+        let max_allowed = ALLOWED_INCREASE + ((ctx.flight_size << TETHER_SHIFT) as f64);
+        self.cwnd.min(max_allowed).max(MIN_CWND)
+    }
+
     /// Pace the window across one RTT rather than emitting it back to back —
     /// bursting builds exactly the queue this controller exists to avoid.
     fn output(&self, ctx: &CcContext) -> CcOutput {
-        let cwnd = self.cwnd.max(MIN_CWND);
+        let cwnd = self.tethered(ctx);
         CcOutput {
             pkt_snd_period_us: (Self::rtt_of(ctx) as f64 / cwnd).max(1.0),
             cwnd,
@@ -210,7 +247,7 @@ impl CongestionControl for Ledbat {
                     self.phase = Phase::Steady;
                     self.phase_started_us = ctx.now_us;
                     // First slowdown two RTTs after slow start completes.
-                    self.next_slowdown_us = ctx.now_us + 2 * rtt;
+                    self.next_slowdown_us = ctx.now_us + Self::slowdown_gap(2 * rtt);
                 }
             }
             Phase::Steady => {
@@ -250,7 +287,7 @@ impl CongestionControl for Ledbat {
                     // "the next slowdown is scheduled to occur at 9 times this
                     // duration" — LEDBAT++ §3.5.
                     self.next_slowdown_us =
-                        ctx.now_us + 9 * self.last_slowdown_len_us.max(rtt);
+                        ctx.now_us + Self::slowdown_gap(9 * self.last_slowdown_len_us.max(rtt));
                 }
             }
         }
@@ -273,7 +310,7 @@ impl CongestionControl for Ledbat {
         if self.phase == Phase::SlowStart {
             self.phase = Phase::Steady;
             self.phase_started_us = ctx.now_us;
-            self.next_slowdown_us = ctx.now_us + 2 * rtt;
+            self.next_slowdown_us = ctx.now_us + Self::slowdown_gap(2 * rtt);
         }
         self.output(&ctx)
     }
@@ -297,6 +334,7 @@ mod tests {
             rcv_rate_pps: 50_000,
             rtt_us,
             snd_curr_seq: SeqNo::new(snd),
+            flight_size: 8192,
             flow_wnd: 8192.0,
             syn_interval_us: 10_000,
             now_us,

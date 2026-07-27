@@ -211,6 +211,7 @@ mod tests {
             rcv_rate_pps: 900,
             rtt_us: 10_000,
             snd_curr_seq: SeqNo::new(100),
+            flight_size: 100,
             flow_wnd: 25600.0,
             syn_interval_us: 10_000,
             now_us,

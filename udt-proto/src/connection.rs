@@ -1240,6 +1240,7 @@ impl Connection {
             rcv_rate_pps: rcv_rate,
             rtt_us: self.rtt_us as u32,
             snd_curr_seq: self.snd_curr_seq,
+            flight_size: self.snd_buf.as_ref().map_or(0, |b| b.in_flight()) as u32,
             flow_wnd: self.flow_wnd as f64,
             syn_interval_us: SYN_US,
             now_us,

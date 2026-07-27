@@ -1,5 +1,7 @@
 pub mod udt_cc;
 pub mod ledbat;
+#[cfg(test)]
+mod sim;
 
 use crate::seq::SeqNo;
 
@@ -11,6 +13,12 @@ pub struct CcContext {
     pub rcv_rate_pps: u32,
     pub rtt_us: u32,
     pub snd_curr_seq: SeqNo,
+    /// Packets sent but not yet acknowledged.
+    ///
+    /// Delay-based controllers need this to bound the window against what the
+    /// application is actually using: with no queue to sense, nothing else stops
+    /// the window growing without limit. See RFC 6817 §2.4.2 `ALLOWED_INCREASE`.
+    pub flight_size: u32,
     /// Flow window size (packets), advertised by the receiver.
     pub flow_wnd: f64,
     /// SYN interval (µs) = 10_000.

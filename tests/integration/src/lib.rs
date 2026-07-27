@@ -504,13 +504,17 @@ mod tests {
         let _held = sender.await.unwrap();
     }
 
-    /// The property that defines a scavenger: when a LEDBAT++ flow shares a
-    /// path with a default (UDT) flow, it must give way.
+    /// Sanity check that two flows with different controllers coexist on a real
+    /// socket and neither starves.
     ///
-    /// Both flows run concurrently for a fixed window and we compare how much
-    /// each moved. Loopback is a poor congestion signal — there is no real
-    /// bottleneck queue — so this asserts only the direction of the effect,
-    /// generously, rather than a precise share.
+    /// **This is not the yielding test.** Loopback has no bottleneck queue, so
+    /// queuing delay never rises and a delay-based controller has nothing to
+    /// yield to — a share measured here says nothing about whether it *would*.
+    /// Expect LEDBAT to take a substantial fraction, and that to be correct:
+    /// declining to use idle capacity would be a bug, not a virtue.
+    ///
+    /// The real test is `congestion::sim` in udt-proto, which models an actual
+    /// bottleneck and shows LEDBAT taking a few percent of a contested link.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn ledbat_yields_to_default_flow() {
