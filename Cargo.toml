@@ -9,6 +9,7 @@ members = [
     "udt-orig",
     "tests/integration",
     "tests/upstream-compat",
+    "tests/quinn-bench",
 ]
 
 [workspace.package]
