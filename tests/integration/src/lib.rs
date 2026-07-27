@@ -516,6 +516,122 @@ mod tests {
         let _client = sender.await.unwrap();
     }
 
+    // ── Out-of-order and TTL delivery ─────────────────────────────────────────
+    //
+    // `send_with(buf, ttl, in_order)` exposes two opt-in relaxations of strict
+    // reliable ordering:
+    //
+    //  * `in_order = false` lets the peer surface a message as soon as it is
+    //    complete, ahead of earlier ones still missing packets.
+    //  * `ttl = Some(d)` lets the sender give up on a message that has not been
+    //    delivered within `d`, telling the peer to skip its sequence range.
+    //
+    // The C++ reference livelocks under the first at throughput: its sender
+    // advances past sequence numbers with no backing block, desynchronising the
+    // positional block-to-sequence mapping that retransmission depends on, and
+    // its receiver silently discards anything below the ACK point with no
+    // feedback at all. These tests pin down that the Rust implementation
+    // sustains the same workload.
+
+    /// Unordered sends at full rate — the shape the user reported as livelocking
+    /// against C++. Every message must still arrive exactly once, intact; only
+    /// the *order* is allowed to vary.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unordered_stream_sustains_throughput() {
+        const MSGS: usize = 3000;
+        const CHUNK: usize = 4096;
+
+        let (mut server, client) = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
+
+        let sender = tokio::spawn(async move {
+            for i in 0..MSGS {
+                let chunk = vec![pattern(i); CHUNK];
+                client
+                    .send_with(&chunk, None, false)
+                    .await
+                    .expect("unordered send failed");
+            }
+            client
+        });
+
+        // Track which fills arrived. Order is explicitly not asserted; delivery
+        // of every message exactly once is.
+        let mut seen = vec![0usize; 251];
+        let mut buf = vec![0u8; CHUNK * 2];
+        let start = std::time::Instant::now();
+        for i in 0..MSGS {
+            let n = tokio::time::timeout(Duration::from_secs(20), server.recv(&mut buf))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("unordered stream stalled after {i} of {MSGS} messages")
+                })
+                .expect("recv failed");
+            assert_eq!(n, CHUNK, "message {i} has wrong length");
+            let fill = buf[0];
+            assert!(
+                buf[..n].iter().all(|&b| b == fill),
+                "message {i} is not a single fill — payloads were spliced",
+            );
+            seen[fill as usize] += 1;
+        }
+        let elapsed = start.elapsed();
+
+        let mut expected = vec![0usize; 251];
+        for i in 0..MSGS {
+            expected[pattern(i) as usize] += 1;
+        }
+        assert_eq!(seen, expected, "message multiset differs — data lost or duplicated");
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "unordered stream took {elapsed:?}, which suggests a livelock rather than progress",
+        );
+        let _held = sender.await.unwrap();
+    }
+
+    /// A message whose TTL expires before it can be delivered is skipped, and
+    /// the connection carries on cleanly rather than stalling on the gap.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn expired_messages_are_skipped_without_stalling() {
+        const AFTER: usize = 200;
+        let (mut server, client) = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
+
+        // A TTL of zero expires the moment the send path reconsiders the
+        // message, so this deterministically exercises the drop path.
+        client
+            .send_with(&vec![0xEEu8; 8192], Some(Duration::from_millis(0)), false)
+            .await
+            .expect("ttl send failed");
+
+        let sender = tokio::spawn(async move {
+            for i in 0..AFTER {
+                let chunk = vec![pattern(i); 2048];
+                client.send(&chunk).await.expect("send failed");
+            }
+            client
+        });
+
+        // Everything sent afterwards must still arrive, in order, whether or not
+        // the expired message made it.
+        let mut buf = vec![0u8; 16384];
+        let mut got = 0usize;
+        while got < AFTER {
+            let n = tokio::time::timeout(Duration::from_secs(20), server.recv(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("stalled after {got} of {AFTER} follow-up messages"))
+                .expect("recv failed");
+            if n == 8192 && buf[0] == 0xEE {
+                continue; // the TTL message beat its own deadline; fine either way
+            }
+            assert_eq!(n, 2048, "unexpected message length {n}");
+            assert!(
+                buf[..n].iter().all(|&b| b == pattern(got)),
+                "follow-up message {got} out of order or corrupted",
+            );
+            got += 1;
+        }
+        let _held = sender.await.unwrap();
+    }
+
     // ── C++ interop integrity ─────────────────────────────────────────────────
     //
     // Bulk transfers across the Rust/C++ boundary with every byte verified.
@@ -683,6 +799,137 @@ mod tests {
             );
         }
         let _held = sender.await.unwrap();
+    }
+
+    /// Unordered sends from Rust into the C++ receiver, exercising its
+    /// `scanMsg` early-delivery path.
+    ///
+    /// Ignored by default and reporting rather than asserting: this documents
+    /// how far the reference gets before its out-of-order path gives out, which
+    /// is the behaviour the Rust side deliberately does not reproduce. Run with
+    /// `cargo test --release unordered_into_cpp -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn unordered_into_cpp_reference() {
+        const MSGS: usize = 3000;
+        const CHUNK: usize = 4096;
+
+        let (cpp_conn, rust_sock) = new_s3_pair().await;
+
+        let sender = tokio::spawn(async move {
+            for i in 0..MSGS {
+                let chunk = vec![pattern(i); CHUNK];
+                if rust_sock.send_with(&chunk, None, false).await.is_err() {
+                    return (rust_sock, i);
+                }
+            }
+            (rust_sock, MSGS)
+        });
+
+        let mut buf = vec![0u8; CHUNK * 2];
+        let start = std::time::Instant::now();
+        let mut got = 0usize;
+        let mut misordered = 0usize;
+        while got < MSGS {
+            match tokio::time::timeout(Duration::from_secs(5), cpp_conn.recv(&mut buf)).await {
+                Ok(Ok(n)) => {
+                    if n != CHUNK || buf[0] != pattern(got) {
+                        misordered += 1;
+                    }
+                    got += 1;
+                }
+                Ok(Err(e)) => {
+                    println!("[unordered→cpp] C++ recv failed after {got}/{MSGS}: {e}");
+                    break;
+                }
+                Err(_) => {
+                    println!("[unordered→cpp] C++ stalled after {got}/{MSGS} messages");
+                    break;
+                }
+            }
+        }
+        println!(
+            "[unordered→cpp] delivered {got}/{MSGS} in {:.2}s ({misordered} out of sequence)",
+            start.elapsed().as_secs_f64(),
+        );
+        let (_held, sent) = sender.await.unwrap();
+        println!("[unordered→cpp] Rust queued {sent}/{MSGS}");
+    }
+
+    /// The reverse: C++ as the *sender* of unordered, TTL-bearing messages at
+    /// full rate — the configuration behind the reported livelock.
+    ///
+    /// **This does not reproduce the livelock on loopback, and is not expected
+    /// to.** C++'s drop path only fires when a TTL-expired block is on the send
+    /// loss list, which needs real packet loss; loopback with 12 MB socket
+    /// buffers produces essentially none, and the reference completes cleanly
+    /// here. Reproducing it needs a lossy path (netem, or a deliberately tiny
+    /// receive buffer). The test is kept as the harness for that.
+    ///
+    /// When the path does fire, C++ `packData` emits a MsgDrop naming one
+    /// sequence number too many and advances `m_iSndCurrSeqNo` past sequence
+    /// numbers with no backing block, desynchronising the positional
+    /// block-to-sequence mapping every later `readData(offset)` depends on.
+    /// `udt-proto` avoids both: `expire_msg_at` reports an exact inclusive range
+    /// and consumes the sequence numbers rather than skipping them.
+    ///
+    /// Note `udt_compat::Connection::try_send_with` forces `inorder = true`
+    /// whenever no TTL is given, precisely to keep applications off this path;
+    /// supplying a TTL is what unlocks it. Ignored and reporting, not asserting.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn unordered_from_cpp_reference() {
+        const MSGS: usize = 3000;
+        const CHUNK: usize = 4096;
+        let ttl = Some(Duration::from_millis(20));
+
+        let (mut rust_sock, cpp_conn) = new_s2_pair().await;
+
+        let sender = tokio::spawn(async move {
+            for i in 0..MSGS {
+                let chunk = vec![pattern(i); CHUNK];
+                match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    cpp_conn.send_with(&chunk, ttl, false),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        println!("[unordered←cpp] C++ send failed at {i}/{MSGS}: {e}");
+                        return (cpp_conn, i);
+                    }
+                    Err(_) => {
+                        println!("[unordered←cpp] C++ send stalled at {i}/{MSGS}");
+                        return (cpp_conn, i);
+                    }
+                }
+            }
+            (cpp_conn, MSGS)
+        });
+
+        let mut buf = vec![0u8; CHUNK * 2];
+        let start = std::time::Instant::now();
+        let mut got = 0usize;
+        while got < MSGS {
+            match tokio::time::timeout(Duration::from_secs(5), rust_sock.recv(&mut buf)).await {
+                Ok(Ok(_)) => got += 1,
+                Ok(Err(e)) => {
+                    println!("[unordered←cpp] Rust recv failed after {got}/{MSGS}: {e}");
+                    break;
+                }
+                Err(_) => {
+                    println!("[unordered←cpp] stalled after {got}/{MSGS} messages");
+                    break;
+                }
+            }
+        }
+        println!(
+            "[unordered←cpp] delivered {got}/{MSGS} in {:.2}s",
+            start.elapsed().as_secs_f64(),
+        );
+        let (_held, sent) = sender.await.unwrap();
+        println!("[unordered←cpp] C++ queued {sent}/{MSGS}");
     }
 
     // ── Benchmarks ────────────────────────────────────────────────────────────

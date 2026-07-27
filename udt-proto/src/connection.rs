@@ -662,7 +662,7 @@ impl Connection {
                 // ACK would let the ring fill up within a single 10 ms SYN
                 // interval at high rates, after which every arrival is rejected
                 // as out-of-window until the ACK finally lands.
-                buf.slide_window();
+                buf.reclaim();
                 out.push(Output::DataReady);
             }
         }
@@ -717,7 +717,15 @@ impl Connection {
                 out.push(Output::Disconnected(DisconnectReason::Shutdown));
             }
             ControlBody::MsgDrop { msg_no, first, last } => {
-                if let Some(buf) = self.rcv_buf.as_mut() { buf.drop_msg(msg_no); }
+                if let Some(buf) = self.rcv_buf.as_mut() {
+                    // Retire the message by number where we hold it, and by
+                    // sequence range regardless: the usual reason the sender
+                    // dropped it is that those packets were lost, so there is
+                    // nothing locally carrying that message number and the
+                    // range would otherwise block the ring forever.
+                    buf.drop_msg(msg_no);
+                    buf.drop_range(first, last);
+                }
                 self.rcv_loss.remove_range(first, last);
                 // Step the receive cursor over the dropped range, but only when
                 // it actually abuts what we have. Without this the ACK point is
@@ -1006,7 +1014,7 @@ impl Connection {
                 self.rcv_last_ack = data_ack;
                 // Recycle the ring slots the application has already consumed.
                 if let Some(buf) = self.rcv_buf.as_mut() {
-                    buf.slide_window();
+                    buf.reclaim();
                 }
             }
             Ordering::Equal => {
@@ -1047,6 +1055,48 @@ impl Connection {
         self.enc.clear();
         codec::encode_ack(asn, data_ack, Some(&full), self.ts(now_us), self.peer_id, &mut self.enc);
         out.push(Output::SendDatagram(self.enc.clone().freeze()));
+    }
+
+    /// Expire the message sitting at the send cursor, if its TTL has run out.
+    ///
+    /// Returns true if a message was retired, in which case the caller should
+    /// treat this as productive work and come round again.
+    fn expire_at_send_cursor(&mut self, now_us: u64, out: &mut Vec<Output>) -> bool {
+        let cursor = match self.snd_buf.as_ref() {
+            Some(b) => b.send_cursor(),
+            None => return false,
+        };
+        self.expire_msg_at(cursor, now_us, out)
+    }
+
+    /// Expire the message covering in-flight block offset `off`, if its TTL has
+    /// run out, and tell the peer to skip its sequence range.
+    ///
+    /// The dropped blocks keep their slots and their sequence numbers — the send
+    /// buffer's block-to-sequence mapping is positional, so consuming the range
+    /// is what keeps `read_at` serving the right payload for every later
+    /// sequence number. The peer is told the exact inclusive range; C++ names
+    /// one sequence number too many here, so both ends forget a packet
+    /// belonging to the *next* message.
+    fn expire_msg_at(&mut self, off: usize, now_us: u64, out: &mut Vec<Output>) -> bool {
+        let Some((msg_no, first_off, last_off)) =
+            self.snd_buf.as_mut().and_then(|b| b.expire_msg_at(off, now_us))
+        else {
+            return false;
+        };
+
+        let first = self.snd_last_ack.add(first_off as u32);
+        let last = self.snd_last_ack.add(last_off as u32);
+        if last > self.snd_curr_seq {
+            self.snd_curr_seq = last;
+        }
+        // Nothing in the dropped range is worth retransmitting any more.
+        self.snd_loss.remove_range(first, last);
+
+        self.enc.clear();
+        codec::encode_msg_drop(msg_no, first, last, self.ts(now_us), self.peer_id, &mut self.enc);
+        out.push(Output::SendDatagram(self.enc.clone().freeze()));
+        true
     }
 
     /// Send a NAK for a single contiguous range, used for immediate loss
@@ -1091,6 +1141,12 @@ impl Connection {
     fn pack_data(&mut self, now_us: u64, burst_end: u64, out: &mut Vec<Output>) -> bool {
         if burst_end < self.next_snd_us { return false; }
 
+        // Retire any message at the send cursor whose TTL has run out, before
+        // spending a transmission on it.
+        if self.expire_at_send_cursor(now_us, out) {
+            return true;
+        }
+
         // Retransmission has priority and is deliberately *not* subject to the
         // congestion window.  Gating it deadlocks the connection: once cwnd
         // falls below the in-flight count the only way it can reopen is for the
@@ -1102,6 +1158,10 @@ impl Connection {
             let off = s.offset_from(self.snd_last_ack);
             if off < 0 {
                 continue; // already acknowledged since the loss was recorded
+            }
+            // A retransmission is also a chance to notice the TTL has expired.
+            if self.expire_msg_at(off as usize, now_us, out) {
+                continue; // dropped instead of resent; try the next loss entry
             }
             // Copy the fields out to release the borrow before calling self.ts().
             let block = self

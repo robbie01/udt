@@ -55,6 +55,30 @@ impl SndLossList {
             }
     }
 
+    /// Remove every entry in `[first, last]` — used when a message is dropped,
+    /// so its sequence numbers are never retransmitted.
+    pub fn remove_range(&mut self, first: SeqNo, last: SeqNo) {
+        let mut i = 0;
+        while i < self.ranges.len() {
+            let (s, e) = self.ranges[i];
+            if e < first || s > last {
+                i += 1;
+            } else if s >= first && e <= last {
+                self.ranges.remove(i);
+            } else if s < first && e > last {
+                self.ranges[i] = (s, first.prev());
+                self.ranges.insert(i + 1, (last.next(), e));
+                i += 2;
+            } else if s < first {
+                self.ranges[i].1 = first.prev();
+                i += 1;
+            } else {
+                self.ranges[i].0 = last.next();
+                i += 1;
+            }
+        }
+    }
+
     /// Pop the lowest sequence number for retransmission.
     pub fn pop_front(&mut self) -> Option<SeqNo> {
         let (start, end) = self.ranges.first_mut()?;

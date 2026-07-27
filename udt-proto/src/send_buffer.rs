@@ -10,6 +10,11 @@ pub struct Block {
     pub origin_us: u64,
     pub ttl_ms: Option<u32>,
     pub in_order: bool,
+    /// Set once the message's TTL has elapsed. The block keeps its slot: this
+    /// buffer maps block index to sequence number *positionally*, so removing
+    /// it would shift every later block and make `read_at` serve the wrong
+    /// payload under a live sequence number. It is freed normally by `ack`.
+    pub dropped: bool,
 }
 
 /// Fixed-capacity send buffer ring.
@@ -84,6 +89,7 @@ impl SendBuffer {
                 origin_us: now_us,
                 ttl_ms,
                 in_order,
+                dropped: false,
             });
             self.len += 1;
         }
@@ -97,17 +103,78 @@ impl SendBuffer {
         }
         let idx = (self.head + self.sent) % self.capacity;
         self.sent += 1;
-        self.slots[idx].as_ref()
+        self.slots[idx].as_ref().filter(|b| !b.dropped)
     }
 
     /// Read a specific in-flight block by offset from the ACK boundary (0 = oldest unacked).
-    /// Used for retransmission. Returns None if offset is out of range.
+    /// Used for retransmission. Returns None if the offset is out of range or the
+    /// message was dropped, in which case the caller must not retransmit it.
     pub fn read_at(&self, offset: usize) -> Option<&Block> {
         if offset >= self.sent {
             return None;
         }
         let idx = (self.head + offset) % self.capacity;
-        self.slots[idx].as_ref()
+        self.slots[idx].as_ref().filter(|b| !b.dropped)
+    }
+
+    /// Offset of the next block that has not yet been transmitted.
+    pub fn send_cursor(&self) -> usize {
+        self.sent
+    }
+
+    /// If the block at in-flight offset `off` has outlived its TTL, mark that
+    /// whole message dropped and report its extent as `(msg_no, first, last)`
+    /// in block offsets.
+    ///
+    /// The offsets map to sequence numbers as `snd_last_ack + off`, so the
+    /// caller can name the exact range in a MsgDrop. `sent` is advanced past the
+    /// message so those sequence numbers are consumed rather than skipped —
+    /// C++ instead advances `m_iSndCurrSeqNo` past sequence numbers with no
+    /// backing block, which desynchronises this very mapping.
+    ///
+    /// Checked on first transmission as well as on retransmit. C++ only checks
+    /// on retransmit, which is why at saturation — where queueing delay alone
+    /// exceeds any sane TTL — essentially every block expires the moment it is
+    /// reconsidered.
+    pub fn expire_msg_at(&mut self, off: usize, now_us: u64) -> Option<(MsgNo, usize, usize)> {
+        if off >= self.len {
+            return None;
+        }
+        let b = self.slots[(self.head + off) % self.capacity].as_ref()?;
+        if b.dropped {
+            return None;
+        }
+        let ttl_us = u64::from(b.ttl_ms?) * 1_000;
+        if now_us.saturating_sub(b.origin_us) <= ttl_us {
+            return None;
+        }
+        let msg_no = b.msg_no;
+
+        // A message is contiguous, so walk out in both directions. Walking back
+        // matters: if part of the message was already sent, those blocks must be
+        // dropped too or they stay on the loss list forever.
+        let mut first = off;
+        while first > 0 {
+            match self.slots[(self.head + first - 1) % self.capacity].as_ref() {
+                Some(p) if p.msg_no == msg_no => first -= 1,
+                _ => break,
+            }
+        }
+        let mut last = off;
+        while last + 1 < self.len {
+            match self.slots[(self.head + last + 1) % self.capacity].as_ref() {
+                Some(p) if p.msg_no == msg_no => last += 1,
+                _ => break,
+            }
+        }
+        for i in first..=last {
+            if let Some(p) = self.slots[(self.head + i) % self.capacity].as_mut() {
+                p.dropped = true;
+            }
+        }
+        // Consume the sequence numbers these blocks occupy.
+        self.sent = self.sent.max(last + 1);
+        Some((msg_no, first, last))
     }
 
     /// Acknowledge `count` blocks (freeing them from the head of the buffer).
