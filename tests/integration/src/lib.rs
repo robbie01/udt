@@ -1062,6 +1062,178 @@ mod tests {
         );
     }
 
+    // ── Reported-livelock repro attempts ──────────────────────────────────────
+
+    /// Throughput matrix for the relaxed-delivery modes, with the **fork on
+    /// both ends** driven through the RPoll async wrapper — the configuration
+    /// the livelock was reported under — and the Rust implementation beside it.
+    ///
+    /// Reports rather than asserts, so a livelock shows up as a bounded,
+    /// readable number instead of a hung suite.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn relaxed_delivery_throughput_matrix() {
+        const MSGS: usize = 20_000;
+        const CHUNK: usize = 8192;
+        let ttl = Some(Duration::from_millis(20));
+
+        // The compat shim forces inorder=true whenever no TTL is given, so a
+        // TTL is required to reach the unordered path at all.
+        for (label, in_order) in [("cpp↔cpp ordered+ttl", true), ("cpp↔cpp unordered+ttl", false)] {
+            let (server, client) = new_cpp_cpp_pair().await;
+            let sender = tokio::spawn(async move {
+                for i in 0..MSGS {
+                    let r = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        client.send_with(&vec![pattern(i); CHUNK], ttl, in_order),
+                    )
+                    .await;
+                    if !matches!(r, Ok(Ok(_))) {
+                        return (client, i);
+                    }
+                }
+                (client, MSGS)
+            });
+
+            let mut buf = vec![0u8; CHUNK * 2];
+            let start = std::time::Instant::now();
+            let mut got = 0usize;
+            while got < MSGS {
+                match tokio::time::timeout(Duration::from_secs(5), server.recv(&mut buf)).await {
+                    Ok(Ok(_)) => got += 1,
+                    _ => break,
+                }
+            }
+            let secs = start.elapsed().as_secs_f64();
+            println!(
+                "[{label:<24}] {:>7.1} MB/s   {got}/{MSGS} delivered in {secs:.2}s",
+                (got * CHUNK) as f64 / 1e6 / secs.max(1e-9),
+            );
+            let _ = sender.await.unwrap();
+        }
+
+        for (label, in_order) in [("rust↔rust ordered", true), ("rust↔rust unordered", false)] {
+            let (mut server, client) = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
+            let sender = tokio::spawn(async move {
+                for i in 0..MSGS {
+                    if client
+                        .send_with(&vec![pattern(i); CHUNK], None, in_order)
+                        .await
+                        .is_err()
+                    {
+                        return (client, i);
+                    }
+                }
+                (client, MSGS)
+            });
+
+            let mut buf = vec![0u8; CHUNK * 2];
+            let start = std::time::Instant::now();
+            let mut got = 0usize;
+            while got < MSGS {
+                match tokio::time::timeout(Duration::from_secs(5), server.recv(&mut buf)).await {
+                    Ok(Ok(_)) => got += 1,
+                    _ => break,
+                }
+            }
+            let secs = start.elapsed().as_secs_f64();
+            println!(
+                "[{label:<24}] {:>7.1} MB/s   {got}/{MSGS} delivered in {secs:.2}s",
+                (got * CHUNK) as f64 / 1e6 / secs.max(1e-9),
+            );
+            let _ = sender.await.unwrap();
+        }
+    }
+
+    // ── Connection setup latency ──────────────────────────────────────────────
+    //
+    // Rendezvous in particular: the handshake is a symmetric exchange with a
+    // 250 ms retransmit timer on the Rust side, so a single lost or mistimed
+    // packet is directly visible as a step in these numbers.
+
+    async fn time_n<F, Fut>(label: &str, n: usize, mut f: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let mut worst = Duration::ZERO;
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            let t = std::time::Instant::now();
+            f().await;
+            worst = worst.max(t.elapsed());
+        }
+        let total = start.elapsed();
+        println!(
+            "[{label:<28}] mean {:>7.1} ms   worst {:>7.1} ms   ({n} connections)",
+            total.as_secs_f64() * 1e3 / n as f64,
+            worst.as_secs_f64() * 1e3,
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn connect_latency_all_paths() {
+        // Hold one C++ socket open for the whole run. Without it, each
+        // iteration drops the last UDT socket, the library's global refcount
+        // hits zero, and `UDT::cleanup()` blocks in the GC loop
+        // (api.cpp `checkBrokenSockets`) until closed sockets age out after a
+        // hard-coded 1 000 000 µs. That is teardown, not connection setup, and
+        // measuring it would attribute a full second to every C++ connect.
+        let _keep_udt_alive =
+            Arc::new(udt_compat::Endpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap());
+
+        time_n("rust listen/connect", 20, || async {
+            let _ = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
+        })
+        .await;
+
+        time_n("rust↔rust rendezvous", 20, || async {
+            let _ = new_rendezvous_pair().await;
+        })
+        .await;
+
+        time_n("rust↔cpp rendezvous", 20, || async {
+            let _ = new_s5_pair().await;
+        })
+        .await;
+
+        time_n("cpp listen/connect", 20, || async {
+            let _ = new_cpp_cpp_pair().await;
+        })
+        .await;
+
+        time_n("cpp↔cpp rendezvous", 20, || async {
+            let _ = new_cpp_cpp_rendezvous_pair().await;
+        })
+        .await;
+    }
+
+    /// C++ rendezvous on both ends, via the async bridge.
+    async fn new_cpp_cpp_rendezvous_pair() -> (udt_compat::Connection, udt_compat::Connection) {
+        use udt_compat::Endpoint as CppEndpoint;
+
+        let ep_a = Arc::new(CppEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap());
+        let ep_b = Arc::new(CppEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap());
+        let addr_a = ep_a.local_addr().unwrap();
+        let addr_b = ep_b.local_addr().unwrap();
+
+        tokio::join!(
+            async {
+                tokio::time::timeout(Duration::from_secs(10), ep_a.connect(addr_b, true))
+                    .await
+                    .expect("cpp rendezvous A timed out")
+                    .expect("cpp rendezvous A failed")
+            },
+            async {
+                tokio::time::timeout(Duration::from_secs(10), ep_b.connect(addr_a, true))
+                    .await
+                    .expect("cpp rendezvous B timed out")
+                    .expect("cpp rendezvous B failed")
+            }
+        )
+    }
+
     // ── Benchmarks ────────────────────────────────────────────────────────────
     //
     // Run with: cargo test --release -- --ignored --nocapture --test-threads=1
