@@ -43,8 +43,27 @@ const MIN_EXP_PER_COUNT_US: u64 = 300_000;
 /// After EXP_MAX expirations the connection is only torn down once it has been
 /// silent for this long in total (matches C++ `5 000 000 µs` guard).
 const EXP_HARD_TIMEOUT_US: u64 = 5_000_000;
-// Handshake re-send interval ≈ 250ms
+/// Handshake retransmit backoff, in µs, then `HS_RESEND_US` thereafter.
+///
+/// A flat 250 ms — which is what the C++ reference uses — costs a full quarter
+/// second every time an opening packet is dropped. That is routine rather than
+/// exceptional on a path where a stateful firewall must see outbound traffic
+/// before it will pass inbound: over IPv6 there is no NAT to punch, but the
+/// filter still has to open, so the first packets in *both* directions are
+/// dropped and a rendezvous needs several exchanges before anything gets
+/// through. Front-loading the retries opens the pinhole in tens of
+/// milliseconds instead of hundreds.
+///
+/// It costs nothing on a clean path: the handshake completes long before the
+/// later attempts would fire.
+const HS_BACKOFF_US: [u64; 4] = [25_000, 50_000, 100_000, 175_000];
+/// Steady-state handshake retransmit interval once the backoff is exhausted.
 const HS_RESEND_US: u64 = 250_000;
+
+/// Interval before handshake attempt number `attempts`.
+fn hs_interval_us(attempts: u32) -> u64 {
+    HS_BACKOFF_US.get(attempts as usize).copied().unwrap_or(HS_RESEND_US)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnMode { Active, Rendezvous }
@@ -55,6 +74,10 @@ enum ConnState {
         mode: ConnMode,
         conn_req: Handshake,
         last_req_us: u64,
+        /// Handshake retransmissions sent since the last state change; indexes
+        /// [`HS_BACKOFF_US`]. Reset whenever the request type advances, so each
+        /// leg of a rendezvous gets the same fast opening retries.
+        attempts: u32,
         deadline_us: u64,
         last_peer_hs: Option<Handshake>,
     },
@@ -215,6 +238,7 @@ impl Connection {
             mode: ConnMode::Active,
             conn_req: req,
             last_req_us: 0,
+            attempts: 0,
             deadline_us: now_us + 30_000_000,
             last_peer_hs: None,
         };
@@ -240,6 +264,7 @@ impl Connection {
             mode: ConnMode::Rendezvous,
             conn_req: req,
             last_req_us: 0,
+            attempts: 0,
             deadline_us: now_us + 30_000_000,
             last_peer_hs: None,
         };
@@ -372,18 +397,20 @@ impl Connection {
     pub fn on_timer(&mut self, now_us: u64, out: &mut Vec<Output>) {
         match &self.state {
             ConnState::Closed => return,
-            ConnState::Connecting { deadline_us, last_req_us, conn_req, .. } => {
+            ConnState::Connecting { deadline_us, last_req_us, conn_req, attempts, .. } => {
                 let deadline = *deadline_us;
                 let last = *last_req_us;
+                let gap = hs_interval_us(*attempts);
                 let req = conn_req.clone();
                 if now_us > deadline {
                     self.state = ConnState::Closed;
                     out.push(Output::Disconnected(DisconnectReason::Timeout));
                     return;
                 }
-                if now_us >= last + HS_RESEND_US {
-                    if let ConnState::Connecting { last_req_us, .. } = &mut self.state {
+                if now_us >= last + gap {
+                    if let ConnState::Connecting { last_req_us, attempts, .. } = &mut self.state {
                         *last_req_us = now_us;
+                        *attempts = attempts.saturating_add(1);
                     }
                     self.enc.clear();
                     codec::encode_handshake(&req, self.ts(now_us), 0, &mut self.enc);
@@ -540,8 +567,8 @@ impl Connection {
     pub fn next_deadline_us(&self) -> Option<u64> {
         match &self.state {
             ConnState::Closed => None,
-            ConnState::Connecting { last_req_us, deadline_us, .. } => {
-                Some((*last_req_us + HS_RESEND_US).min(*deadline_us))
+            ConnState::Connecting { last_req_us, deadline_us, attempts, .. } => {
+                Some((*last_req_us + hs_interval_us(*attempts)).min(*deadline_us))
             }
             ConnState::Connected => {
                 let mut t = self.next_ack_us.min(self.next_snd_us);
@@ -759,9 +786,12 @@ impl Connection {
                     let mut new_req = local_req;
                     new_req.req_type = req_type::RESPONSE; // -1
                     new_req.cookie = hs.cookie;
-                    if let ConnState::Connecting { conn_req, last_req_us, .. } = &mut self.state {
+                    if let ConnState::Connecting { conn_req, last_req_us, attempts, .. } =
+                        &mut self.state
+                    {
                         *conn_req = new_req.clone();
                         *last_req_us = 0; // resend immediately
+                        *attempts = 0;
                     }
                     self.enc.clear();
                     codec::encode_handshake(&new_req, self.ts(now_us), 0, &mut self.enc);
@@ -802,9 +832,13 @@ impl Connection {
                         r.req_type = req_type::RESPONSE;
                         r
                     } else { return };
-                    if let ConnState::Connecting { conn_req, last_req_us, last_peer_hs, .. } = &mut self.state {
+                    if let ConnState::Connecting {
+                        conn_req, last_req_us, attempts, last_peer_hs, ..
+                    } = &mut self.state
+                    {
                         *conn_req = new_req.clone();
                         *last_req_us = 0;
+                        *attempts = 0;
                         *last_peer_hs = Some(hs.clone());
                     }
                     self.enc.clear();

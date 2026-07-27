@@ -197,6 +197,20 @@ impl BatchIo {
     }
 }
 
+/// Allocate receive storage sized for this socket's offload settings.
+///
+/// Each buffer must hold a full generic-receive-offload run, not a single
+/// datagram: undersizing it truncates the run and silently discards every
+/// datagram after the first.
+pub(crate) fn recv_buffers(io: &BatchIo) -> (Vec<Vec<u8>>, Vec<RecvMeta>) {
+    let per_datagram = 2048;
+    let cap = per_datagram * io.gro_segments().max(1);
+    (
+        (0..RECV_BATCH).map(|_| vec![0u8; cap]).collect(),
+        vec![RecvMeta::default(); RECV_BATCH],
+    )
+}
+
 /// Split a received buffer into its constituent datagrams.
 ///
 /// With generic receive offload the kernel may hand back several datagrams

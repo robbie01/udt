@@ -79,8 +79,16 @@ const RECV_BATCH: usize = 64;
 /// loop, across however many batch calls that takes.
 const RECV_DRAIN_CAP: usize = 64;
 
-/// Kernel UDP send buffer, in bytes.  Matches C++ `m_iUDPSndBufSize`.
-const UDP_SND_BUF: usize = 65_536;
+/// Kernel UDP send buffer, in bytes.
+///
+/// C++ uses 64 KiB, but it emits one datagram per call. With segmentation
+/// offload a single write is a whole coalesced run — up to
+/// `MAX_COALESCE_BYTES` — so a 64 KiB buffer can be filled by one call, and
+/// several connections sharing an endpoint socket then spend their time
+/// waiting on writability instead of sending. Measured on Linux: at 64 KiB,
+/// adding a second connection *dropped* combined throughput from 997 to
+/// 313 MB/s.
+const UDP_SND_BUF: usize = 2 * 1024 * 1024;
 
 /// Kernel UDP receive buffer, in packets.  Matches C++, which sizes the socket
 /// buffer as `m_iRcvBufSize (8192 packets) × MSS`.
@@ -561,8 +569,12 @@ async fn run_endpoint_mux(
     // optional listener state machine
     let mut listener: Option<(ListenerState, mpsc::Sender<Socket>)> = None;
     let mut listener_out: Vec<ListenerOutput> = Vec::new();
-    let mut recv_buf = vec![0u8; 65536];
     let mut cmd_rx_closed = false;
+    let mux_io = match batch::BatchIo::new(&socket) {
+        Ok(io) => io,
+        Err(_) => return,
+    };
+    let (mut rx_storage, mut rx_metas) = batch::recv_buffers(&mux_io);
 
     loop {
         // Prune stale listener (Listener struct was dropped by the caller).
@@ -598,67 +610,49 @@ async fn run_endpoint_mux(
                     }
                 }
             }
-            result = socket.recv_from(&mut recv_buf) => {
-                let (mut n, mut from) = match result {
-                    Ok(r) => r,
-                    Err(_) => return,
-                };
+            result = mux_io.recv_batch(&socket, &mut rx_storage, &mut rx_metas) => {
+                let Ok(count) = result else { return };
 
-                // Fast path: forward datagrams from established peers, draining
-                // the socket in one wakeup.  Going back through the outer loop
-                // per datagram would re-run the route pruning scan and re-arm
-                // the select each time, which dominates at high packet rates.
-                //
-                // The loop stops on the first datagram from an unknown source,
-                // which is then handled by the listener path below.
-                // Invariant: at the top of each iteration `(n, from)` holds a
-                // datagram that has NOT been forwarded yet.  The batch cap is
-                // therefore checked *before* fetching the next one — fetching
-                // first would leave an unprocessed datagram in the buffer that
-                // the loop then discards, silently dropping one packet per
-                // batch and triggering retransmission storms.
-                let mut unrouted = false;
-                let mut batched = 0usize;
-                loop {
-                    match routes.get(&from) {
-                        Some(conn_tx) => {
-                            let bytes = Bytes::copy_from_slice(&recv_buf[..n]);
-                            match conn_tx.try_send(bytes) {
-                                Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Full(bytes)) => {
-                                    // Driver is behind: block so backpressure is
-                                    // real rather than dropping the datagram.
-                                    if conn_tx.send(bytes).await.is_err() {
+                // Split every buffer before routing. Enabling batched IO on a
+                // connection also enables generic receive offload on this
+                // shared socket, so a buffer may hold a whole run of datagrams
+                // described by `stride` — reading it as one would hand the
+                // decoder a blob and silently lose every packet after the
+                // first.
+                let mut unrouted: Option<(SocketAddr, Bytes)> = None;
+                'outer: for i in 0..count {
+                    let from = rx_metas[i].addr;
+                    for dg in batch::split_gro(&rx_storage[i], &rx_metas[i]) {
+                        match routes.get(&from) {
+                            Some(conn_tx) => {
+                                let bytes = Bytes::copy_from_slice(dg);
+                                match conn_tx.try_send(bytes) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(bytes)) => {
+                                        // Driver is behind: block so backpressure
+                                        // is real rather than dropping silently.
+                                        if conn_tx.send(bytes).await.is_err() {
+                                            routes.remove(&from);
+                                        }
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
                                         routes.remove(&from);
                                     }
                                 }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    routes.remove(&from);
-                                }
+                            }
+                            None => {
+                                // Hand the first unknown source to the listener
+                                // below; anything after it waits for the peer to
+                                // retransmit, which is what a fresh connection
+                                // does anyway.
+                                unrouted = Some((from, Bytes::copy_from_slice(dg)));
+                                break 'outer;
                             }
                         }
-                        None => {
-                            unrouted = true;
-                            break;
-                        }
                     }
-                    batched += 1;
-                    if batched >= RECV_BATCH {
-                        break;
-                    }
-                    match socket.try_recv_from(&mut recv_buf) {
-                        Ok((n2, from2)) => {
-                            n = n2;
-                            from = from2;
-                        }
-                        Err(_) => break, // socket drained
-                    }
-                }
-                if !unrouted {
-                    continue;
                 }
 
-                let bytes = Bytes::copy_from_slice(&recv_buf[..n]);
+                let Some((from, bytes)) = unrouted else { continue };
 
                 // Unknown source → give to the listener state machine.
                 if listener.is_some() {
@@ -744,10 +738,7 @@ async fn run_conn_driver(
     let mut pending: Vec<Bytes> = Vec::new();
     // Receive scratch: one buffer per datagram in a batch, each large enough to
     // hold a GRO-coalesced run.
-    let gro = io.gro_segments().max(1);
-    let mut rx_storage: Vec<Vec<u8>> =
-        (0..batch::RECV_BATCH).map(|_| vec![0u8; 2048 * gro]).collect();
-    let mut rx_metas = vec![quinn_udp::RecvMeta::default(); batch::RECV_BATCH];
+    let (mut rx_storage, mut rx_metas) = batch::recv_buffers(&io);
     // Pending flush barrier: resolved once snd_buf drains.
     let mut pending_flush: Option<oneshot::Sender<()>> = None;
     // Message awaiting send-buffer space; see `BlockedSend`.
