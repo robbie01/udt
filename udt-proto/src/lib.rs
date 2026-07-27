@@ -1,3 +1,10 @@
+//! Sans-IO UDT protocol implementation.
+//!
+//! Pure state machines: no sockets, no threads, no clock of its own. All IO and
+//! timing is the caller's, which is what lets the whole crate be
+//! `forbid(unsafe_code)` and unit-tested deterministically.
+#![forbid(unsafe_code)]
+
 pub mod seq;
 pub mod packet;
 pub mod handshake;

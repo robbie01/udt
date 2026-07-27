@@ -1,3 +1,10 @@
+//! Async runtime drivers for [`udt_proto`].
+//!
+//! `forbid(unsafe_code)` is deliberate and load-bearing: platform-specific IO
+//! optimisations must arrive through a safe wrapper rather than raw syscalls
+//! written here.
+#![forbid(unsafe_code)]
+
 #[cfg(feature = "tokio")]
 mod tokio_impl;
 #[cfg(feature = "tokio")]

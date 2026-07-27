@@ -1,15 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "udt-compat",
-    "udt-compat/udt-sys",
     "udt-proto",
     "udt-async",
     "udt-compio",
-    "udt-orig",
     "tests/integration",
-    "tests/upstream-compat",
-    "tests/quinn-bench",
 ]
 
 [workspace.package]
