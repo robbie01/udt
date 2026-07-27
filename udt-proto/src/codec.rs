@@ -72,13 +72,21 @@ fn decode_ctrl_body(hdr: &ControlHeader, payload: Bytes) -> Option<ControlBody> 
                 return None;
             }
             let data_ack = SeqNo::new(read_be_i32(&payload[0..4]) as u32);
-            let full = if payload.len() >= 24 {
+            // UDT has three ACK sizes: 4 bytes is a lite ACK (acknowledgement
+            // point only); 16 bytes adds RTT, RTT variance and the peer's free
+            // buffer size; 24 bytes further adds its rate estimates.  C++ emits
+            // the 16-byte form whenever a full ACK follows within one SYN
+            // interval of the last one, so treating anything under 24 bytes as
+            // lite would drop most flow-window updates on the floor.
+            let full = if payload.len() >= 16 {
                 Some(AckFull {
                     rtt_us:        read_be_i32(&payload[4..8]),
                     rtt_var_us:    read_be_i32(&payload[8..12]),
                     avail_buf_pkts:read_be_i32(&payload[12..16]),
-                    rcv_rate_pps:  read_be_i32(&payload[16..20]),
-                    bandwidth_pps: read_be_i32(&payload[20..24]),
+                    // Absent in the 16-byte form.  Zero reads as "no sample"
+                    // and is skipped by the rate estimators, as in C++.
+                    rcv_rate_pps:  if payload.len() >= 24 { read_be_i32(&payload[16..20]) } else { 0 },
+                    bandwidth_pps: if payload.len() >= 24 { read_be_i32(&payload[20..24]) } else { 0 },
                 })
             } else {
                 None

@@ -472,139 +472,514 @@ mod tests {
         for t in xfer_tasks { t.await.unwrap(); }
     }
 
-    // ── Throughput benchmarks (run with: cargo test throughput -- --ignored --nocapture) ──
+    // ── Streaming integrity ───────────────────────────────────────────────────
+    //
+    // Unlike the echo tests above, these keep many messages in flight at once so
+    // the send buffer is driven to capacity.  Every message is verified, which
+    // catches silent drops caused by send-buffer overflow.
+
+    /// Fill pattern for message `i` — distinct per message so a dropped or
+    /// reordered message is detected rather than masked by uniform bytes.
+    fn pattern(i: usize) -> u8 {
+        (i % 251) as u8
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stream_integrity_rust_rust() {
+        const MSGS: usize = 2000;
+        const CHUNK: usize = 8192;
+
+        let (mut server, client) = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
+
+        let sender = tokio::spawn(async move {
+            for i in 0..MSGS {
+                let chunk = vec![pattern(i); CHUNK];
+                client.send(&chunk).await.expect("send failed");
+            }
+            client
+        });
+
+        let mut buf = vec![0u8; CHUNK * 2];
+        for i in 0..MSGS {
+            let n = tokio::time::timeout(Duration::from_secs(20), server.recv(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for message {i} of {MSGS}"))
+                .expect("recv failed");
+            assert_eq!(n, CHUNK, "message {i} has wrong length");
+            assert!(
+                buf[..n].iter().all(|&b| b == pattern(i)),
+                "message {i} corrupted (expected fill {:#04x}, got {:#04x})",
+                pattern(i),
+                buf[0],
+            );
+        }
+        let _client = sender.await.unwrap();
+    }
+
+    // ── C++ interop integrity ─────────────────────────────────────────────────
+    //
+    // Bulk transfers across the Rust/C++ boundary with every byte verified.
+    // These use a dedicated sender task rather than send-then-wait, both because
+    // it keeps many messages in flight (exercising the send buffer, flow control
+    // and retransmission) and because a sender that goes quiet after each
+    // message stalls on the C++ receiver's 100 ms idle timer.
+
+    const INTEROP_MSGS: usize = 1500;
+    const INTEROP_CHUNK: usize = 4096;
+
+    /// Rust → C++, every message verified by the C++ side.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interop_bulk_rust_to_cpp_verified() {
+        let (cpp_conn, rust_sock) = new_s3_pair().await;
+
+        let sender = tokio::spawn(async move {
+            for i in 0..INTEROP_MSGS {
+                let chunk = vec![pattern(i); INTEROP_CHUNK];
+                rust_sock.send(&chunk).await.expect("rust send failed");
+            }
+            rust_sock
+        });
+
+        let mut buf = vec![0u8; INTEROP_CHUNK * 2];
+        for i in 0..INTEROP_MSGS {
+            let n = tokio::time::timeout(Duration::from_secs(20), cpp_conn.recv(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("cpp recv timed out on message {i} of {INTEROP_MSGS}"))
+                .expect("cpp recv failed");
+            assert_eq!(n, INTEROP_CHUNK, "message {i} arrived at C++ with wrong length");
+            assert!(
+                buf[..n].iter().all(|&b| b == pattern(i)),
+                "message {i} corrupted in transit to C++ (expected fill {:#04x}, got {:#04x})",
+                pattern(i),
+                buf[0],
+            );
+        }
+        let _held = sender.await.unwrap();
+    }
+
+    /// C++ → Rust, every message verified by the Rust side.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interop_bulk_cpp_to_rust_verified() {
+        let (mut rust_sock, cpp_conn) = new_s2_pair().await;
+
+        let sender = tokio::spawn(async move {
+            for i in 0..INTEROP_MSGS {
+                let chunk = vec![pattern(i); INTEROP_CHUNK];
+                cpp_conn.send(&chunk).await.expect("cpp send failed");
+            }
+            cpp_conn
+        });
+
+        let mut buf = vec![0u8; INTEROP_CHUNK * 2];
+        for i in 0..INTEROP_MSGS {
+            let n = tokio::time::timeout(Duration::from_secs(20), rust_sock.recv(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("rust recv timed out on message {i} of {INTEROP_MSGS}"))
+                .expect("rust recv failed");
+            assert_eq!(n, INTEROP_CHUNK, "message {i} arrived at Rust with wrong length");
+            assert!(
+                buf[..n].iter().all(|&b| b == pattern(i)),
+                "message {i} corrupted in transit from C++ (expected fill {:#04x}, got {:#04x})",
+                pattern(i),
+                buf[0],
+            );
+        }
+        let _held = sender.await.unwrap();
+    }
+
+    /// Message sizes chosen to straddle the packet payload boundary (1436 bytes
+    /// at the default MSS), so single-packet, exact-multiple and partial-tail
+    /// messages are all covered.
+    ///
+    /// UDT is message-oriented: each `send` must surface as exactly one `recv`
+    /// of the same length, never split or coalesced. Boundary handling is
+    /// encoded in per-packet flags, so a disagreement with C++ here would be a
+    /// wire-format bug.
+    const BOUNDARY_SIZES: &[usize] = &[
+        1,      // single packet, minimal
+        1435,   // one byte under a full payload
+        1436,   // exactly one full payload
+        1437,   // full payload + 1 → two packets, tiny tail
+        2872,   // exactly two full payloads
+        4308,   // exactly three full payloads
+        5000,   // three full payloads + partial tail
+        65536,  // 45 full payloads + partial tail
+    ];
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interop_message_boundaries_rust_to_cpp() {
+        let (cpp_conn, rust_sock) = new_s3_pair().await;
+
+        let sender = tokio::spawn(async move {
+            for (i, &size) in BOUNDARY_SIZES.iter().enumerate() {
+                let msg: Vec<u8> = (0..size).map(|b| (b.wrapping_add(i)) as u8).collect();
+                rust_sock.send(&msg).await.expect("rust send failed");
+            }
+            rust_sock
+        });
+
+        let mut buf = vec![0u8; 131072];
+        for (i, &size) in BOUNDARY_SIZES.iter().enumerate() {
+            let n = tokio::time::timeout(Duration::from_secs(20), cpp_conn.recv(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("cpp recv timed out on {size}-byte message"))
+                .expect("cpp recv failed");
+            assert_eq!(n, size, "C++ saw a different message length (message {i})");
+            let expected: Vec<u8> = (0..size).map(|b| (b.wrapping_add(i)) as u8).collect();
+            assert_eq!(&buf[..n], &expected[..], "{size}-byte message corrupted");
+        }
+        let _held = sender.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interop_message_boundaries_cpp_to_rust() {
+        let (mut rust_sock, cpp_conn) = new_s2_pair().await;
+
+        let sender = tokio::spawn(async move {
+            for (i, &size) in BOUNDARY_SIZES.iter().enumerate() {
+                let msg: Vec<u8> = (0..size).map(|b| (b.wrapping_add(i)) as u8).collect();
+                cpp_conn.send(&msg).await.expect("cpp send failed");
+            }
+            cpp_conn
+        });
+
+        let mut buf = vec![0u8; 131072];
+        for (i, &size) in BOUNDARY_SIZES.iter().enumerate() {
+            let n = tokio::time::timeout(Duration::from_secs(20), rust_sock.recv(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("rust recv timed out on {size}-byte message"))
+                .expect("rust recv failed");
+            assert_eq!(n, size, "Rust saw a different message length (message {i})");
+            let expected: Vec<u8> = (0..size).map(|b| (b.wrapping_add(i)) as u8).collect();
+            assert_eq!(&buf[..n], &expected[..], "{size}-byte message corrupted");
+        }
+        let _held = sender.await.unwrap();
+    }
+
+    /// Same streaming integrity check as the Rust-only test, but with C++ on
+    /// both ends of the rendezvous handshake path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interop_bulk_rendezvous_rust_to_cpp_verified() {
+        let (cpp_conn, rust_sock) = new_s5_pair().await;
+
+        let sender = tokio::spawn(async move {
+            for i in 0..INTEROP_MSGS {
+                let chunk = vec![pattern(i); INTEROP_CHUNK];
+                rust_sock.send(&chunk).await.expect("rust send failed");
+            }
+            rust_sock
+        });
+
+        let mut buf = vec![0u8; INTEROP_CHUNK * 2];
+        for i in 0..INTEROP_MSGS {
+            let n = tokio::time::timeout(Duration::from_secs(20), cpp_conn.recv(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("cpp recv timed out on message {i} of {INTEROP_MSGS}"))
+                .expect("cpp recv failed");
+            assert_eq!(n, INTEROP_CHUNK, "message {i} arrived at C++ with wrong length");
+            assert!(
+                buf[..n].iter().all(|&b| b == pattern(i)),
+                "message {i} corrupted over rendezvous to C++",
+            );
+        }
+        let _held = sender.await.unwrap();
+    }
+
+    // ── Benchmarks ────────────────────────────────────────────────────────────
+    //
+    // Run with: cargo test --release -- --ignored --nocapture --test-threads=1
+    //
+    // Two distinct patterns, because they measure different things:
+    //
+    //  * `stream_*` keeps the pipe full — a dedicated sender pushes continuously
+    //    while a receiver drains.  This is the throughput number.
+    //
+    //  * `pingpong_*` sends one message and waits for it to arrive before
+    //    sending the next.  With only one message in flight this is really a
+    //    latency measurement, and it is dominated by how promptly the *receiver*
+    //    acknowledges a burst that is followed by silence.
+    //
+    // Every configuration has a C++↔C++ variant so the Rust numbers can be read
+    // against the reference implementation on the same machine, in the same
+    // conditions, rather than against an absolute expectation.
+
+    const BENCH_TOTAL: usize = 128 * 1024 * 1024;
+    const BENCH_CHUNK: usize = 64 * 1024;
+    const PINGPONG_MSGS: usize = 400;
+
+    fn report(name: &str, bytes: usize, elapsed: f64) {
+        println!(
+            "[{name:<26}] {:>7.1} MB/s  ({} MiB in {:.2}s)",
+            bytes as f64 / 1e6 / elapsed,
+            bytes / (1024 * 1024),
+            elapsed,
+        );
+    }
+
+    fn report_latency(name: &str, msgs: usize, elapsed: f64) {
+        println!(
+            "[{name:<26}] {:>7.0} us/msg  ({msgs} msgs in {:.2}s)",
+            elapsed / msgs as f64 * 1e6,
+            elapsed,
+        );
+    }
+
+    /// C++ listener + C++ connector — the reference implementation talking to
+    /// itself, for a same-machine baseline.
+    async fn new_cpp_cpp_pair() -> (udt_compat::Connection, udt_compat::Connection) {
+        use udt_compat::Endpoint as CppEndpoint;
+
+        let srv_ep = Arc::new(CppEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap());
+        let srv_addr = srv_ep.local_addr().unwrap();
+        let listener = srv_ep.listen(4).unwrap();
+
+        tokio::join!(
+            async {
+                tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect("cpp accept timed out")
+                    .expect("cpp accept failed")
+            },
+            async {
+                let cep = Arc::new(CppEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap());
+                tokio::time::timeout(Duration::from_secs(5), cep.connect(srv_addr, false))
+                    .await
+                    .expect("cpp connect timed out")
+                    .expect("cpp connect failed")
+            }
+        )
+    }
+
+    // ── Streaming throughput ──────────────────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
-    async fn throughput_rust_single_connection() {
-        const TOTAL: usize = 128 * 1024 * 1024; // 128 MiB
-        const CHUNK: usize = 64 * 1024;          // 64 KiB per message
-
+    async fn stream_rust_to_rust() {
         let (mut server, client) = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
-        let mut buf = vec![0u8; CHUNK * 2];
-        let chunk = vec![0x55u8; CHUNK];
+        let chunk = vec![0x5Au8; BENCH_CHUNK];
 
         let start = std::time::Instant::now();
-        let mut sent = 0usize;
-        while sent < TOTAL {
-            client.send(&chunk).await.unwrap();
-            let n = server.recv(&mut buf).await.unwrap();
-            sent += n;
+        let sender = tokio::spawn(async move {
+            let mut sent = 0usize;
+            while sent < BENCH_TOTAL {
+                client.send(&chunk).await.unwrap();
+                sent += BENCH_CHUNK;
+            }
+            client
+        });
+
+        let mut buf = vec![0u8; BENCH_CHUNK * 2];
+        let mut got = 0usize;
+        while got < BENCH_TOTAL {
+            got += server.recv(&mut buf).await.unwrap();
         }
         let elapsed = start.elapsed().as_secs_f64();
-        println!(
-            "[throughput_rust_single] {:.1} MB/s  ({} MiB in {:.2}s)",
-            sent as f64 / 1e6 / elapsed,
-            sent / (1024 * 1024),
-            elapsed
-        );
+        let _held = sender.await.unwrap();
+        report("stream rust→rust", got, elapsed);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
-    async fn throughput_rust_two_connections_concurrent() {
-        const TOTAL: usize = 64 * 1024 * 1024; // 64 MiB per connection
-        const CHUNK: usize = 64 * 1024;
+    async fn stream_cpp_to_cpp() {
+        let (server, client) = new_cpp_cpp_pair().await;
+        let chunk = vec![0x5Au8; BENCH_CHUNK];
 
+        let start = std::time::Instant::now();
+        let sender = tokio::spawn(async move {
+            let mut sent = 0usize;
+            while sent < BENCH_TOTAL {
+                sent += client.send(&chunk).await.unwrap();
+            }
+            client
+        });
+
+        let mut buf = vec![0u8; BENCH_CHUNK * 2];
+        let mut got = 0usize;
+        while got < BENCH_TOTAL {
+            got += server.recv(&mut buf).await.unwrap();
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let _held = sender.await.unwrap();
+        report("stream cpp→cpp", got, elapsed);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn stream_rust_to_cpp() {
+        let (cpp_conn, rust_sock) = new_s3_pair().await;
+        let chunk = vec![0x5Au8; BENCH_CHUNK];
+
+        let start = std::time::Instant::now();
+        let sender = tokio::spawn(async move {
+            let mut sent = 0usize;
+            while sent < BENCH_TOTAL {
+                rust_sock.send(&chunk).await.unwrap();
+                sent += BENCH_CHUNK;
+            }
+            rust_sock
+        });
+
+        let mut buf = vec![0u8; BENCH_CHUNK * 2];
+        let mut got = 0usize;
+        while got < BENCH_TOTAL {
+            got += cpp_conn.recv(&mut buf).await.unwrap();
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let _held = sender.await.unwrap();
+        report("stream rust→cpp", got, elapsed);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn stream_cpp_to_rust() {
+        let (mut rust_sock, cpp_conn) = new_s2_pair().await;
+        let chunk = vec![0x5Au8; BENCH_CHUNK];
+
+        let start = std::time::Instant::now();
+        let sender = tokio::spawn(async move {
+            let mut sent = 0usize;
+            while sent < BENCH_TOTAL {
+                sent += cpp_conn.send(&chunk).await.unwrap();
+            }
+            cpp_conn
+        });
+
+        let mut buf = vec![0u8; BENCH_CHUNK * 2];
+        let mut got = 0usize;
+        while got < BENCH_TOTAL {
+            got += rust_sock.recv(&mut buf).await.unwrap();
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let _held = sender.await.unwrap();
+        report("stream cpp→rust", got, elapsed);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn stream_rust_two_connections() {
         let ep = Endpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let server_addr = ep.local_addr().unwrap();
         let mut listener = ep.listen(4).unwrap();
 
-        let conn_tasks: Vec<_> = (0..2).map(|_| {
-            tokio::spawn(async move {
-                let cep = Endpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-                cep.connect(server_addr).await.unwrap()
-            })
-        }).collect();
-        let mut server_socks = Vec::new();
-        for _ in 0..2 { server_socks.push(listener.accept().await.unwrap()); }
-        let client_socks: Vec<Socket> = {
-            let mut v = Vec::new();
-            for t in conn_tasks { v.push(t.await.unwrap()); }
-            v
-        };
-
-        let start = std::time::Instant::now();
-        let xfer: Vec<_> = server_socks.into_iter().zip(client_socks)
-            .map(|(mut srv, cli)| {
-                let chunk = vec![0xAAu8; CHUNK];
+        let conn_tasks: Vec<_> = (0..2)
+            .map(|_| {
                 tokio::spawn(async move {
-                    let mut buf = vec![0u8; CHUNK * 2];
-                    let mut sent = 0usize;
-                    while sent < TOTAL {
-                        cli.send(&chunk).await.unwrap();
-                        let n = srv.recv(&mut buf).await.unwrap();
-                        sent += n;
+                    let cep = Endpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+                    cep.connect(server_addr).await.unwrap()
+                })
+            })
+            .collect();
+        let mut server_socks = Vec::new();
+        for _ in 0..2 {
+            server_socks.push(listener.accept().await.unwrap());
+        }
+        let mut client_socks = Vec::new();
+        for t in conn_tasks {
+            client_socks.push(t.await.unwrap());
+        }
+
+        const PER_CONN: usize = BENCH_TOTAL / 2;
+        let start = std::time::Instant::now();
+        let xfer: Vec<_> = server_socks
+            .into_iter()
+            .zip(client_socks)
+            .map(|(mut srv, cli)| {
+                let chunk = vec![0xAAu8; BENCH_CHUNK];
+                tokio::spawn(async move {
+                    let sender = tokio::spawn(async move {
+                        let mut sent = 0usize;
+                        while sent < PER_CONN {
+                            cli.send(&chunk).await.unwrap();
+                            sent += BENCH_CHUNK;
+                        }
+                        cli
+                    });
+                    let mut buf = vec![0u8; BENCH_CHUNK * 2];
+                    let mut got = 0usize;
+                    while got < PER_CONN {
+                        got += srv.recv(&mut buf).await.unwrap();
                     }
-                    sent
+                    let _held = sender.await.unwrap();
+                    got
                 })
             })
             .collect();
         let totals: Vec<usize> = futures::future::join_all(xfer)
-            .await.into_iter().map(|r| r.unwrap()).collect();
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
         let elapsed = start.elapsed().as_secs_f64();
-        let total_bytes: usize = totals.iter().sum();
-        println!(
-            "[throughput_rust_2conn] {:.1} MB/s combined  ({} MiB in {:.2}s)",
-            total_bytes as f64 / 1e6 / elapsed,
-            total_bytes / (1024 * 1024),
-            elapsed
-        );
+        report("stream rust 2-conn", totals.iter().sum(), elapsed);
     }
+
+    // ── Ping-pong latency ─────────────────────────────────────────────────────
+    //
+    // One message in flight at a time.  The C++ receiver only makes data visible
+    // to the application when it emits an ACK, and it only services its ACK
+    // timer when a packet arrives or on a 100 ms idle sweep (queue.cpp).  A
+    // sender that goes quiet after each message therefore waits on that sweep,
+    // which is why the C++-receiver numbers here are far worse than the
+    // streaming ones.  The cpp→cpp variant shows this is inherent to the
+    // reference implementation, not something the Rust side introduces.
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
-    async fn throughput_cpp_connector_rust_listener() {
-        #[allow(unused_imports)]
-        use udt_compat::Endpoint as CppEndpoint;
-        const TOTAL: usize = 128 * 1024 * 1024;
-        const CHUNK: usize = 64 * 1024;
-
-        let (mut rust_sock, cpp_conn) = new_s2_pair().await;
-        let mut buf = vec![0u8; CHUNK * 2];
-        let chunk = vec![0xBBu8; CHUNK];
+    async fn pingpong_rust_to_rust() {
+        let (mut server, client) = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
+        let chunk = vec![0x55u8; BENCH_CHUNK];
+        let mut buf = vec![0u8; BENCH_CHUNK * 2];
 
         let start = std::time::Instant::now();
-        let mut sent = 0usize;
-        while sent < TOTAL {
-            cpp_conn.send(&chunk).await.unwrap();
-            let n = rust_sock.recv(&mut buf).await.unwrap();
-            sent += n;
+        for _ in 0..PINGPONG_MSGS {
+            client.send(&chunk).await.unwrap();
+            server.recv(&mut buf).await.unwrap();
         }
-        let elapsed = start.elapsed().as_secs_f64();
-        println!(
-            "[throughput_cpp→rust] {:.1} MB/s  ({} MiB in {:.2}s)",
-            sent as f64 / 1e6 / elapsed,
-            sent / (1024 * 1024),
-            elapsed
-        );
+        report_latency("pingpong rust→rust", PINGPONG_MSGS, start.elapsed().as_secs_f64());
     }
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
-    async fn throughput_rust_connector_cpp_listener() {
-        #[allow(unused_imports)]
-        use udt_compat::Endpoint as CppEndpoint;
-        const TOTAL: usize = 128 * 1024 * 1024;
-        const CHUNK: usize = 64 * 1024;
+    async fn pingpong_cpp_to_cpp() {
+        let (server, client) = new_cpp_cpp_pair().await;
+        let chunk = vec![0x55u8; BENCH_CHUNK];
+        let mut buf = vec![0u8; BENCH_CHUNK * 2];
 
+        let start = std::time::Instant::now();
+        for _ in 0..PINGPONG_MSGS {
+            client.send(&chunk).await.unwrap();
+            server.recv(&mut buf).await.unwrap();
+        }
+        report_latency("pingpong cpp→cpp", PINGPONG_MSGS, start.elapsed().as_secs_f64());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn pingpong_rust_to_cpp() {
         let (cpp_conn, rust_sock) = new_s3_pair().await;
-        let mut buf = vec![0u8; CHUNK * 2];
-        let chunk = vec![0xCCu8; CHUNK];
+        let chunk = vec![0x55u8; BENCH_CHUNK];
+        let mut buf = vec![0u8; BENCH_CHUNK * 2];
 
         let start = std::time::Instant::now();
-        let mut sent = 0usize;
-        while sent < TOTAL {
+        for _ in 0..PINGPONG_MSGS {
             rust_sock.send(&chunk).await.unwrap();
-            let n = cpp_conn.recv(&mut buf).await.unwrap();
-            sent += n;
+            cpp_conn.recv(&mut buf).await.unwrap();
         }
-        let elapsed = start.elapsed().as_secs_f64();
-        println!(
-            "[throughput_rust→cpp] {:.1} MB/s  ({} MiB in {:.2}s)",
-            sent as f64 / 1e6 / elapsed,
-            sent / (1024 * 1024),
-            elapsed
-        );
+        report_latency("pingpong rust→cpp", PINGPONG_MSGS, start.elapsed().as_secs_f64());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn pingpong_cpp_to_rust() {
+        let (mut rust_sock, cpp_conn) = new_s2_pair().await;
+        let chunk = vec![0x55u8; BENCH_CHUNK];
+        let mut buf = vec![0u8; BENCH_CHUNK * 2];
+
+        let start = std::time::Instant::now();
+        for _ in 0..PINGPONG_MSGS {
+            cpp_conn.send(&chunk).await.unwrap();
+            rust_sock.recv(&mut buf).await.unwrap();
+        }
+        report_latency("pingpong cpp→rust", PINGPONG_MSGS, start.elapsed().as_secs_f64());
     }
 }

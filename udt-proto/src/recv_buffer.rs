@@ -2,11 +2,31 @@ use bytes::{Bytes, BytesMut, BufMut};
 use crate::seq::{SeqNo, MsgNo};
 use crate::packet::MsgBoundary;
 
+/// Outcome of [`RecvBuffer::add`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddResult {
+    /// The packet was stored in the ring.
+    Stored,
+    /// A packet for this sequence number is already held, or the sequence has
+    /// already been delivered to the application.
+    Duplicate,
+    /// Beyond the ring's window — nothing was stored.  The caller must not
+    /// count this packet as received.
+    OutOfWindow,
+}
+
 struct Slot {
     payload: Bytes,
     boundary: MsgBoundary,
     msg_no: MsgNo,
-    #[allow(dead_code)] // stored for future in-order delivery enforcement
+    /// Peer's delivery-order flag for this message.
+    ///
+    /// Currently recorded but not acted on: this buffer always delivers in
+    /// sequence order. A clear flag means the sender permits early delivery
+    /// ahead of still-missing earlier messages (which is what C++ `scanMsg`
+    /// does), so ignoring it is conservative — correct, just without the
+    /// latency benefit for peers that opt in.
+    #[allow(dead_code)]
     in_order: bool,
 }
 
@@ -14,15 +34,30 @@ struct Slot {
 ///
 /// Slots are indexed by sequence number offset from the last-ACKed position.
 /// Slots hold `Option<Slot>` — None means the packet hasn't arrived yet (a gap).
-/// `add()` inserts a received packet. `read_msg()` extracts the next complete message.
+///
+/// ## Ring addressing
+///
+/// The ring uses a physical `head` cursor so that `base_seq` can be advanced
+/// without shifting data in memory.  The physical slot for logical offset `off`
+/// (where `off = seq_no - base_seq`) is:
+///
+/// ```text
+/// phys = (head + off) % capacity
+/// ```
+///
+/// `add()` inserts a received packet.  `read_msg()` extracts the next complete
+/// message.  `slide_window()` advances the ring after an ACK is sent,
+/// recycling the physical slots occupied by already-delivered messages.
 pub struct RecvBuffer {
     slots: Box<[Option<Slot>]>,
     capacity: usize,
     /// Absolute seq no of the first slot in the ring (the last-ACKed seq + 1).
     base_seq: SeqNo,
-    /// Maximum populated offset (for determining contiguous data available for ACK).
+    /// Physical index of the slot for `base_seq` (logical offset 0).
+    head: usize,
+    /// Maximum populated logical offset + 1 (high-water mark; used for scans).
     max_off: usize,
-    /// Read cursor: offset of the next slot to deliver to the application.
+    /// Read cursor: logical offset of the next slot to deliver to the application.
     read_off: usize,
     /// Number of complete messages ready to read.
     msg_ready: usize,
@@ -35,14 +70,25 @@ impl RecvBuffer {
             slots,
             capacity,
             base_seq: initial_seq,
+            head: 0,
             max_off: 0,
             read_off: 0,
             msg_ready: 0,
         }
     }
 
+    /// Physical slot index for logical offset `off`.
+    #[inline]
+    fn phys(&self, off: usize) -> usize {
+        (self.head + off) % self.capacity
+    }
+
     /// Insert a received packet. `seq_no` identifies the slot.
-    /// Returns false if the slot is out of window or already filled (duplicate).
+    ///
+    /// The caller **must** distinguish [`AddResult::OutOfWindow`] from
+    /// [`AddResult::Duplicate`]: an out-of-window packet was not stored, so
+    /// treating it as received would let the acknowledgement point advance past
+    /// data the receiver does not actually hold.
     pub fn add(
         &mut self,
         seq_no: SeqNo,
@@ -50,29 +96,38 @@ impl RecvBuffer {
         boundary: MsgBoundary,
         msg_no: MsgNo,
         in_order: bool,
-    ) -> bool {
+    ) -> AddResult {
         let off = seq_no.offset_from(self.base_seq);
-        if off < 0 || off as usize >= self.capacity {
-            return false; // outside window
+        if off < 0 {
+            // Below the ring: already delivered to the application and freed.
+            return AddResult::Duplicate;
         }
         let off = off as usize;
-        let idx = (off) % self.capacity; // base_seq is always at slot 0 in ring
-        // Actually the ring is addressed as (off % capacity), but we need to track
-        // that base_seq maps to physical slot 0... Let me use absolute slot indexing.
-        // slot index = (base_physical + off) % capacity
-        // We don't track base_physical separately — use off directly since the ring
-        // is always compacted after ack(). But ack() doesn't move base_seq slot,
-        // so we need a physical base pointer. Let me add one.
-
-        // Re-implement with a proper physical offset.
-        let _ = idx; // suppress warning — see corrected logic below
+        // Already handed to the application.  Its slot was emptied by read_msg,
+        // so it *looks* free — but repopulating it would deliver the same data
+        // twice and leave live data in the region slide_window recycles.
+        // Retransmissions land here routinely, since the read cursor runs ahead
+        // of the acknowledgement point.
+        if off < self.read_off {
+            return AddResult::Duplicate;
+        }
+        if off >= self.capacity {
+            return AddResult::OutOfWindow;
+        }
         self.add_inner(off, payload, boundary, msg_no, in_order)
     }
 
-    fn add_inner(&mut self, off: usize, payload: Bytes, boundary: MsgBoundary, msg_no: MsgNo, in_order: bool) -> bool {
-        let phys = off % self.capacity;
+    fn add_inner(
+        &mut self,
+        off: usize,
+        payload: Bytes,
+        boundary: MsgBoundary,
+        msg_no: MsgNo,
+        in_order: bool,
+    ) -> AddResult {
+        let phys = self.phys(off);
         if self.slots[phys].is_some() {
-            return false; // duplicate
+            return AddResult::Duplicate;
         }
         self.slots[phys] = Some(Slot { payload, boundary, msg_no, in_order });
         if off >= self.max_off {
@@ -84,32 +139,37 @@ impl RecvBuffer {
         } else if boundary.is_last() {
             // Walk backward: is the First (and all middles) already there?
             if let Some(first) = self.find_first_of_msg(off, msg_no)
-                && self.all_slots_filled(first, off) {
-                    self.msg_ready += 1;
-                }
+                && self.all_slots_filled(first, off)
+            {
+                self.msg_ready += 1;
+            }
         } else if boundary.is_first() {
             // Walk forward: is the Last (and all middles) already there?
             if let Some(last) = self.find_last_of_msg(off, msg_no)
-                && self.all_slots_filled(off, last) {
-                    self.msg_ready += 1;
-                }
+                && self.all_slots_filled(off, last)
+            {
+                self.msg_ready += 1;
+            }
         } else {
             // Middle: check if both First and Last are present with a complete run.
             if let Some(first) = self.find_first_of_msg(off, msg_no)
                 && let Some(last) = self.find_last_of_msg(off, msg_no)
-                    && self.all_slots_filled(first, last) {
-                        self.msg_ready += 1;
-                    }
+                && self.all_slots_filled(first, last)
+            {
+                self.msg_ready += 1;
+            }
         }
-        true
+        AddResult::Stored
     }
 
     fn find_first_of_msg(&self, last_off: usize, msg_no: MsgNo) -> Option<usize> {
         let mut off = last_off as isize;
         while off >= 0 {
-            let phys = (off as usize) % self.capacity;
+            let phys = self.phys(off as usize);
             match &self.slots[phys] {
-                Some(s) if s.msg_no == msg_no && s.boundary.is_first() => return Some(off as usize),
+                Some(s) if s.msg_no == msg_no && s.boundary.is_first() => {
+                    return Some(off as usize);
+                }
                 Some(s) if s.msg_no != msg_no => return None,
                 None => return None,
                 _ => { off -= 1; }
@@ -121,7 +181,7 @@ impl RecvBuffer {
     fn find_last_of_msg(&self, first_off: usize, msg_no: MsgNo) -> Option<usize> {
         let mut off = first_off;
         while off < self.max_off {
-            let phys = off % self.capacity;
+            let phys = self.phys(off);
             match &self.slots[phys] {
                 Some(s) if s.msg_no == msg_no && s.boundary.is_last() => return Some(off),
                 Some(s) if s.msg_no == msg_no => { off += 1; }
@@ -136,8 +196,7 @@ impl RecvBuffer {
 
     fn all_slots_filled(&self, from: usize, to: usize) -> bool {
         for off in from..=to {
-            let phys = off % self.capacity;
-            if self.slots[phys].is_none() {
+            if self.slots[self.phys(off)].is_none() {
                 return false;
             }
         }
@@ -150,108 +209,114 @@ impl RecvBuffer {
         if self.msg_ready == 0 {
             return None;
         }
-        // Find the boundary of the next message starting at read_off
+        // Find the boundary of the next message starting at read_off.
         let start = self.read_off;
-        let phys_start = start % self.capacity;
-        let first = self.slots[phys_start].as_ref()?;
+        let first = self.slots[self.phys(start)].as_ref()?;
         if !first.boundary.is_first() {
-            return None; // not ready
+            // Slot exists but is not a message start — shouldn't happen in normal
+            // operation since we only deliver in-order, but guard defensively.
+            return None;
         }
-        // Find the end
+        // Walk forward to find the last packet of this message.
         let mut end = start;
         loop {
-            let phys = end % self.capacity;
-            match &self.slots[phys] {
+            match &self.slots[self.phys(end)] {
                 Some(s) if s.boundary.is_last() => break,
                 Some(_) => { end += 1; }
                 None => return None, // gap — not complete yet
             }
             if end - start >= self.capacity {
-                return None; // safety
+                return None; // safety guard
             }
         }
-        // Collect payload
-        let total_len: usize = (start..=end).map(|o| {
-            let phys = o % self.capacity;
-            self.slots[phys].as_ref().map(|s| s.payload.len()).unwrap_or(0)
-        }).sum();
-        let msg = if start == end {
-            // Solo or single-block: return Bytes directly (zero-copy)
-            let phys = start % self.capacity;
-            let slot = self.slots[phys].take().unwrap();
+        // Collect payload into a single Bytes.
+        if start == end {
+            // Solo or single-block message: return payload directly (zero-copy).
+            let slot = self.slots[self.phys(start)].take().unwrap();
             self.advance_read(1);
             self.msg_ready -= 1;
-            return Some(slot.payload);
+            Some(slot.payload)
         } else {
+            let total_len: usize = (start..=end)
+                .map(|o| self.slots[self.phys(o)].as_ref().map_or(0, |s| s.payload.len()))
+                .sum();
             let mut out = BytesMut::with_capacity(total_len);
             for off in start..=end {
-                let phys = off % self.capacity;
-                let slot = self.slots[phys].take().unwrap();
+                let slot = self.slots[self.phys(off)].take().unwrap();
                 out.put_slice(&slot.payload);
             }
             self.advance_read(end - start + 1);
             self.msg_ready -= 1;
-            out.freeze()
-        };
-        Some(msg)
+            Some(out.freeze())
+        }
     }
 
     fn advance_read(&mut self, n: usize) {
         self.read_off += n;
-        // The base_seq advances to match read_off (we've delivered these to the app).
-        // ACK boundary = max contiguous sequence starting from base_seq.
     }
 
-    /// Returns the count of contiguous delivered packets from base_seq.
-    /// The caller should advance base_seq by this amount and send an ACK.
-    pub fn ack_advance(&self) -> usize {
-        let mut count = 0;
-        while count < self.max_off {
-            let phys = count % self.capacity;
-            if self.slots[phys].is_none() && count < self.read_off {
-                // Delivered to app — counts as acked
-                count += 1;
-            } else if self.slots[phys].is_some() {
-                count += 1;
-            } else {
-                break;
-            }
+    /// Slide the receive window forward past all packets already delivered to
+    /// the application.
+    ///
+    /// Must be called after emitting an ACK.  Advances `base_seq` and `head`
+    /// by `read_off` (the number of slots freed by `read_msg` since the last
+    /// slide), then resets `read_off` to 0.  This frees those physical slots
+    /// for new incoming packets without disturbing any still-buffered data.
+    ///
+    /// **Safety invariant**: all `read_off` slots starting at `head` are `None`
+    /// (they were taken by `read_msg`), so the physical slots can be safely
+    /// re-used once `head` advances past them.
+    pub fn slide_window(&mut self) {
+        let n = self.read_off;
+        if n == 0 {
+            return;
         }
-        count
-    }
-
-    /// Advance base_seq (called after sending ACK). Clears logically freed slots.
-    pub fn commit_ack(&mut self, count: usize) {
-        self.base_seq = self.base_seq.add(count as u32);
-        // Physical slots are already None if delivered, or may still have data for
-        // re-ordered packets. The ring addressing remains valid.
+        // Debug-assert that freed slots really are None before we recycle them.
+        #[cfg(debug_assertions)]
+        for i in 0..n {
+            debug_assert!(
+                self.slots[(self.head + i) % self.capacity].is_none(),
+                "slide_window: slot {} not freed (off={})",
+                (self.head + i) % self.capacity,
+                i,
+            );
+        }
+        self.head = (self.head + n) % self.capacity;
+        self.base_seq = self.base_seq.add(n as u32);
+        self.read_off = 0;
+        self.max_off = self.max_off.saturating_sub(n);
     }
 
     /// Drop a message (for MsgDrop requests). Marks affected slots as delivered.
     pub fn drop_msg(&mut self, msg_no: MsgNo) {
         let mut found_last = false;
         for off in 0..self.max_off {
-            let phys = off % self.capacity;
+            let phys = self.phys(off);
             if let Some(s) = &self.slots[phys]
-                && s.msg_no == msg_no {
-                    if s.boundary.is_last() {
-                        found_last = true;
-                    }
-                    self.slots[phys] = None;
+                && s.msg_no == msg_no
+            {
+                if s.boundary.is_last() {
+                    found_last = true;
                 }
-        }
-        if found_last {
-            // Decrement msg_ready if we're removing a complete message
-            if self.msg_ready > 0 {
-                self.msg_ready -= 1;
+                self.slots[phys] = None;
             }
+        }
+        if found_last && self.msg_ready > 0 {
+            self.msg_ready -= 1;
         }
     }
 
-    /// Number of available receive buffer packets (capacity - current occupancy).
-    pub fn avail_pkts(&self) -> usize {
-        let occupied = self.max_off.saturating_sub(self.read_off);
-        self.capacity.saturating_sub(occupied)
+    /// Free space ahead of `ack_point`, in packets — how many further sequence
+    /// numbers the ring can still accept.
+    ///
+    /// This is the value to advertise to the peer for flow control.  It is
+    /// measured from the ring's base (the oldest byte the application has not
+    /// read) rather than from occupancy, because unread data pins its slots
+    /// even when later slots happen to be free.  Mirrors C++
+    /// `CRcvBuffer::getAvailBufSize()`.
+    pub fn avail_from(&self, ack_point: SeqNo) -> usize {
+        let used = ack_point.offset_from(self.base_seq).max(0) as usize;
+        self.capacity.saturating_sub(used)
     }
 
     pub fn msg_ready(&self) -> usize {
@@ -304,8 +369,11 @@ mod tests {
     #[test]
     fn duplicate_ignored() {
         let mut buf = RecvBuffer::new(256, seq(0));
-        assert!(buf.add(seq(0), bytes(b"a"), MsgBoundary::Solo, msg(0), false));
-        assert!(!buf.add(seq(0), bytes(b"b"), MsgBoundary::Solo, msg(0), false));
+        assert_eq!(buf.add(seq(0), bytes(b"a"), MsgBoundary::Solo, msg(0), false), AddResult::Stored);
+        assert_eq!(
+            buf.add(seq(0), bytes(b"b"), MsgBoundary::Solo, msg(0), false),
+            AddResult::Duplicate,
+        );
         let out = buf.read_msg().unwrap();
         assert_eq!(&out[..], b"a");
     }
@@ -317,5 +385,72 @@ mod tests {
         buf.add(seq(1), bytes(b"second"), MsgBoundary::Solo, msg(1), false);
         assert_eq!(&buf.read_msg().unwrap()[..], b"first");
         assert_eq!(&buf.read_msg().unwrap()[..], b"second");
+    }
+
+    /// After delivering many messages the window must slide so that new arrivals
+    /// beyond offset `capacity` are not rejected.
+    #[test]
+    fn slide_window_allows_many_messages() {
+        let cap = 16usize;
+        let mut buf = RecvBuffer::new(cap, seq(0));
+
+        // Send 3 × cap packets as solo messages; each round requires a slide.
+        for round in 0..3u32 {
+            for i in 0..cap as u32 {
+                let s = seq(round * cap as u32 + i);
+                assert_eq!(
+                    buf.add(s, bytes(b"x"), MsgBoundary::Solo, msg(round * cap as u32 + i), false),
+                    AddResult::Stored,
+                    "add failed at round={round} i={i} seq={s:?}",
+                );
+            }
+            for _ in 0..cap {
+                assert!(buf.read_msg().is_some());
+            }
+            buf.slide_window();
+        }
+        assert_eq!(buf.msg_ready(), 0);
+    }
+
+    /// Slide then receive more data that reuses the same physical slots.
+    #[test]
+    fn slide_then_receive_reuses_slots() {
+        let mut buf = RecvBuffer::new(4, seq(100));
+        // Fill first 4 slots.
+        for i in 0u32..4 {
+            buf.add(seq(100 + i), bytes(b"a"), MsgBoundary::Solo, msg(i), false);
+        }
+        for _ in 0..4 { buf.read_msg().unwrap(); }
+        buf.slide_window(); // base_seq = 104, head = 0
+
+        // Now receive 4 more at seq 104–107 (reuses physical slots 0–3).
+        for i in 0u32..4 {
+            assert_eq!(
+                buf.add(seq(104 + i), bytes(b"b"), MsgBoundary::Solo, msg(4 + i), false),
+                AddResult::Stored,
+            );
+        }
+        for _ in 0..4 {
+            let m = buf.read_msg().unwrap();
+            assert_eq!(&m[..], b"b");
+        }
+    }
+
+    /// A multi-packet message that straddles a window slide boundary should
+    /// still be read correctly after the slide.
+    #[test]
+    fn multi_packet_after_slide() {
+        let mut buf = RecvBuffer::new(8, seq(0));
+        // Message A: solo at seq 0
+        buf.add(seq(0), bytes(b"A"), MsgBoundary::Solo, msg(0), false);
+        buf.read_msg().unwrap();
+        buf.slide_window(); // base_seq = 1, head = 1
+
+        // Message B: 3-packet at seq 1, 2, 3
+        buf.add(seq(1), bytes(b"X"), MsgBoundary::First,  msg(1), false);
+        buf.add(seq(2), bytes(b"Y"), MsgBoundary::Middle, msg(1), false);
+        buf.add(seq(3), bytes(b"Z"), MsgBoundary::Last,   msg(1), false);
+        let out = buf.read_msg().unwrap();
+        assert_eq!(&out[..], b"XYZ");
     }
 }

@@ -49,10 +49,13 @@ impl SendBuffer {
 
     /// Enqueue a message. It is split into payload-sized blocks automatically.
     /// Returns `Err(())` if there is insufficient space.
+    ///
+    /// Takes an owned [`Bytes`] so the per-packet blocks can be cheap slices of
+    /// the caller's buffer (a refcount bump each) rather than copies. Splitting
+    /// a large message would otherwise memcpy the whole payload a second time.
     #[allow(clippy::result_unit_err)]
-    pub fn add(&mut self, data: &[u8], ttl_ms: Option<u32>, in_order: bool, now_us: u64) -> Result<(), ()> {
-        let chunks = data.chunks(self.payload_size);
-        let n_chunks = chunks.len();
+    pub fn add(&mut self, data: Bytes, ttl_ms: Option<u32>, in_order: bool, now_us: u64) -> Result<(), ()> {
+        let n_chunks = data.len().div_ceil(self.payload_size);
         if n_chunks == 0 {
             return Ok(());
         }
@@ -61,7 +64,9 @@ impl SendBuffer {
         }
         let msg_no = self.next_msg_no;
         self.next_msg_no = self.next_msg_no.next();
-        for (i, chunk) in data.chunks(self.payload_size).enumerate() {
+        for i in 0..n_chunks {
+            let start = i * self.payload_size;
+            let end = (start + self.payload_size).min(data.len());
             let boundary = if n_chunks == 1 {
                 MsgBoundary::Solo
             } else if i == 0 {
@@ -73,7 +78,7 @@ impl SendBuffer {
             };
             let idx = (self.head + self.len) % self.capacity;
             self.slots[idx] = Some(Block {
-                data: Bytes::copy_from_slice(chunk),
+                data: data.slice(start..end),
                 msg_no,
                 boundary,
                 origin_us: now_us,
@@ -106,7 +111,17 @@ impl SendBuffer {
     }
 
     /// Acknowledge `count` blocks (freeing them from the head of the buffer).
+    ///
+    /// `count` must not exceed the number of in-flight blocks: acknowledging
+    /// more than was sent means the caller's sequence bookkeeping has drifted
+    /// out of step with this buffer, and freeing those blocks would silently
+    /// discard unsent data and misalign every later `read_at`.
     pub fn ack(&mut self, count: usize) {
+        debug_assert!(
+            count <= self.sent,
+            "ack({count}) exceeds in-flight block count ({}) — sequence bookkeeping has drifted",
+            self.sent,
+        );
         let count = count.min(self.sent);
         for i in 0..count {
             let idx = (self.head + i) % self.capacity;
@@ -120,6 +135,18 @@ impl SendBuffer {
     /// Number of blocks currently buffered (including sent-not-acked and unsent).
     pub fn buffered(&self) -> usize {
         self.len
+    }
+
+    /// Number of additional blocks the buffer can accept right now.
+    pub fn avail(&self) -> usize {
+        self.capacity - self.len
+    }
+
+    /// Largest message, in bytes, that could ever fit in an empty buffer.
+    /// A message above this size can never be queued and must be rejected
+    /// rather than retried.
+    pub fn max_msg_bytes(&self) -> usize {
+        self.capacity * self.payload_size
     }
 
     /// Number of blocks sent but not yet ACKed (in-flight).
@@ -144,7 +171,7 @@ mod tests {
     #[test]
     fn add_and_read_single_block() {
         let mut buf = SendBuffer::new(64, 1000);
-        buf.add(b"hello", None, false, 0).unwrap();
+        buf.add(Bytes::from_static(b"hello"), None, false, 0).unwrap();
         let block = buf.read_next().unwrap();
         assert_eq!(&block.data[..], b"hello");
         assert_eq!(block.boundary, MsgBoundary::Solo);
@@ -153,7 +180,7 @@ mod tests {
     #[test]
     fn add_multi_block_message() {
         let mut buf = SendBuffer::new(64, 4);
-        buf.add(b"abcdefgh", None, false, 0).unwrap(); // 2 blocks of 4
+        buf.add(Bytes::from_static(b"abcdefgh"), None, false, 0).unwrap(); // 2 blocks of 4
         let b0 = buf.read_next().unwrap();
         assert_eq!(b0.boundary, MsgBoundary::First);
         assert_eq!(&b0.data[..], b"abcd");
@@ -166,22 +193,22 @@ mod tests {
     #[test]
     fn ack_frees_space() {
         let mut buf = SendBuffer::new(4, 1000);
-        buf.add(b"a", None, false, 0).unwrap();
-        buf.add(b"b", None, false, 0).unwrap();
-        buf.add(b"c", None, false, 0).unwrap();
-        buf.add(b"d", None, false, 0).unwrap();
-        assert!(buf.add(b"e", None, false, 0).is_err()); // full
+        buf.add(Bytes::from_static(b"a"), None, false, 0).unwrap();
+        buf.add(Bytes::from_static(b"b"), None, false, 0).unwrap();
+        buf.add(Bytes::from_static(b"c"), None, false, 0).unwrap();
+        buf.add(Bytes::from_static(b"d"), None, false, 0).unwrap();
+        assert!(buf.add(Bytes::from_static(b"e"), None, false, 0).is_err()); // full
         buf.read_next();
         buf.read_next();
         buf.ack(2);
-        assert!(buf.add(b"e", None, false, 0).is_ok());
+        assert!(buf.add(Bytes::from_static(b"e"), None, false, 0).is_ok());
     }
 
     #[test]
     fn read_at_for_retransmit() {
         let mut buf = SendBuffer::new(64, 1000);
-        buf.add(b"first", None, false, 0).unwrap();
-        buf.add(b"second", None, false, 0).unwrap();
+        buf.add(Bytes::from_static(b"first"), None, false, 0).unwrap();
+        buf.add(Bytes::from_static(b"second"), None, false, 0).unwrap();
         buf.read_next(); // advance sent cursor
         buf.read_next();
         let block = buf.read_at(0).unwrap();

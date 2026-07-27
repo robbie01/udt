@@ -99,6 +99,9 @@ impl CongestionControl for UdtCc {
                 }
             }
         } else {
+            // The caller feeds us a smoothed delivery rate that is seeded at
+            // 16 pkt/s and only updated from positive samples, so this cannot
+            // collapse the window on a zero-rate report.
             self.cwnd = ctx.rcv_rate_pps as f64 / 1_000_000.0
                 * (ctx.rtt_us as f64 + self.rc_interval_us as f64)
                 + 16.0;

@@ -15,6 +15,6 @@ pub use seq::{SeqNo, MsgNo, AckSeqNo};
 pub use packet::{Packet, DataHeader, ControlHeader, ControlBody, ControlType,
                  MsgBoundary, AckPayload, AckFull, NakList};
 pub use handshake::Handshake;
-pub use connection::{Connection, Output, DisconnectReason, UDT_HEADER_SIZE};
+pub use connection::{Connection, ConnDebug, Output, DisconnectReason, SendOutcome, UDT_HEADER_SIZE};
 pub use listener::{ListenerState, ListenerOutput};
 pub use congestion::CongestionControl;

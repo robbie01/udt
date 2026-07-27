@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -9,7 +9,7 @@ use bytes::Bytes;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 
-use udt_proto::{Connection, Output};
+use udt_proto::{Connection, Output, SendOutcome};
 use udt_proto::listener::{ListenerState, ListenerOutput, PeerAddr};
 use udt_proto::seq::SeqNo;
 
@@ -67,9 +67,51 @@ pub const UDP_OVERHEAD_V6: u32 = 48;
 /// can pass a custom `mss` to [`Endpoint::bind_with_mss`].
 pub const DEFAULT_MSS: u32 = 1500;
 
+/// Maximum datagrams consumed per wakeup before returning to the event loop.
+///
+/// Draining in batches amortises the `select!` timer arm/disarm across many
+/// packets instead of paying it per packet.  The cap keeps one busy connection
+/// from starving the send path or the timer.
+const RECV_BATCH: usize = 64;
+
+/// Kernel UDP send buffer, in bytes.  Matches C++ `m_iUDPSndBufSize`.
+const UDP_SND_BUF: usize = 65_536;
+
+/// Kernel UDP receive buffer, in packets.  Matches C++, which sizes the socket
+/// buffer as `m_iRcvBufSize (8192 packets) × MSS`.
+const UDP_RCV_BUF_PKTS: usize = 8192;
+
+/// Size the kernel socket buffers before handing the socket to tokio.
+///
+/// This matters far more than it looks: with the OS defaults (tens to a few
+/// hundred KB) a burst at several hundred MB/s overruns the receive buffer and
+/// the kernel silently drops datagrams.  Each drop then costs a full loss
+/// detection and retransmission round trip, so throughput collapses long before
+/// the network is the limit.
+///
+/// Best effort — the OS may clamp the request (macOS honours only up to
+/// `kern.ipc.maxsockbuf`), and failing to grow the buffer is not fatal.
+fn configure_udp_buffers(sock: &std::net::UdpSocket, mss: u32) {
+    let s = socket2::SockRef::from(sock);
+    let _ = s.set_recv_buffer_size(UDP_RCV_BUF_PKTS * mss as usize);
+    let _ = s.set_send_buffer_size(UDP_SND_BUF);
+}
+
 // ── Send request (application → driver) ──────────────────────────────────────
 
-struct SendReq {
+enum SendReq {
+    /// Normal data send.
+    Data { payload: Bytes, ttl_ms: Option<u32>, in_order: bool },
+    /// Flush barrier: resolved when all data queued *before* this marker
+    /// has been acknowledged by the peer.
+    Flush { notify: oneshot::Sender<()> },
+}
+
+/// A message the send buffer had no room for, held by the driver until space
+/// frees up.  While one of these is outstanding the driver stops reading
+/// `send_rx`, so backpressure reaches the application through the bounded
+/// channel rather than data being dropped on the floor.
+struct BlockedSend {
     payload: Bytes,
     ttl_ms: Option<u32>,
     in_order: bool,
@@ -102,9 +144,136 @@ pub struct Socket {
     local_addr: SocketAddr,
 }
 
-impl Socket {
+// ── Split halves ──────────────────────────────────────────────────────────────
+
+/// Owned read half returned by [`Socket::into_split`].
+pub struct OwnedReadHalf {
+    recv_rx: mpsc::Receiver<Bytes>,
+    pub peer_addr: SocketAddr,
+    pub local_addr: SocketAddr,
+}
+
+/// Owned write half returned by [`Socket::into_split`].
+pub struct OwnedWriteHalf {
+    send_tx: mpsc::Sender<SendReq>,
+    pub peer_addr: SocketAddr,
+    pub local_addr: SocketAddr,
+}
+
+/// Borrowed read half returned by [`Socket::split`].
+pub struct ReadHalf<'a> {
+    recv_rx: &'a mut mpsc::Receiver<Bytes>,
+    pub peer_addr: SocketAddr,
+    pub local_addr: SocketAddr,
+}
+
+/// Borrowed write half returned by [`Socket::split`].
+pub struct WriteHalf<'a> {
+    send_tx: &'a mpsc::Sender<SendReq>,
+    pub peer_addr: SocketAddr,
+    pub local_addr: SocketAddr,
+}
+
+impl OwnedReadHalf {
+    pub async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        recv_from_channel(&mut self.recv_rx, buf).await
+    }
+}
+
+impl OwnedWriteHalf {
+    /// Send a message, preserving order relative to earlier sends.
+    ///
+    /// Use [`send_with`](Self::send_with) with `in_order = false` to let the
+    /// peer surface this message ahead of earlier ones that are still in
+    /// flight. That is a real wire-level request, not a hint: a UDT receiver
+    /// (including the C++ implementation) will deliver such a message as soon
+    /// as it is complete, so the application must be able to cope with gaps.
     pub async fn send(&self, buf: &[u8]) -> io::Result<()> {
-        self.send_with(buf, None, false).await
+        self.send_with(buf, None, true).await
+    }
+
+    pub async fn send_with(&self, buf: &[u8], ttl: Option<Duration>, in_order: bool) -> io::Result<()> {
+        send_via_channel(&self.send_tx, buf, ttl, in_order).await
+    }
+
+    pub async fn flush(&self) -> io::Result<()> {
+        flush_via_channel(&self.send_tx).await
+    }
+}
+
+impl<'a> ReadHalf<'a> {
+    pub async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        recv_from_channel(self.recv_rx, buf).await
+    }
+}
+
+impl<'a> WriteHalf<'a> {
+    /// Send a message, preserving order relative to earlier sends.
+    ///
+    /// Use [`send_with`](Self::send_with) with `in_order = false` to let the
+    /// peer surface this message ahead of earlier ones that are still in
+    /// flight. That is a real wire-level request, not a hint: a UDT receiver
+    /// (including the C++ implementation) will deliver such a message as soon
+    /// as it is complete, so the application must be able to cope with gaps.
+    pub async fn send(&self, buf: &[u8]) -> io::Result<()> {
+        self.send_with(buf, None, true).await
+    }
+
+    pub async fn send_with(&self, buf: &[u8], ttl: Option<Duration>, in_order: bool) -> io::Result<()> {
+        send_via_channel(self.send_tx, buf, ttl, in_order).await
+    }
+
+    pub async fn flush(&self) -> io::Result<()> {
+        flush_via_channel(self.send_tx).await
+    }
+}
+
+// ── Shared helpers for send/recv channel ops ──────────────────────────────────
+
+async fn send_via_channel(
+    tx: &mpsc::Sender<SendReq>,
+    buf: &[u8],
+    ttl: Option<Duration>,
+    in_order: bool,
+) -> io::Result<()> {
+    tx.send(SendReq::Data {
+        payload: Bytes::copy_from_slice(buf),
+        ttl_ms: ttl.map(|d| d.as_millis() as u32),
+        in_order,
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))
+}
+
+async fn flush_via_channel(tx: &mpsc::Sender<SendReq>) -> io::Result<()> {
+    let (notify, rx) = oneshot::channel::<()>();
+    tx.send(SendReq::Flush { notify })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))?;
+    rx.await
+        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))
+}
+
+async fn recv_from_channel(rx: &mut mpsc::Receiver<Bytes>, buf: &mut [u8]) -> io::Result<usize> {
+    let msg = rx
+        .recv()
+        .await
+        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))?;
+    let n = msg.len().min(buf.len());
+    buf[..n].copy_from_slice(&msg[..n]);
+    Ok(n)
+}
+
+impl Socket {
+    /// Send a message, preserving order relative to earlier sends.
+    ///
+    /// Use [`send_with`](Self::send_with) with `in_order = false` to let the
+    /// peer surface this message ahead of earlier ones that are still in
+    /// flight. That is a real wire-level request, not a hint: a UDT receiver
+    /// (including the C++ implementation) will deliver such a message as soon
+    /// as it is complete, so the application must be able to cope with gaps.
+    pub async fn send(&self, buf: &[u8]) -> io::Result<()> {
+        self.send_with(buf, None, true).await
     }
 
     pub async fn send_with(
@@ -113,25 +282,40 @@ impl Socket {
         ttl: Option<Duration>,
         in_order: bool,
     ) -> io::Result<()> {
-        self.send_tx
-            .send(SendReq {
-                payload: Bytes::copy_from_slice(buf),
-                ttl_ms: ttl.map(|d| d.as_millis() as u32),
-                in_order,
-            })
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))
+        send_via_channel(&self.send_tx, buf, ttl, in_order).await
+    }
+
+    /// Wait until all data queued before this call has been acknowledged by the peer.
+    ///
+    /// Concurrent sends that are enqueued *after* the first poll of the returned
+    /// future are not included in the flush barrier.
+    pub async fn flush(&self) -> io::Result<()> {
+        flush_via_channel(&self.send_tx).await
     }
 
     pub async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let msg = self
-            .recv_rx
-            .recv()
-            .await
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))?;
-        let n = msg.len().min(buf.len());
-        buf[..n].copy_from_slice(&msg[..n]);
-        Ok(n)
+        recv_from_channel(&mut self.recv_rx, buf).await
+    }
+
+    /// Split into owned halves that can be held by separate tasks.
+    pub fn into_split(self) -> (OwnedReadHalf, OwnedWriteHalf) {
+        let Socket { send_tx, recv_rx, peer_addr, local_addr } = self;
+        (
+            OwnedReadHalf { recv_rx, peer_addr, local_addr },
+            OwnedWriteHalf { send_tx, peer_addr, local_addr },
+        )
+    }
+
+    /// Borrow split halves for use within a single scope.
+    ///
+    /// Unlike [`into_split`], neither half can outlive `self`.
+    pub fn split(&mut self) -> (ReadHalf<'_>, WriteHalf<'_>) {
+        let peer_addr = self.peer_addr;
+        let local_addr = self.local_addr;
+        (
+            ReadHalf { recv_rx: &mut self.recv_rx, peer_addr, local_addr },
+            WriteHalf { send_tx: &self.send_tx, peer_addr, local_addr },
+        )
     }
 
     pub fn peer_addr(&self) -> SocketAddr { self.peer_addr }
@@ -191,6 +375,7 @@ impl Endpoint {
     pub fn bind_with_mss(addr: SocketAddr, mss: u32) -> io::Result<Self> {
         let std_sock = std::net::UdpSocket::bind(addr)?;
         std_sock.set_nonblocking(true)?;
+        configure_udp_buffers(&std_sock, mss);
         let socket = Arc::new(UdpSocket::from_std(std_sock)?);
         let local_addr = socket.local_addr()?;
         let (mux_tx, mux_rx) = mpsc::unbounded_channel::<MuxCmd>();
@@ -203,13 +388,14 @@ impl Endpoint {
     /// Each `connect()` call binds a fresh ephemeral socket, so concurrent
     /// outgoing active connections from the same `Endpoint` are fully isolated.
     pub async fn connect(&self, peer: SocketAddr) -> io::Result<Socket> {
-        let std_sock = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        let std_sock = std::net::UdpSocket::bind(outgoing_bind_addr(self.local_addr, peer))?;
         std_sock.set_nonblocking(true)?;
+        configure_udp_buffers(&std_sock, self.mss);
         let udp = Arc::new(UdpSocket::from_std(std_sock)?);
         let local_addr = udp.local_addr()?;
 
-        let (send_tx, send_rx) = mpsc::channel::<SendReq>(64);
-        let (recv_tx, recv_rx) = mpsc::channel::<Bytes>(64);
+        let (send_tx, send_rx) = mpsc::channel::<SendReq>(256);
+        let (recv_tx, recv_rx) = mpsc::channel::<Bytes>(256);
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
         let socket_id = next_socket_id();
@@ -232,9 +418,9 @@ impl Endpoint {
     /// socket through the endpoint mux, so there is exactly one `recv_from` call
     /// in flight at any time regardless of how many are active concurrently.
     pub async fn connect_rendezvous(&self, peer: SocketAddr) -> io::Result<Socket> {
-        let (datagram_tx, datagram_rx) = mpsc::channel::<Bytes>(64);
-        let (send_tx, send_rx) = mpsc::channel::<SendReq>(64);
-        let (recv_tx, recv_rx) = mpsc::channel::<Bytes>(64);
+        let (datagram_tx, datagram_rx) = mpsc::channel::<Bytes>(256);
+        let (send_tx, send_rx) = mpsc::channel::<SendReq>(256);
+        let (recv_tx, recv_rx) = mpsc::channel::<Bytes>(256);
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
         // Register the route *before* spawning so no incoming packet is missed.
@@ -278,6 +464,42 @@ impl Endpoint {
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         Ok(self.local_addr)
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Choose the local bind address for an outgoing active `connect()` socket.
+///
+/// Rules:
+/// 1. If the endpoint is bound to a specific (non-wildcard) IP, reuse that IP
+///    so all outgoing traffic leaves from the same interface.
+/// 2. Use the wildcard address for the **peer's address family**.  Binding
+///    `0.0.0.0` on a connection to an IPv6 peer would make `recv_from` deaf
+///    to IPv6 packets.
+fn outgoing_bind_addr(endpoint_addr: SocketAddr, peer: SocketAddr) -> SocketAddr {
+    match (endpoint_addr, peer) {
+        (SocketAddr::V4(la), SocketAddr::V4(_)) => {
+            if !la.ip().is_unspecified() {
+                SocketAddr::V4(SocketAddrV4::new(*la.ip(), 0))
+            } else {
+                SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0))
+            }
+        }
+        (SocketAddr::V6(la), SocketAddr::V6(_)) => {
+            if !la.ip().is_unspecified() {
+                SocketAddr::V6(SocketAddrV6::new(*la.ip(), 0, 0, 0))
+            } else {
+                SocketAddr::V6(SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, 0, 0, 0))
+            }
+        }
+        // Address-family mismatch — use the any-address for the peer's family.
+        (_, SocketAddr::V4(_)) => {
+            SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0))
+        }
+        (_, SocketAddr::V6(_)) => {
+            SocketAddr::V6(SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, 0, 0, 0))
+        }
     }
 }
 
@@ -349,19 +571,66 @@ async fn run_endpoint_mux(
                 }
             }
             result = socket.recv_from(&mut recv_buf) => {
-                let (n, from) = match result {
+                let (mut n, mut from) = match result {
                     Ok(r) => r,
                     Err(_) => return,
                 };
-                let bytes = Bytes::copy_from_slice(&recv_buf[..n]);
 
-                // Known peer → forward to its connection driver.
-                if let Some(conn_tx) = routes.get(&from) {
-                    if conn_tx.send(bytes).await.is_err() {
-                        routes.remove(&from);
+                // Fast path: forward datagrams from established peers, draining
+                // the socket in one wakeup.  Going back through the outer loop
+                // per datagram would re-run the route pruning scan and re-arm
+                // the select each time, which dominates at high packet rates.
+                //
+                // The loop stops on the first datagram from an unknown source,
+                // which is then handled by the listener path below.
+                // Invariant: at the top of each iteration `(n, from)` holds a
+                // datagram that has NOT been forwarded yet.  The batch cap is
+                // therefore checked *before* fetching the next one — fetching
+                // first would leave an unprocessed datagram in the buffer that
+                // the loop then discards, silently dropping one packet per
+                // batch and triggering retransmission storms.
+                let mut unrouted = false;
+                let mut batched = 0usize;
+                loop {
+                    match routes.get(&from) {
+                        Some(conn_tx) => {
+                            let bytes = Bytes::copy_from_slice(&recv_buf[..n]);
+                            match conn_tx.try_send(bytes) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(bytes)) => {
+                                    // Driver is behind: block so backpressure is
+                                    // real rather than dropping the datagram.
+                                    if conn_tx.send(bytes).await.is_err() {
+                                        routes.remove(&from);
+                                    }
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    routes.remove(&from);
+                                }
+                            }
+                        }
+                        None => {
+                            unrouted = true;
+                            break;
+                        }
                     }
+                    batched += 1;
+                    if batched >= RECV_BATCH {
+                        break;
+                    }
+                    match socket.try_recv_from(&mut recv_buf) {
+                        Ok((n2, from2)) => {
+                            n = n2;
+                            from = from2;
+                        }
+                        Err(_) => break, // socket drained
+                    }
+                }
+                if !unrouted {
                     continue;
                 }
+
+                let bytes = Bytes::copy_from_slice(&recv_buf[..n]);
 
                 // Unknown source → give to the listener state machine.
                 if listener.is_some() {
@@ -383,9 +652,9 @@ async fn run_endpoint_mux(
                                     let _ = socket.send_to(&data, from).await;
                                 }
                                 ListenerOutput::Accept(conn, _pa) => {
-                                    let (datagram_tx, datagram_rx) = mpsc::channel::<Bytes>(64);
-                                    let (send_tx, send_rx) = mpsc::channel::<SendReq>(64);
-                                    let (recv_tx, recv_rx) = mpsc::channel::<Bytes>(64);
+                                    let (datagram_tx, datagram_rx) = mpsc::channel::<Bytes>(256);
+                                    let (send_tx, send_rx) = mpsc::channel::<SendReq>(256);
+                                    let (recv_tx, recv_rx) = mpsc::channel::<Bytes>(256);
                                     routes.insert(from, datagram_tx);
                                     tokio::spawn(run_conn_driver(
                                         Arc::clone(&socket),
@@ -438,6 +707,10 @@ async fn run_conn_driver(
 ) {
     let mut out: Vec<Output> = Vec::new();
     let mut recv_buf = vec![0u8; 65536];
+    // Pending flush barrier: resolved once snd_buf drains.
+    let mut pending_flush: Option<oneshot::Sender<()>> = None;
+    // Message awaiting send-buffer space; see `BlockedSend`.
+    let mut blocked: Option<BlockedSend> = None;
 
     // Trigger initial handshake send or keepalive.
     conn.on_timer(now_us(), &mut out);
@@ -482,6 +755,34 @@ async fn run_conn_driver(
                 let _ = socket.send_to(&bytes, peer_addr).await;
             }
         }
+
+        // Retry a message that previously found the send buffer full.  ACKs
+        // processed above may have freed the space it needs.
+        if let Some(b) = blocked.take() {
+            match conn.send_msg(b.payload.clone(), b.ttl_ms, b.in_order, now_us(), &mut out) {
+                SendOutcome::Queued => {}
+                SendOutcome::WouldBlock => blocked = Some(b),
+                // Unsendable (oversized, or the connection is closing) — drop it
+                // and let the loop wind down rather than retrying forever.
+                SendOutcome::Rejected => {}
+            }
+            // Queuing may have produced more datagrams; go round again to flush
+            // them before parking on the select below.
+            if !out.is_empty() {
+                continue;
+            }
+        }
+
+        // Resolve any pending flush barrier once everything has drained — that
+        // includes any message still waiting for buffer space.
+        if let Some(notify) = pending_flush.take() {
+            if conn.snd_buf_is_empty() && blocked.is_none() {
+                let _ = notify.send(());
+            } else {
+                pending_flush = Some(notify);
+            }
+        }
+
         if done { return; }
 
         // ── Wait for the next event ───────────────────────────────────────────
@@ -494,20 +795,36 @@ async fn run_conn_driver(
                     match maybe {
                         Some(bytes) => {
                             conn.on_datagram(bytes, now_us(), &mut out);
+                            // Drain whatever else is already queued in the same
+                            // wakeup.  Re-entering the select per datagram costs
+                            // a timer arm/disarm each time, which dominates at
+                            // hundreds of thousands of packets per second.
+                            let mut batched = 1;
+                            while batched < RECV_BATCH {
+                                match drx.try_recv() {
+                                    Ok(b) => {
+                                        conn.on_datagram(b, now_us(), &mut out);
+                                        batched += 1;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
                         }
                         None => {
                             return; // mux dropped the route
                         }
                     }
                 }
-                maybe_req = send_rx.recv() => {
-                    match maybe_req {
-                        Some(req) => conn.send_msg(&req.payload, req.ttl_ms, req.in_order, now_us(), &mut out),
-                        None => conn.half_close(now_us(), &mut out),
-                    }
+                // Stop accepting new work while a message is waiting for buffer
+                // space, so the bounded channel backpressures the application.
+                maybe_req = send_rx.recv(), if blocked.is_none() => {
+                    handle_send_req(
+                        maybe_req, &mut conn, &mut pending_flush, &mut blocked, now_us(), &mut out,
+                    );
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     conn.on_timer(now_us(), &mut out);
+                    debug_tick(&conn, "mux", &blocked);
                 }
             }
         } else {
@@ -515,24 +832,104 @@ async fn run_conn_driver(
             tokio::select! {
                 result = socket.recv_from(&mut recv_buf) => {
                     match result {
-                        Ok((n, from)) if from == peer_addr => {
-                            let bytes = Bytes::copy_from_slice(&recv_buf[..n]);
-                            conn.on_datagram(bytes, now_us(), &mut out);
+                        Ok((n, from)) => {
+                            if from == peer_addr {
+                                let bytes = Bytes::copy_from_slice(&recv_buf[..n]);
+                                conn.on_datagram(bytes, now_us(), &mut out);
+                            }
+                            // Drain the socket in the same wakeup — see above.
+                            let mut batched = 1;
+                            while batched < RECV_BATCH {
+                                match socket.try_recv_from(&mut recv_buf) {
+                                    Ok((n, from)) => {
+                                        if from == peer_addr {
+                                            let bytes = Bytes::copy_from_slice(&recv_buf[..n]);
+                                            conn.on_datagram(bytes, now_us(), &mut out);
+                                        }
+                                        batched += 1;
+                                    }
+                                    Err(_) => break, // WouldBlock, or a real error we take next round
+                                }
+                            }
                         }
-                        Ok(_) => {} // stray packet; re-loop
                         Err(_) => return,
                     }
                 }
-                maybe_req = send_rx.recv() => {
-                    match maybe_req {
-                        Some(req) => conn.send_msg(&req.payload, req.ttl_ms, req.in_order, now_us(), &mut out),
-                        None => conn.half_close(now_us(), &mut out),
-                    }
+                // Stop accepting new work while a message is waiting for buffer
+                // space, so the bounded channel backpressures the application.
+                maybe_req = send_rx.recv(), if blocked.is_none() => {
+                    handle_send_req(
+                        maybe_req, &mut conn, &mut pending_flush, &mut blocked, now_us(), &mut out,
+                    );
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     conn.on_timer(now_us(), &mut out);
+                    debug_tick(&conn, "own", &blocked);
                 }
             }
+        }
+    }
+}
+
+/// Periodic state dump, enabled by setting `UDT_DEBUG=1`.  Used to diagnose
+/// stalls; compiled in but inert unless the variable is set.
+fn debug_tick(conn: &Connection, tag: &str, blocked: &Option<BlockedSend>) {
+    if std::env::var_os("UDT_DEBUG").is_none() {
+        return;
+    }
+    let st = conn.debug_state();
+    // Only report connections with outstanding work; otherwise idle sockets
+    // drown out the one that is actually stuck.
+    let has_work = st.snd_in_flight > 0
+        || st.snd_pending > 0
+        || st.snd_loss_len > 0
+        || st.rcv_loss_len > 0
+        || !st.connected;
+    if !has_work {
+        return;
+    }
+    eprintln!("[{tag}] {st:?} blocked={}", blocked.is_some());
+}
+
+/// Handle a `SendReq` option (Some = new request, None = channel closed → half-close).
+fn handle_send_req(
+    req: Option<SendReq>,
+    conn: &mut Connection,
+    pending_flush: &mut Option<oneshot::Sender<()>>,
+    blocked: &mut Option<BlockedSend>,
+    now_us: u64,
+    out: &mut Vec<Output>,
+) {
+    match req {
+        Some(SendReq::Data { payload, ttl_ms, in_order }) => {
+            match conn.send_msg(payload.clone(), ttl_ms, in_order, now_us, out) {
+                SendOutcome::Queued => {}
+                // Hold the message; the driver loop retries it and stops
+                // reading send_rx until it lands.
+                SendOutcome::WouldBlock => {
+                    *blocked = Some(BlockedSend { payload, ttl_ms, in_order });
+                }
+                SendOutcome::Rejected => {}
+            }
+        }
+        Some(SendReq::Flush { notify }) => {
+            // Resolve immediately if the buffer is already empty; otherwise
+            // stash and resolve once the last ACK arrives.
+            if conn.snd_buf_is_empty() && blocked.is_none() {
+                let _ = notify.send(());
+            } else {
+                // If there's already a pending flush, resolve it now (caller
+                // will get a spuriously-early completion for the old one, which
+                // is acceptable — it was empty at the time the new one arrived).
+                if let Some(old) = pending_flush.take() {
+                    let _ = old.send(());
+                }
+                *pending_flush = Some(notify);
+            }
+        }
+        None => {
+            // Send channel closed: application is done sending.
+            conn.half_close(now_us, out);
         }
     }
 }
