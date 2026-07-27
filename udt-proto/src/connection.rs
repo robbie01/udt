@@ -172,6 +172,11 @@ pub struct Connection {
     cc: Box<dyn CongestionControl>,
     snd_period_us: f64,
     cwnd: f64,
+    /// CC-supplied overrides, applied by `apply_cc`. `None` means "use the
+    /// protocol default" for each.
+    cc_ack_period_us: Option<u64>,
+    cc_ack_interval_pkts: Option<u32>,
+    cc_rto_us: Option<u64>,
 
     rcv_tw: PktTimeWindow,
     snd_tw: PktTimeWindow,
@@ -305,6 +310,9 @@ impl Connection {
             cc: Box::new(UdtCc::new()),
             snd_period_us: 1.0,
             cwnd: 16.0,
+            cc_ack_period_us: None,
+            cc_ack_interval_pkts: None,
+            cc_rto_us: None,
             rcv_tw: PktTimeWindow::new(),
             snd_tw: PktTimeWindow::new(),
             enc: BytesMut::with_capacity(DEFAULT_MSS as usize),
@@ -410,9 +418,11 @@ impl Connection {
 
         // ACK — full ACK on the SYN timer, cheap light ACKs in between when the
         // peer is sending fast enough to outrun it (C++ checkTimers).
-        if now_us >= self.next_ack_us {
+        if now_us >= self.next_ack_us
+            || self.cc_ack_interval_pkts.is_some_and(|n| self.pkt_count >= n)
+        {
             self.emit_ack(now_us, false, out);
-            self.next_ack_us = now_us + SYN_US as u64;
+            self.next_ack_us = now_us + self.ack_int_us();
             self.pkt_count = 0;
             self.light_ack_count = 1;
         } else if self.pkt_count >= LIGHT_ACK_INTERVAL * self.light_ack_count {
@@ -426,11 +436,8 @@ impl Connection {
             self.next_nak_us = now_us + self.nak_int_us();
         }
 
-        // EXP — mirrors C++ checkTimers() logic.
-        //
-        // Interval formula (matching C++):
-        //   exp_int = max(count × MIN_EXP_PER_COUNT,
-        //                 count × (RTT + 4×RTTVar) + SYN)
+        // EXP — mirrors C++ checkTimers() logic; see `exp_int_us` for the
+        // interval formula.
         //
         // After firing, `last_rsp_us` is reset to now so the timer does NOT
         // immediately re-fire (the C++ does the same: `m_ullLastRspTime = currtime`).
@@ -438,14 +445,7 @@ impl Connection {
         // Disconnect only when BOTH:
         //   • exp_count > EXP_MAX (16 expirations), AND
         //   • silence since last fire > EXP_HARD_TIMEOUT_US (5 s)
-        let exp_int = {
-            let rtt_based = self.exp_count as u64
-                * (self.rtt_us as u64 + 4 * self.rtt_var_us as u64)
-                + SYN_US as u64;
-            let min_based = self.exp_count as u64 * MIN_EXP_PER_COUNT_US;
-            rtt_based.max(min_based)
-        };
-        if now_us >= self.last_rsp_us + exp_int {
+        if now_us >= self.last_rsp_us + self.exp_int_us() {
             // Hard timeout: peer has been silent for too long.
             if self.exp_count > EXP_MAX
                 && now_us.saturating_sub(self.last_rsp_us) > EXP_HARD_TIMEOUT_US
@@ -545,15 +545,7 @@ impl Connection {
             ConnState::Connected => {
                 let mut t = self.next_ack_us.min(self.next_snd_us);
                 if !self.rcv_loss.is_empty() { t = t.min(self.next_nak_us); }
-                let exp_int = {
-                    let rtt_based = self.exp_count as u64
-                        * (self.rtt_us as u64 + 4 * self.rtt_var_us as u64)
-                        + SYN_US as u64;
-                    let min_based = self.exp_count as u64 * MIN_EXP_PER_COUNT_US;
-                    rtt_based.max(min_based)
-                };
-                let exp = self.last_rsp_us + exp_int;
-                Some(t.min(exp))
+                Some(t.min(self.last_rsp_us + self.exp_int_us()))
             }
         }
     }
@@ -694,10 +686,6 @@ impl Connection {
         else if probe_mod == 1 { self.rcv_tw.probe2_arrival(now_us); }
         self.rcv_tw.on_pkt_arrival(now_us);
 
-        let ctx = self.cc_ctx(now_us);
-        let o = self.cc.on_pkt_received(header.timestamp_us, payload.len(), ctx);
-        self.apply_cc(o);
-
         // The ACK timer in on_timer decides when this count warrants a light
         // ACK; matching C++, which only counts here and acts in checkTimers.
         self.pkt_count += 1;
@@ -731,6 +719,14 @@ impl Connection {
             ControlBody::MsgDrop { msg_no, first, last } => {
                 if let Some(buf) = self.rcv_buf.as_mut() { buf.drop_msg(msg_no); }
                 self.rcv_loss.remove_range(first, last);
+                // Step the receive cursor over the dropped range, but only when
+                // it actually abuts what we have. Without this the ACK point is
+                // pinned below the hole forever: the next packet above the range
+                // re-opens a gap and we re-NAK sequences the sender has already
+                // given up on. Matches C++ processCtrl case 7.
+                if first <= self.rcv_curr_seq.next() && last > self.rcv_curr_seq {
+                    self.rcv_curr_seq = last;
+                }
             }
             ControlBody::ErrorSignal { .. } => {
                 self.state = ConnState::Closed;
@@ -1117,14 +1113,14 @@ impl Connection {
                 let hdr = codec::encode_data_header(
                     s, boundary, in_order, msg_no, self.ts(now_us), self.peer_id,
                 );
-                retransmit = Some((s, hdr, data));
+                retransmit = Some((hdr, data));
                 break;
             }
             // Names a block we no longer hold (e.g. a stale NAK) — discard it
             // and try the next entry rather than stalling the pacing loop.
         }
 
-        let (seq, hdr_bytes, payload_bytes) = match retransmit {
+        let (hdr_bytes, payload_bytes) = match retransmit {
             Some(v) => v,
             None => {
                 // New data — this is what the congestion/flow window limits.
@@ -1143,7 +1139,7 @@ impl Connection {
                     }
                 };
                 let hdr = codec::encode_data_header(seq, boundary, in_order, msg_no, self.ts(now_us), self.peer_id);
-                (seq, hdr, data)
+                (hdr, data)
             }
         };
 
@@ -1158,10 +1154,6 @@ impl Connection {
         self.pkt_arena.extend_from_slice(&payload_bytes);
         out.push(Output::SendDatagram(self.pkt_arena.split_to(total).freeze()));
 
-        let len = payload_bytes.len();
-        let ctx = self.cc_ctx(now_us);
-        let o = self.cc.on_pkt_sent(seq, len, ctx);
-        self.apply_cc(o);
         self.snd_tw.on_pkt_arrival(now_us);
         // Accumulate next_snd_us rather than resetting relative to now_us.
         // This allows the pacing loop to send all packets that are "due" in one
@@ -1194,9 +1186,34 @@ impl Connection {
     }
 
     fn apply_cc(&mut self, o: CcOutput) {
-        if o.is_noop() { return; }
         self.snd_period_us = o.pkt_snd_period_us.max(1.0);
         self.cwnd = o.cwnd.max(2.0);
+        // A CC may also drive ACK cadence and the retransmission timeout.
+        // C++ reads m_iACKPeriod / m_iACKInterval in checkTimers and
+        // m_bUserDefinedRTO / m_iRTO in its EXP calculation; mirror that rather
+        // than leaving these outputs unread.
+        self.cc_ack_period_us = o.ack_period_ms.map(|ms| ms as u64 * 1_000);
+        self.cc_ack_interval_pkts = o.ack_interval_pkts;
+        self.cc_rto_us = o.rto_us.map(|us| us as u64);
+    }
+
+    /// Interval until the next EXP (retransmission timeout) firing.
+    ///
+    /// Uses the CC's RTO if it supplies one, else the C++ formula:
+    /// `max(count × (RTT + 4·RTTVar) + SYN, count × MIN_EXP_PER_COUNT)`.
+    fn exp_int_us(&self) -> u64 {
+        if let Some(rto) = self.cc_rto_us {
+            return self.exp_count as u64 * rto;
+        }
+        let rtt_based =
+            self.exp_count as u64 * (self.rtt_us as u64 + 4 * self.rtt_var_us as u64) + SYN_US as u64;
+        let min_based = self.exp_count as u64 * MIN_EXP_PER_COUNT_US;
+        rtt_based.max(min_based)
+    }
+
+    /// Interval between full ACKs — the CC's ACK period if it sets one.
+    fn ack_int_us(&self) -> u64 {
+        self.cc_ack_period_us.unwrap_or(SYN_US as u64)
     }
 
     fn nak_int_us(&self) -> u64 {

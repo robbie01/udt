@@ -80,25 +80,26 @@ impl PktTimeWindow {
         ((self.arr_count as u64 - 1) * 1_000_000 / span_us) as u32
     }
 
-    /// Estimated bandwidth in packets per second (from probe intervals).
+    /// Estimated bandwidth in packets per second, from the median probe interval.
+    ///
+    /// Sorts into a fixed-size stack array rather than collecting into a `Vec`:
+    /// this sits on the ACK path, and the window is bounded at 64 entries, so
+    /// there is no reason to touch the allocator here.
     pub fn bandwidth(&self) -> u32 {
-        if self.probe_count == 0 {
+        let mut scratch = [0u32; 64];
+        let mut len = 0;
+        for &v in &self.probe_times[..self.probe_count] {
+            if v > 0 {
+                scratch[len] = v;
+                len += 1;
+            }
+        }
+        if len == 0 {
             return 0;
         }
-        let n = self.probe_count;
-        // Use median of the probe window (sorted median avoids outlier sensitivity).
-        // For simplicity, use the minimum non-zero interval as an upper-bound estimate.
-        // (The C++ implementation uses a sorted median; we replicate that below.)
-        let mut sorted: Vec<u32> = self.probe_times[..n]
-            .iter()
-            .copied()
-            .filter(|&v| v > 0)
-            .collect();
-        if sorted.is_empty() {
-            return 0;
-        }
-        sorted.sort_unstable();
-        let median = sorted[sorted.len() / 2];
+        let scratch = &mut scratch[..len];
+        scratch.sort_unstable();
+        let median = scratch[len / 2];
         if median == 0 {
             return 0;
         }
