@@ -3,8 +3,7 @@ use std::collections::VecDeque;
 
 use bytes::{Bytes, BytesMut};
 use crate::codec;
-use crate::congestion::{CcContext, CcOutput, CongestionControl};
-use crate::congestion::udt_cc::UdtCc;
+use crate::congestion::{CcContext, CcKind, CcOutput, CongestionControl};
 use crate::handshake::{req_type, Handshake, SOCK_DGRAM, UDT_VERSION};
 use crate::loss_list::{RcvLossList, SndLossList};
 use crate::ack_window::AckWindow;
@@ -197,7 +196,7 @@ pub struct Connection {
 const PKT_ARENA_SIZE: usize = 96 * 1024;
 
 impl Connection {
-    pub fn new_active(socket_id: u32, local_isn: SeqNo, mss: u32, now_us: u64) -> Self {
+    pub fn new_active(socket_id: u32, local_isn: SeqNo, mss: u32, now_us: u64, cc: CcKind) -> Self {
         let req = Handshake {
             version: UDT_VERSION,
             sock_type: SOCK_DGRAM,
@@ -210,6 +209,7 @@ impl Connection {
             peer_ip: [0u32; 4],
         };
         let mut c = Self::skeleton(socket_id, mss, now_us);
+        c.cc = cc.build();
         c.local_isn = local_isn;
         c.state = ConnState::Connecting {
             mode: ConnMode::Active,
@@ -221,7 +221,7 @@ impl Connection {
         c
     }
 
-    pub fn new_rendezvous(socket_id: u32, local_isn: SeqNo, mss: u32, now_us: u64) -> Self {
+    pub fn new_rendezvous(socket_id: u32, local_isn: SeqNo, mss: u32, now_us: u64, cc: CcKind) -> Self {
         let req = Handshake {
             version: UDT_VERSION,
             sock_type: SOCK_DGRAM,
@@ -234,6 +234,7 @@ impl Connection {
             peer_ip: [0u32; 4],
         };
         let mut c = Self::skeleton(socket_id, mss, now_us);
+        c.cc = cc.build();
         c.local_isn = local_isn;
         c.state = ConnState::Connecting {
             mode: ConnMode::Rendezvous,
@@ -307,7 +308,7 @@ impl Connection {
             bandwidth_pps: 1,
             rtt_us: 10_000,
             rtt_var_us: 0,
-            cc: Box::new(UdtCc::new()),
+            cc: CcKind::default().build(),
             snd_period_us: 1.0,
             cwnd: 16.0,
             cc_ack_period_us: None,

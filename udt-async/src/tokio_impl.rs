@@ -9,7 +9,7 @@ use bytes::Bytes;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 
-use udt_proto::{Connection, Output, SendOutcome};
+use udt_proto::{CcKind, Connection, Output, SendOutcome};
 use udt_proto::listener::{ListenerState, ListenerOutput, PeerAddr};
 use udt_proto::seq::SeqNo;
 
@@ -342,6 +342,24 @@ impl Listener {
 
 // ── Endpoint ──────────────────────────────────────────────────────────────────
 
+/// Tunables for every connection created from an [`Endpoint`].
+#[derive(Debug, Clone, Copy)]
+pub struct EndpointConfig {
+    /// IP-layer MTU advertised in the handshake. See [`DEFAULT_MSS`].
+    pub mss: u32,
+    /// Congestion controller. [`CcKind::Udt`] is the default and the only one
+    /// whose behaviour matches the C++ reference;
+    /// [`CcKind::LedbatPlusPlus`] yields to competing traffic and suits
+    /// background transfers.
+    pub congestion: CcKind,
+}
+
+impl Default for EndpointConfig {
+    fn default() -> Self {
+        EndpointConfig { mss: DEFAULT_MSS, congestion: CcKind::default() }
+    }
+}
+
 pub struct Endpoint {
     /// Shared socket for the endpoint's bound address.
     /// The mux task is the sole *reader*; this handle is used for outbound sends
@@ -351,14 +369,13 @@ pub struct Endpoint {
     /// Command channel to the endpoint mux task that owns the recv loop.
     mux_tx: mpsc::UnboundedSender<MuxCmd>,
     local_addr: SocketAddr,
-    /// MSS used for all connections created from this endpoint.
-    mss: u32,
+    cfg: EndpointConfig,
 }
 
 impl Endpoint {
-    /// Bind with the default MSS (1500, standard Ethernet MTU).
+    /// Bind with defaults: MSS 1500 and UDT's native congestion control.
     pub fn bind(addr: SocketAddr) -> io::Result<Self> {
-        Self::bind_with_mss(addr, DEFAULT_MSS)
+        Self::bind_with(addr, EndpointConfig::default())
     }
 
     /// Bind with an explicit MSS (IP-layer MTU).
@@ -373,14 +390,20 @@ impl Endpoint {
     /// // max payload = 9000 − 48 − 16 = 8936 bytes
     /// ```
     pub fn bind_with_mss(addr: SocketAddr, mss: u32) -> io::Result<Self> {
+        Self::bind_with(addr, EndpointConfig { mss, ..Default::default() })
+    }
+
+    /// Bind with full control over MSS and congestion control.
+    pub fn bind_with(addr: SocketAddr, cfg: EndpointConfig) -> io::Result<Self> {
+        let mss = cfg.mss;
         let std_sock = std::net::UdpSocket::bind(addr)?;
         std_sock.set_nonblocking(true)?;
         configure_udp_buffers(&std_sock, mss);
         let socket = Arc::new(UdpSocket::from_std(std_sock)?);
         let local_addr = socket.local_addr()?;
         let (mux_tx, mux_rx) = mpsc::unbounded_channel::<MuxCmd>();
-        tokio::spawn(run_endpoint_mux(Arc::clone(&socket), mux_rx, mss));
-        Ok(Endpoint { socket, mux_tx, local_addr, mss })
+        tokio::spawn(run_endpoint_mux(Arc::clone(&socket), mux_rx, cfg));
+        Ok(Endpoint { socket, mux_tx, local_addr, cfg })
     }
 
     /// Connect to a remote UDT listener.
@@ -390,7 +413,7 @@ impl Endpoint {
     pub async fn connect(&self, peer: SocketAddr) -> io::Result<Socket> {
         let std_sock = std::net::UdpSocket::bind(outgoing_bind_addr(self.local_addr, peer))?;
         std_sock.set_nonblocking(true)?;
-        configure_udp_buffers(&std_sock, self.mss);
+        configure_udp_buffers(&std_sock, self.cfg.mss);
         let udp = Arc::new(UdpSocket::from_std(std_sock)?);
         let local_addr = udp.local_addr()?;
 
@@ -400,7 +423,7 @@ impl Endpoint {
 
         let socket_id = next_socket_id();
         let isn = SeqNo::new(rand::random::<u32>() & 0x7FFF_FFFF);
-        let conn = Connection::new_active(socket_id, isn, self.mss, now_us());
+        let conn = Connection::new_active(socket_id, isn, self.cfg.mss, now_us(), self.cfg.congestion);
 
         tokio::spawn(run_conn_driver(udp, conn, peer, None, send_rx, recv_tx, Some(connected_tx)));
 
@@ -429,7 +452,7 @@ impl Endpoint {
 
         let socket_id = next_socket_id();
         let isn = SeqNo::new(rand::random::<u32>() & 0x7FFF_FFFF);
-        let conn = Connection::new_rendezvous(socket_id, isn, self.mss, now_us());
+        let conn = Connection::new_rendezvous(socket_id, isn, self.cfg.mss, now_us(), self.cfg.congestion);
 
         tokio::spawn(run_conn_driver(
             Arc::clone(&self.socket),
@@ -522,7 +545,7 @@ fn outgoing_bind_addr(endpoint_addr: SocketAddr, peer: SocketAddr) -> SocketAddr
 async fn run_endpoint_mux(
     socket: Arc<UdpSocket>,
     mut cmd_rx: mpsc::UnboundedReceiver<MuxCmd>,
-    mss: u32,
+    cfg: EndpointConfig,
 ) {
     let local_addr = match socket.local_addr() {
         Ok(a) => a,
@@ -560,7 +583,7 @@ async fn run_endpoint_mux(
                     }
                     Some(MuxCmd::StartListener { accept_tx, secret, socket_id }) => {
                         listener = Some((
-                            ListenerState::new(socket_id, mss, now_us(), secret),
+                            ListenerState::new(socket_id, cfg.mss, now_us(), secret, cfg.congestion),
                             accept_tx,
                         ));
                     }

@@ -2,9 +2,13 @@
 mod tokio_impl;
 #[cfg(feature = "tokio")]
 pub use tokio_impl::{
-    Endpoint, Listener, Socket,
+    Endpoint, EndpointConfig, Listener, OwnedReadHalf, OwnedWriteHalf, ReadHalf, Socket, WriteHalf,
     DEFAULT_MSS, UDT_HEADER_SIZE, UDP_OVERHEAD_V4, UDP_OVERHEAD_V6,
 };
+
+/// Congestion-control selection for [`EndpointConfig`].
+#[cfg(feature = "tokio")]
+pub use udt_proto::CcKind;
 
 /// Maximum application payload per UDT packet with the default MSS.
 ///

@@ -33,6 +33,30 @@ pub struct CcOutput {
     pub rto_us: Option<u32>,
 }
 
+/// Which congestion controller a connection should use.
+///
+/// Exists because a `Box<dyn CongestionControl>` cannot be cloned, while a
+/// listener needs to build a fresh controller per accepted connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CcKind {
+    /// UDT's native rate-based DAIMD controller. The default, and the only one
+    /// that is wire-behaviour-compatible with the C++ reference.
+    #[default]
+    Udt,
+    /// LEDBAT++, a delay-based "scavenger" that yields to competing traffic.
+    /// Appropriate for background transfers. See [`ledbat`].
+    LedbatPlusPlus,
+}
+
+impl CcKind {
+    pub fn build(self) -> Box<dyn CongestionControl> {
+        match self {
+            CcKind::Udt => Box::new(udt_cc::UdtCc::new()),
+            CcKind::LedbatPlusPlus => Box::new(ledbat::Ledbat::new()),
+        }
+    }
+}
+
 /// Pluggable congestion control algorithm.
 ///
 /// Note there are deliberately no per-packet hooks. Earlier revisions had

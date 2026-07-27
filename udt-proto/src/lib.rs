@@ -17,4 +17,4 @@ pub use packet::{Packet, DataHeader, ControlHeader, ControlBody, ControlType,
 pub use handshake::Handshake;
 pub use connection::{Connection, ConnDebug, Output, DisconnectReason, SendOutcome, UDT_HEADER_SIZE};
 pub use listener::{ListenerState, ListenerOutput};
-pub use congestion::CongestionControl;
+pub use congestion::{CcKind, CongestionControl};

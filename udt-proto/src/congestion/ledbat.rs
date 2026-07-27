@@ -1,208 +1,426 @@
-/// LEDBAT congestion control — RFC 6817.
-///
-/// UDT measures RTT via ACK/ACK2. We use RTT/2 as an approximation of
-/// one-way delay, which is the standard adaptation for protocols without
-/// native OWD measurement. `base_delay` converges to min(RTT/2) over time;
-/// `queuing_delay = rtt/2 - base_delay`.
-use std::collections::VecDeque;
+//! LEDBAT++ — delay-based congestion control for background traffic.
+//!
+//! Implements [draft-irtf-iccrg-ledbat-plus-plus-02][draft], the variant
+//! shipped as a TCP congestion provider in Windows. It is *not* RFC 6817; see
+//! the conformance table below for exactly where and why it differs.
+//!
+//! [draft]: https://www.ietf.org/archive/id/draft-irtf-iccrg-ledbat-plus-plus-02.html
+//!
+//! # Why LEDBAT++ rather than RFC 6817
+//!
+//! RFC 6817 §2.4.1 requires *one-way* delay measurements. UDT's ACK carries no
+//! field for them, and its packet timestamp is wall-clock microseconds
+//! truncated to 32 bits — dominated by the inter-host clock offset and wrapping
+//! roughly every 72 minutes. Carrying true one-way delay would need a wire
+//! extension, which would not interoperate with the C++ reference.
+//!
+//! LEDBAT++ takes the approach shipping stacks do: measure round-trip delay and
+//! compensate for the weaker signal with *periodic slowdowns* that re-measure
+//! the base delay. Without those, a round-trip-based base estimate drifts
+//! upward as the flow's own queue builds and the controller stops yielding —
+//! the latecomer-advantage problem.
+//!
+//! # RFC 6817 conformance
+//!
+//! | Clause | Status |
+//! |---|---|
+//! | §2.4.1 one-way delay | **Deviates** — round-trip delay, per LEDBAT++ §3. No wire field for OWD exists. |
+//! | §2.4.2 `TARGET` ≤ 100 ms | **Deviates** — 60 ms, per LEDBAT++ §3.1. Tighter than the RFC ceiling, so it yields sooner. |
+//! | §2.4.2 `GAIN` | **Deviates** — dynamic `1/min(16, ceil(2·TARGET/base))` rather than a constant. |
+//! | §2.4.2 linear increase | Met, via the dynamic gain. |
+//! | §2.4.2 decrease on delay | **Extends** — multiplicative, floored at `-W/2`. |
+//! | at most one backoff per RTT | Met — see `loss_guard_us`. |
+//! | §2.4.2 `min_cwnd` = 2 | Met. |
+//! | §2.5 base-delay history | **Deviates** — re-measured by periodic slowdown rather than kept in per-minute buckets. |
+//! | §2.6 no worse than TCP | Met by construction: this controller only ever reduces the window. |
+//!
+//! # Known limitation
+//!
+//! The delay signal comes from [`CcContext::rtt_us`], the connection's smoothed
+//! RTT, which on the sending side is the value the *peer* reports in its ACKs.
+//! The draft asks for lightly-filtered per-ACK samples; a 7/8 EWMA is heavier
+//! filtering than intended and blunts the queuing-delay transient. The periodic
+//! slowdowns are what keep the base estimate honest despite this.
+
 use super::{CcContext, CcOutput, CongestionControl};
 use crate::seq::SeqNo;
 
-const TARGET_US: f64    = 100_000.0; // 100 ms max queuing delay
-const GAIN: f64         = 1.0;
-const BASE_HISTORY: usize = 10;     // one-minute delay minima to retain
-const CURRENT_FILTER: usize = 4;    // recent delay samples
-const INIT_CWND_PKTS: f64 = 2.0;
-const MIN_CWND_PKTS: f64 = 2.0;
-const MINUTE_US: u64 = 60_000_000;
+/// Target queuing delay above the base, in µs. LEDBAT++ §3.1 (RFC 6817: 100 ms).
+const TARGET_US: f64 = 60_000.0;
+/// Cap on the dynamic gain divisor.
+const GAIN_CAP: f64 = 16.0;
+/// Multiplicative-decrease constant; the draft recommends 1.
+const DECREASE_C: f64 = 1.0;
+const MIN_CWND: f64 = 2.0;
+const INIT_CWND: f64 = 2.0;
+/// Window held during a slowdown while the base delay is re-measured.
+const SLOWDOWN_CWND: f64 = 2.0;
+/// Current-delay filter width, in samples.
+const FILTER: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// Initial slow start; exited on excess delay, loss, or the flow window.
+    SlowStart,
+    /// Normal operation.
+    Steady,
+    /// Window pinned low while the base delay is re-measured.
+    Slowdown,
+    /// Ramping back to `ssthresh` after a slowdown.
+    Recovery,
+}
 
 pub struct Ledbat {
-    /// Per-minute delay minima (µs). Each entry covers one minute.
-    base_delays: VecDeque<u32>,
-    /// Recent delay samples for FILTER().
-    current_delays: VecDeque<u32>,
-    last_rollover_us: u64,
-    /// Congestion window in bytes.
-    cwnd_bytes: f64,
-    /// Congestion timeout (µs); doubles on each timeout up to 60s.
-    cto_us: u64,
-    mss: u32,
+    phase: Phase,
+    cwnd: f64,
+    ssthresh: f64,
+    /// Minimum RTT seen in the current measurement epoch, µs.
+    base_us: u32,
+    /// Recent RTT samples; the filter takes their minimum.
+    recent: [u32; FILTER],
+    recent_len: usize,
+    recent_ptr: usize,
+    /// Highest sequence acknowledged, for counting newly-acked packets.
+    last_ack: SeqNo,
+    phase_started_us: u64,
+    /// When the next slowdown is due; 0 means "not yet scheduled".
+    next_slowdown_us: u64,
+    last_slowdown_len_us: u64,
+    /// Suppresses more than one multiplicative decrease per RTT.
+    loss_guard_us: u64,
+}
+
+impl Default for Ledbat {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Ledbat {
     pub fn new() -> Self {
-        let mut base_delays = VecDeque::with_capacity(BASE_HISTORY);
-        for _ in 0..BASE_HISTORY {
-            base_delays.push_back(u32::MAX); // initialized to +infinity
-        }
-        let current_delays = VecDeque::with_capacity(CURRENT_FILTER);
         Ledbat {
-            base_delays,
-            current_delays,
-            last_rollover_us: 0,
-            cwnd_bytes: 0.0,
-            cto_us: 1_000_000,
-            mss: 1472,
+            phase: Phase::SlowStart,
+            cwnd: INIT_CWND,
+            ssthresh: f64::INFINITY,
+            base_us: u32::MAX,
+            recent: [u32::MAX; FILTER],
+            recent_len: 0,
+            recent_ptr: 0,
+            last_ack: SeqNo::new(0),
+            phase_started_us: 0,
+            next_slowdown_us: 0,
+            last_slowdown_len_us: 0,
+            loss_guard_us: 0,
         }
     }
 
-    fn update_base_delay(&mut self, delay_us: u32, now_us: u64) {
-        let cur_minute = now_us / MINUTE_US;
-        let last_minute = self.last_rollover_us / MINUTE_US;
-        if cur_minute != last_minute || self.last_rollover_us == 0 {
-            self.last_rollover_us = now_us;
-            // Rotate: push new entry, drop oldest
-            if self.base_delays.len() >= BASE_HISTORY {
-                self.base_delays.pop_front();
-            }
-            self.base_delays.push_back(delay_us);
-        } else {
-            let last = self.base_delays.back_mut().unwrap();
-            if delay_us < *last {
-                *last = delay_us;
-            }
+    fn record_delay(&mut self, rtt_us: u32) {
+        self.recent[self.recent_ptr] = rtt_us;
+        self.recent_ptr = (self.recent_ptr + 1) % FILTER;
+        if self.recent_len < FILTER {
+            self.recent_len += 1;
+        }
+        if rtt_us < self.base_us {
+            self.base_us = rtt_us;
         }
     }
 
-    fn update_current_delay(&mut self, delay_us: u32) {
-        if self.current_delays.len() >= CURRENT_FILTER {
-            self.current_delays.pop_front();
+    /// Filtered current delay: minimum of the recent samples.
+    fn filtered_us(&self) -> u32 {
+        self.recent[..self.recent_len.max(1)].iter().copied().min().unwrap_or(u32::MAX)
+    }
+
+    /// Queuing delay above the base, µs.
+    fn queuing_us(&self) -> f64 {
+        let f = self.filtered_us();
+        if f == u32::MAX || self.base_us == u32::MAX {
+            return 0.0;
         }
-        self.current_delays.push_back(delay_us);
+        f.saturating_sub(self.base_us) as f64
     }
 
-    fn filter_current(&self) -> u32 {
-        // FILTER = MIN over recent samples
-        self.current_delays.iter().copied().min().unwrap_or(u32::MAX)
+    /// `GAIN = 1 / min(16, ceil(2·TARGET / base))` — LEDBAT++ §3.2.
+    ///
+    /// Scaling by the base delay keeps the ramp gentle on short paths, where a
+    /// constant gain would overshoot the target within a single RTT.
+    fn gain(&self) -> f64 {
+        let base = if self.base_us == u32::MAX { TARGET_US } else { self.base_us as f64 };
+        let divisor = (2.0 * TARGET_US / base.max(1.0)).ceil().clamp(1.0, GAIN_CAP);
+        1.0 / divisor
     }
 
-    fn min_base(&self) -> u32 {
-        self.base_delays.iter().copied().min().unwrap_or(u32::MAX)
+    fn rtt_of(ctx: &CcContext) -> u64 {
+        (ctx.rtt_us as u64).max(1)
     }
 
-    fn output(&self, ctx: CcContext) -> CcOutput {
-        let cwnd_pkts = self.cwnd_bytes / ctx.mss as f64;
-        // Convert cwnd to a sending period; if cwnd > 0 use bandwidth otherwise keep slow
-        let period_us = if cwnd_pkts > 0.0 {
-            (ctx.rtt_us as f64 / cwnd_pkts).max(1.0)
-        } else {
-            ctx.syn_interval_us as f64
-        };
+    /// Pace the window across one RTT rather than emitting it back to back —
+    /// bursting builds exactly the queue this controller exists to avoid.
+    fn output(&self, ctx: &CcContext) -> CcOutput {
+        let cwnd = self.cwnd.max(MIN_CWND);
         CcOutput {
-            pkt_snd_period_us: period_us,
-            cwnd: cwnd_pkts,
+            pkt_snd_period_us: (Self::rtt_of(ctx) as f64 / cwnd).max(1.0),
+            cwnd,
             ack_period_ms: None,
             ack_interval_pkts: None,
             rto_us: None,
         }
     }
-}
 
-impl Default for Ledbat {
-    fn default() -> Self { Self::new() }
+    /// Pin the window low so the queue drains and the base delay can be
+    /// measured without this flow's own backlog inflating it.
+    fn enter_slowdown(&mut self, now_us: u64) {
+        self.ssthresh = self.cwnd;
+        self.cwnd = SLOWDOWN_CWND;
+        self.phase = Phase::Slowdown;
+        self.phase_started_us = now_us;
+        // Discard the delay history: it describes the pre-slowdown queue.
+        self.base_us = u32::MAX;
+        self.recent = [u32::MAX; FILTER];
+        self.recent_len = 0;
+        self.recent_ptr = 0;
+    }
 }
 
 impl CongestionControl for Ledbat {
     fn init(&mut self, ctx: CcContext) -> CcOutput {
-        self.mss = ctx.mss;
-        self.cwnd_bytes = INIT_CWND_PKTS * ctx.mss as f64;
-        self.cto_us = 1_000_000;
-        self.base_delays.clear();
-        for _ in 0..BASE_HISTORY {
-            self.base_delays.push_back(u32::MAX);
-        }
-        self.current_delays.clear();
-        self.last_rollover_us = 0;
-        self.output(ctx)
+        self.phase = Phase::SlowStart;
+        self.cwnd = INIT_CWND;
+        self.ssthresh = f64::INFINITY;
+        self.last_ack = ctx.snd_curr_seq;
+        self.phase_started_us = ctx.now_us;
+        self.next_slowdown_us = 0;
+        self.output(&ctx)
     }
 
-    fn on_ack(&mut self, _ack_seq: SeqNo, ctx: CcContext) -> CcOutput {
-        let delay_us = ctx.rtt_us / 2;
-        self.update_base_delay(delay_us, ctx.now_us);
-        self.update_current_delay(delay_us);
+    fn on_ack(&mut self, ack: SeqNo, ctx: CcContext) -> CcOutput {
+        let acked = ack.offset_from(self.last_ack).max(0) as f64;
+        self.last_ack = ack;
+        self.record_delay(ctx.rtt_us);
 
-        let min_base = self.min_base();
-        let filtered = self.filter_current();
+        let rtt = Self::rtt_of(&ctx);
+        let queuing = self.queuing_us();
+        let gain = self.gain();
 
-        // queuing_delay can go negative if our base is stale; clamp to 0
-        let queuing_delay = if filtered > min_base { (filtered - min_base) as f64 } else { 0.0 };
-        let off_target = (TARGET_US - queuing_delay) / TARGET_US;
+        match self.phase {
+            Phase::SlowStart => {
+                self.cwnd += acked * gain;
+                // "If the queuing delay is larger than 3/4ths of the target
+                // delay, exit slow start" — LEDBAT++ §3.4.
+                if queuing > 0.75 * TARGET_US || self.cwnd >= ctx.flow_wnd {
+                    self.phase = Phase::Steady;
+                    self.phase_started_us = ctx.now_us;
+                    // First slowdown two RTTs after slow start completes.
+                    self.next_slowdown_us = ctx.now_us + 2 * rtt;
+                }
+            }
+            Phase::Steady => {
+                if queuing <= TARGET_US {
+                    // Linear increase, apportioned across the window so one
+                    // window of ACKs adds GAIN. An earlier version fixed the
+                    // acked amount at one packet regardless of what the
+                    // cumulative ACK actually covered, making growth ~sqrt(n):
+                    // reaching a 1000-packet window took over an hour.
+                    self.cwnd += gain * acked / self.cwnd.max(1.0);
+                } else {
+                    // W += max(GAIN − C·W·(delay/target − 1), −W/2)
+                    let over = queuing / TARGET_US - 1.0;
+                    let delta = (gain - DECREASE_C * self.cwnd * over).max(-self.cwnd / 2.0);
+                    self.cwnd += delta * (acked / self.cwnd.max(1.0)).min(1.0);
+                }
+                self.cwnd = self.cwnd.max(MIN_CWND);
 
-        // bytes_newly_acked: approximate as one packet (we don't track exact bytes here)
-        let bytes_newly_acked = ctx.mss as f64;
-        let cwnd_delta = GAIN * off_target * bytes_newly_acked * ctx.mss as f64 / self.cwnd_bytes.max(1.0);
-        self.cwnd_bytes += cwnd_delta;
-        self.cwnd_bytes = self.cwnd_bytes.max(MIN_CWND_PKTS * ctx.mss as f64);
+                if self.next_slowdown_us != 0 && ctx.now_us >= self.next_slowdown_us {
+                    self.enter_slowdown(ctx.now_us);
+                }
+            }
+            Phase::Slowdown => {
+                self.cwnd = SLOWDOWN_CWND;
+                if ctx.now_us.saturating_sub(self.phase_started_us) >= 2 * rtt {
+                    self.last_slowdown_len_us = ctx.now_us.saturating_sub(self.phase_started_us);
+                    self.phase = Phase::Recovery;
+                    self.phase_started_us = ctx.now_us;
+                }
+            }
+            Phase::Recovery => {
+                self.cwnd += acked * gain;
+                if self.cwnd >= self.ssthresh {
+                    self.cwnd = self.ssthresh;
+                    self.phase = Phase::Steady;
+                    self.phase_started_us = ctx.now_us;
+                    // "the next slowdown is scheduled to occur at 9 times this
+                    // duration" — LEDBAT++ §3.5.
+                    self.next_slowdown_us =
+                        ctx.now_us + 9 * self.last_slowdown_len_us.max(rtt);
+                }
+            }
+        }
 
-        self.output(ctx)
+        self.output(&ctx)
     }
 
     fn on_loss(&mut self, _loss: &[(SeqNo, SeqNo)], ctx: CcContext) -> CcOutput {
-        self.cwnd_bytes = (self.cwnd_bytes / 2.0).max(MIN_CWND_PKTS * ctx.mss as f64);
-        self.output(ctx)
+        // At most one backoff per RTT. Every NAK arrives here and a single loss
+        // episode commonly produces several; halving on each would collapse the
+        // window far below what one congestion signal warrants.
+        if ctx.now_us < self.loss_guard_us {
+            return self.output(&ctx);
+        }
+        let rtt = Self::rtt_of(&ctx);
+        self.loss_guard_us = ctx.now_us + rtt;
+
+        self.cwnd = (self.cwnd / 2.0).max(MIN_CWND);
+        self.ssthresh = self.cwnd;
+        if self.phase == Phase::SlowStart {
+            self.phase = Phase::Steady;
+            self.phase_started_us = ctx.now_us;
+            self.next_slowdown_us = ctx.now_us + 2 * rtt;
+        }
+        self.output(&ctx)
     }
 
     fn on_timeout(&mut self, ctx: CcContext) -> CcOutput {
-        self.cwnd_bytes = ctx.mss as f64; // 1 packet
-        self.cto_us = (self.cto_us * 2).min(60_000_000);
-        self.output(ctx)
+        self.cwnd = MIN_CWND;
+        self.phase = Phase::Steady;
+        self.phase_started_us = ctx.now_us;
+        self.output(&ctx)
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::congestion::CcContext;
 
-    fn ctx_with_rtt(rtt_us: u32, now_us: u64) -> CcContext {
+    fn ctx(now_us: u64, rtt_us: u32, snd: u32) -> CcContext {
         CcContext {
-            mss: 1472,
-            bandwidth_pps: 0,
-            rcv_rate_pps: 0,
+            mss: 1500,
+            bandwidth_pps: 100_000,
+            rcv_rate_pps: 50_000,
             rtt_us,
-            snd_curr_seq: SeqNo::new(0),
-            flow_wnd: 25600.0,
+            snd_curr_seq: SeqNo::new(snd),
+            flow_wnd: 8192.0,
             syn_interval_us: 10_000,
             now_us,
         }
     }
 
+    /// Growth must be linear in acknowledged packets. The previous
+    /// implementation grew as sqrt(n) because it ignored how much each ACK
+    /// covered — this asserts the *rate*, which a sign-only check cannot catch.
     #[test]
-    fn cwnd_grows_when_below_target() {
+    fn steady_growth_is_linear_in_acked_packets() {
         let mut cc = Ledbat::new();
-        let mut ctx = ctx_with_rtt(1_000, 0); // very low RTT → tiny OWD → below target
-        cc.init(ctx);
-        let before = cc.cwnd_bytes;
-        // Feed 10 ACKs, no loss
-        for i in 1..=10u64 {
-            ctx.now_us = i * 10_000;
-            cc.on_ack(SeqNo::new(i as u32), ctx);
+        cc.init(ctx(0, 1_000, 0));
+        cc.phase = Phase::Steady;
+        cc.next_slowdown_us = 0; // not scheduled
+        cc.cwnd = 100.0;
+        cc.base_us = 1_000;
+
+        let before = cc.cwnd;
+        let gain = cc.gain();
+        // One full window of ACKs should add about GAIN.
+        for i in 0..100u32 {
+            cc.on_ack(SeqNo::new(i + 1), ctx(1_000 + u64::from(i) * 10, 1_000, i + 1));
         }
-        assert!(cc.cwnd_bytes > before, "cwnd should grow when below target");
+        let grew = cc.cwnd - before;
+        assert!(
+            grew > gain * 0.5 && grew < gain * 2.0,
+            "one window of ACKs grew cwnd by {grew}, expected about {gain}",
+        );
+    }
+
+    /// Queuing delay above target must shrink the window — the defining
+    /// behaviour of a scavenger controller.
+    #[test]
+    fn cwnd_shrinks_when_over_target() {
+        let mut cc = Ledbat::new();
+        cc.init(ctx(0, 1_000, 0));
+        cc.phase = Phase::Steady;
+        cc.next_slowdown_us = 0;
+        cc.cwnd = 100.0;
+        cc.base_us = 1_000;
+
+        let before = cc.cwnd;
+        cc.on_ack(SeqNo::new(50), ctx(10_000, 200_000, 50));
+        assert!(cc.cwnd < before, "cwnd {} did not shrink from {before}", cc.cwnd);
     }
 
     #[test]
-    fn cwnd_shrinks_on_loss() {
+    fn repeated_loss_within_one_rtt_backs_off_once() {
         let mut cc = Ledbat::new();
-        let ctx = ctx_with_rtt(10_000, 0);
-        cc.init(ctx);
-        cc.cwnd_bytes = 100_000.0;
-        let before = cc.cwnd_bytes;
-        cc.on_loss(&[(SeqNo::new(5), SeqNo::new(5))], ctx);
-        assert!(cc.cwnd_bytes < before);
+        cc.init(ctx(0, 10_000, 0));
+        cc.phase = Phase::Steady;
+        cc.cwnd = 100.0;
+
+        cc.on_loss(&[], ctx(1_000_000, 10_000, 0));
+        let after_first = cc.cwnd;
+        for i in 1..5u64 {
+            cc.on_loss(&[], ctx(1_000_000 + i * 1_000, 10_000, 0));
+        }
+        assert_eq!(cc.cwnd, after_first, "backed off more than once within an RTT");
+
+        cc.on_loss(&[], ctx(1_020_000, 10_000, 0));
+        assert!(cc.cwnd < after_first, "no backoff once the guard expired");
+    }
+
+    /// A slowdown pins the window and discards the stale base estimate — which
+    /// is what stops the base drifting up behind this flow's own queue.
+    #[test]
+    fn slowdown_pins_window_and_resets_base() {
+        let mut cc = Ledbat::new();
+        cc.init(ctx(0, 1_000, 0));
+        cc.phase = Phase::Steady;
+        cc.cwnd = 500.0;
+        cc.base_us = 5_000;
+        cc.next_slowdown_us = 1_000;
+
+        cc.on_ack(SeqNo::new(10), ctx(2_000, 5_000, 10));
+        assert_eq!(cc.phase, Phase::Slowdown);
+        assert_eq!(cc.cwnd, SLOWDOWN_CWND);
+        // The ACK that triggers the slowdown also grows the window a little
+        // first, so compare with tolerance rather than for equality.
+        assert!(
+            (cc.ssthresh - 500.0).abs() < 1.0,
+            "pre-slowdown window not remembered: {}",
+            cc.ssthresh,
+        );
+        assert_eq!(cc.base_us, u32::MAX, "stale base delay survived the slowdown");
     }
 
     #[test]
-    fn base_delay_rotation() {
+    fn slowdown_recovers_to_previous_window() {
         let mut cc = Ledbat::new();
-        // Feed samples in minute 0
-        cc.update_base_delay(5000, 0);
-        cc.update_base_delay(3000, 30_000_000); // still minute 0
-        assert_eq!(cc.min_base(), 3000);
-        // Advance to minute 1
-        cc.update_base_delay(8000, 60_000_000);
-        // Now we have a new entry; minimum should be 3000 (from history) or 8000
-        assert!(cc.min_base() <= 8000);
+        cc.init(ctx(0, 1_000, 0));
+        cc.cwnd = 64.0;
+        cc.enter_slowdown(0);
+
+        let mut seq = 0u32;
+        let mut t = 0u64;
+        for _ in 0..2000 {
+            t += 1_000;
+            seq += 4;
+            cc.on_ack(SeqNo::new(seq), ctx(t, 1_000, seq));
+            if cc.phase == Phase::Steady {
+                break;
+            }
+        }
+        assert_eq!(cc.phase, Phase::Steady, "never finished recovering");
+        assert_eq!(cc.cwnd, 64.0, "did not return to the pre-slowdown window");
+        assert!(cc.next_slowdown_us > t, "next slowdown not scheduled");
+    }
+
+    #[test]
+    fn window_floor_is_two_packets() {
+        let mut cc = Ledbat::new();
+        cc.init(ctx(0, 1_000, 0));
+        cc.phase = Phase::Steady;
+        cc.next_slowdown_us = 0;
+        cc.cwnd = 3.0;
+        cc.base_us = 1_000;
+        for i in 0..20u32 {
+            cc.on_ack(SeqNo::new(i + 1), ctx(10_000 + u64::from(i) * 1_000, 500_000, i + 1));
+        }
+        assert!(cc.cwnd >= MIN_CWND, "cwnd fell to {}", cc.cwnd);
+        cc.on_timeout(ctx(100_000, 1_000, 0));
+        assert!(cc.cwnd >= MIN_CWND, "timeout drove cwnd to {}", cc.cwnd);
     }
 }

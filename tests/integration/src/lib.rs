@@ -932,6 +932,136 @@ mod tests {
         println!("[unordered←cpp] C++ queued {sent}/{MSGS}");
     }
 
+    // ── LEDBAT++ ──────────────────────────────────────────────────────────────
+
+    /// A LEDBAT++ connection must carry data correctly, not just back off.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ledbat_transfers_correctly() {
+        use udt_async::{CcKind, EndpointConfig};
+
+        const MSGS: usize = 400;
+        const CHUNK: usize = 4096;
+        let cfg = EndpointConfig { congestion: CcKind::LedbatPlusPlus, ..Default::default() };
+
+        let ep = Endpoint::bind_with("127.0.0.1:0".parse().unwrap(), cfg).unwrap();
+        let server_addr = ep.local_addr().unwrap();
+        let mut listener = ep.listen(4).unwrap();
+
+        let (mut server, client) = tokio::join!(
+            async { listener.accept().await.unwrap() },
+            async {
+                let cep = Endpoint::bind_with("127.0.0.1:0".parse().unwrap(), cfg).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), cep.connect(server_addr))
+                    .await
+                    .expect("ledbat connect timed out")
+                    .expect("ledbat connect failed")
+            }
+        );
+
+        let sender = tokio::spawn(async move {
+            for i in 0..MSGS {
+                client.send(&vec![pattern(i); CHUNK]).await.expect("send failed");
+            }
+            client
+        });
+
+        let mut buf = vec![0u8; CHUNK * 2];
+        for i in 0..MSGS {
+            let n = tokio::time::timeout(Duration::from_secs(20), server.recv(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("ledbat stalled at message {i} of {MSGS}"))
+                .expect("recv failed");
+            assert_eq!(n, CHUNK, "message {i} wrong length");
+            assert!(buf[..n].iter().all(|&b| b == pattern(i)), "message {i} corrupted");
+        }
+        let _held = sender.await.unwrap();
+    }
+
+    /// The property that defines a scavenger: when a LEDBAT++ flow shares a
+    /// path with a default (UDT) flow, it must give way.
+    ///
+    /// Both flows run concurrently for a fixed window and we compare how much
+    /// each moved. Loopback is a poor congestion signal — there is no real
+    /// bottleneck queue — so this asserts only the direction of the effect,
+    /// generously, rather than a precise share.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn ledbat_yields_to_default_flow() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use udt_async::{CcKind, EndpointConfig};
+
+        const CHUNK: usize = 64 * 1024;
+        const RUN: Duration = Duration::from_secs(3);
+
+        async fn spawn_flow(cc: CcKind, counter: Arc<AtomicUsize>, stop: Arc<AtomicUsize>) {
+            let cfg = EndpointConfig { congestion: cc, ..Default::default() };
+            let ep = Endpoint::bind_with("127.0.0.1:0".parse().unwrap(), cfg).unwrap();
+            let addr = ep.local_addr().unwrap();
+            let mut listener = ep.listen(4).unwrap();
+            let (mut server, client) = tokio::join!(
+                async { listener.accept().await.unwrap() },
+                async {
+                    let cep = Endpoint::bind_with("127.0.0.1:0".parse().unwrap(), cfg).unwrap();
+                    cep.connect(addr).await.unwrap()
+                }
+            );
+
+            let s = Arc::clone(&stop);
+            tokio::spawn(async move {
+                let chunk = vec![0x5Au8; CHUNK];
+                while s.load(Ordering::Relaxed) == 0 {
+                    if client.send(&chunk).await.is_err() {
+                        break;
+                    }
+                }
+                client
+            });
+
+            let mut buf = vec![0u8; CHUNK * 2];
+            while stop.load(Ordering::Relaxed) == 0 {
+                match tokio::time::timeout(Duration::from_millis(500), server.recv(&mut buf)).await {
+                    Ok(Ok(n)) => {
+                        counter.fetch_add(n, Ordering::Relaxed);
+                    }
+                    _ => break,
+                }
+            }
+            // Keep the endpoint alive for the flow's lifetime.
+            drop(ep);
+        }
+
+        let stop = Arc::new(AtomicUsize::new(0));
+        let udt_bytes = Arc::new(AtomicUsize::new(0));
+        let led_bytes = Arc::new(AtomicUsize::new(0));
+
+        let a = tokio::spawn(spawn_flow(CcKind::Udt, Arc::clone(&udt_bytes), Arc::clone(&stop)));
+        let b = tokio::spawn(spawn_flow(
+            CcKind::LedbatPlusPlus,
+            Arc::clone(&led_bytes),
+            Arc::clone(&stop),
+        ));
+
+        tokio::time::sleep(RUN).await;
+        stop.store(1, Ordering::Relaxed);
+        let _ = tokio::time::timeout(Duration::from_secs(10), a).await;
+        let _ = tokio::time::timeout(Duration::from_secs(10), b).await;
+
+        let udt = udt_bytes.load(Ordering::Relaxed);
+        let led = led_bytes.load(Ordering::Relaxed);
+        println!(
+            "[ledbat-yield] udt={:.1} MB  ledbat={:.1} MB  (ledbat took {:.0}% of the pair)",
+            udt as f64 / 1e6,
+            led as f64 / 1e6,
+            100.0 * led as f64 / (udt + led).max(1) as f64,
+        );
+        assert!(led > 0, "LEDBAT flow moved nothing at all");
+        assert!(
+            led <= udt,
+            "LEDBAT flow ({led} B) did not yield to the default flow ({udt} B)",
+        );
+    }
+
     // ── Benchmarks ────────────────────────────────────────────────────────────
     //
     // Run with: cargo test --release -- --ignored --nocapture --test-threads=1

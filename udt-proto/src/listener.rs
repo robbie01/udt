@@ -1,7 +1,7 @@
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use crate::codec;
-use crate::congestion::udt_cc::UdtCc;
+use crate::congestion::CcKind;
 use crate::handshake::{req_type, Handshake, SOCK_DGRAM, UDT_VERSION};
 use crate::connection::Connection;
 use crate::seq::SeqNo;
@@ -41,6 +41,8 @@ struct PendingConn {
 pub struct ListenerState {
     socket_id: u32,
     mss: u32,
+    /// Controller built fresh for each accepted connection.
+    cc: CcKind,
     flight_flag_size: i32,
     /// Pending connections awaiting the req_type=-1 echo (cookie challenge stage).
     pending: HashMap<PeerAddr, PendingConn>,
@@ -52,10 +54,11 @@ pub struct ListenerState {
 }
 
 impl ListenerState {
-    pub fn new(socket_id: u32, mss: u32, _now_us: u64, secret: u64) -> Self {
+    pub fn new(socket_id: u32, mss: u32, _now_us: u64, secret: u64, cc: CcKind) -> Self {
         ListenerState {
             socket_id,
             mss,
+            cc,
             flight_flag_size: 25600,
             pending: HashMap::new(),
             accepted: HashMap::new(),
@@ -145,7 +148,7 @@ impl ListenerState {
                     neg_mss,
                     flow_wnd,
                     now_us,
-                    Box::new(UdtCc::new()),
+                    self.cc.build(),
                 );
 
                 self.pending.remove(&addr);
