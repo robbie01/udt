@@ -211,12 +211,18 @@ pub(crate) fn recv_buffers(io: &BatchIo) -> (Vec<Vec<u8>>, Vec<RecvMeta>) {
     )
 }
 
-/// Split a received buffer into its constituent datagrams.
+/// Split one received buffer into its constituent datagrams.
 ///
-/// With generic receive offload the kernel may hand back several datagrams
-/// coalesced into one buffer, described by `meta.stride`. Without it there is
-/// exactly one datagram and `stride == len`.
-pub(crate) fn split_gro<'a>(buf: &'a [u8], meta: &RecvMeta) -> impl Iterator<Item = &'a [u8]> {
-    let stride = if meta.stride == 0 { meta.len.max(1) } else { meta.stride };
-    buf[..meta.len].chunks(stride)
+/// With generic receive offload the kernel hands back a *run* of datagrams
+/// coalesced into one buffer, described by `meta.stride`. The run is copied
+/// once and the datagrams are zero-copy slices sharing that allocation —
+/// copying each datagram separately costs an allocation and a memcpy per
+/// packet where one per run will do, and up to 64 packets can share a run.
+pub(crate) fn split_run(buf: &[u8], meta: &RecvMeta) -> impl Iterator<Item = Bytes> {
+    let len = meta.len.min(buf.len());
+    let stride = if meta.stride == 0 { len.max(1) } else { meta.stride };
+    let run = Bytes::copy_from_slice(&buf[..len]);
+    (0..len)
+        .step_by(stride.max(1))
+        .map(move |off| run.slice(off..(off + stride).min(len)))
 }

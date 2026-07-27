@@ -751,6 +751,78 @@ mod tests {
         .await;
     }
 
+    /// Long-running two-connection transfer, for attaching a profiler.
+    ///
+    /// Both connections are accepted through one endpoint, so their inbound
+    /// traffic funnels through the single mux task — which is what this is for
+    /// measuring.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn profile_stream_two_connections() {
+        const ROUNDS: usize = 8;
+        const PER_CONN: usize = BENCH_TOTAL / 2;
+
+        let ep = Endpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = ep.local_addr().unwrap();
+        let mut listener = ep.listen(4).unwrap();
+
+        let conn_tasks: Vec<_> = (0..2)
+            .map(|_| {
+                tokio::spawn(async move {
+                    let cep = Endpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+                    (cep.connect(server_addr).await.unwrap(), cep)
+                })
+            })
+            .collect();
+        let mut servers = Vec::new();
+        for _ in 0..2 {
+            servers.push(listener.accept().await.unwrap());
+        }
+        let mut clients = Vec::new();
+        for t in conn_tasks {
+            clients.push(t.await.unwrap());
+        }
+
+        let start = std::time::Instant::now();
+        let mut total = 0usize;
+        let xfer: Vec<_> = servers
+            .into_iter()
+            .zip(clients)
+            .map(|(mut srv, (cli, _cep))| {
+                tokio::spawn(async move {
+                    let (_rd, wr) = cli.into_split();
+                    let wr = std::sync::Arc::new(wr);
+                    let chunk = vec![0xAAu8; BENCH_CHUNK];
+                    let mut got = 0usize;
+                    for _ in 0..ROUNDS {
+                        let c = chunk.clone();
+                        let w = std::sync::Arc::clone(&wr);
+                        let sender = tokio::spawn(async move {
+                            let mut sent = 0usize;
+                            while sent < PER_CONN {
+                                if w.send(&c).await.is_err() { break; }
+                                sent += BENCH_CHUNK;
+                            }
+                        });
+                        let mut buf = vec![0u8; BENCH_CHUNK * 2];
+                        let mut round = 0usize;
+                        while round < PER_CONN {
+                            round += srv.recv(&mut buf).await.unwrap();
+                        }
+                        got += round;
+                        sender.await.unwrap();
+                    }
+                    (got, wr)
+                })
+            })
+            .collect();
+        for t in xfer {
+            let (n, _held) = t.await.unwrap();
+            total += n;
+        }
+        report("profile rust 2-conn", total, start.elapsed().as_secs_f64());
+    }
+
     // ── Streaming throughput ──────────────────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread")]

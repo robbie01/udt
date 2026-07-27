@@ -622,11 +622,10 @@ async fn run_endpoint_mux(
                 let mut unrouted: Option<(SocketAddr, Bytes)> = None;
                 'outer: for i in 0..count {
                     let from = rx_metas[i].addr;
-                    for dg in batch::split_gro(&rx_storage[i], &rx_metas[i]) {
+                    for dg in batch::split_run(&rx_storage[i], &rx_metas[i]) {
                         match routes.get(&from) {
                             Some(conn_tx) => {
-                                let bytes = Bytes::copy_from_slice(dg);
-                                match conn_tx.try_send(bytes) {
+                                match conn_tx.try_send(dg) {
                                     Ok(()) => {}
                                     Err(mpsc::error::TrySendError::Full(bytes)) => {
                                         // Driver is behind: block so backpressure
@@ -645,7 +644,7 @@ async fn run_endpoint_mux(
                                 // below; anything after it waits for the peer to
                                 // retransmit, which is what a fresh connection
                                 // does anyway.
-                                unrouted = Some((from, Bytes::copy_from_slice(dg)));
+                                unrouted = Some((from, dg));
                                 break 'outer;
                             }
                         }
@@ -891,10 +890,8 @@ async fn run_conn_driver(
                             if rx_metas[i].addr != peer_addr {
                                 continue;
                             }
-                            for dg in batch::split_gro(&rx_storage[i], &rx_metas[i]) {
-                                conn.on_datagram(
-                                    Bytes::copy_from_slice(dg), now_us(), &mut out,
-                                );
+                            for dg in batch::split_run(&rx_storage[i], &rx_metas[i]) {
+                                conn.on_datagram(dg, now_us(), &mut out);
                             }
                         }
                         drained += count;

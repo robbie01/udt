@@ -85,6 +85,14 @@ pub struct RecvBuffer {
     /// change that. Without it, a stalled hole would make every arriving packet
     /// pay a full window scan.
     maybe_ready: bool,
+    /// Held packets whose sender cleared the order flag.
+    ///
+    /// Only these can be delivered out of sequence, so when the count is zero
+    /// the search for a deliverable message is just "does one start at the
+    /// reclaim frontier" — no scan of the window at all. Counted per packet
+    /// rather than per message because a message's packets may arrive in any
+    /// order; the exact figure does not matter, only whether it is zero.
+    unordered_pending: usize,
 }
 
 impl RecvBuffer {
@@ -98,6 +106,7 @@ impl RecvBuffer {
             max_off: 0,
             reclaimable: 0,
             maybe_ready: false,
+            unordered_pending: 0,
         }
     }
 
@@ -136,6 +145,9 @@ impl RecvBuffer {
         if self.slots[phys].is_occupied() {
             return AddResult::Duplicate;
         }
+        if !in_order {
+            self.unordered_pending += 1;
+        }
         self.slots[phys] = SlotState::Filled(Slot { payload, boundary, msg_no, in_order });
         if off >= self.max_off {
             self.max_off = off + 1;
@@ -160,6 +172,18 @@ impl RecvBuffer {
     /// ACKed it — a sender that goes quiet then waits on its ACK timer. Using
     /// the frontier is equivalent for ordering and delivers immediately.
     fn find_deliverable(&self) -> Option<(usize, usize)> {
+        // Fast path: only a message starting at the reclaim frontier can be
+        // delivered in sequence, so unless some sender has opted out of
+        // ordering this is the entire search. Scanning the window here instead
+        // costs O(window) on *every* arriving packet, which profiled as the
+        // single hottest symbol in the whole implementation.
+        if let Some(r) = self.message_at(self.reclaimable) {
+            return Some(r);
+        }
+        if self.unordered_pending == 0 {
+            return None;
+        }
+
         let mut start: Option<usize> = None;
         for off in self.reclaimable..self.max_off {
             match &self.slots[self.phys(off)] {
@@ -186,6 +210,28 @@ impl RecvBuffer {
         None
     }
 
+    /// Extent of a complete message starting exactly at `off`, if there is one.
+    fn message_at(&self, off: usize) -> Option<(usize, usize)> {
+        if off >= self.max_off {
+            return None;
+        }
+        match &self.slots[self.phys(off)] {
+            SlotState::Filled(s) if s.boundary.is_first() => {}
+            _ => return None,
+        }
+        let mut end = off;
+        loop {
+            match &self.slots[self.phys(end)] {
+                SlotState::Filled(s) if s.boundary.is_last() => return Some((off, end)),
+                SlotState::Filled(_) => end += 1,
+                _ => return None,
+            }
+            if end >= self.max_off || end - off >= self.capacity {
+                return None;
+            }
+        }
+    }
+
     /// Extract the next deliverable message, if any.
     pub fn read_msg(&mut self) -> Option<Bytes> {
         if !self.maybe_ready {
@@ -199,7 +245,12 @@ impl RecvBuffer {
         let msg = if start == end {
             // Solo or single-packet message: hand over the payload as-is.
             match std::mem::replace(&mut self.slots[self.phys(start)], SlotState::Delivered) {
-                SlotState::Filled(s) => s.payload,
+                SlotState::Filled(s) => {
+                    if !s.in_order {
+                        self.unordered_pending -= 1;
+                    }
+                    s.payload
+                }
                 _ => unreachable!("find_deliverable returned a non-filled slot"),
             }
         } else {
@@ -212,7 +263,12 @@ impl RecvBuffer {
             let mut out = BytesMut::with_capacity(total);
             for off in start..=end {
                 match std::mem::replace(&mut self.slots[self.phys(off)], SlotState::Delivered) {
-                    SlotState::Filled(s) => out.put_slice(&s.payload),
+                    SlotState::Filled(s) => {
+                        if !s.in_order {
+                            self.unordered_pending -= 1;
+                        }
+                        out.put_slice(&s.payload);
+                    }
                     _ => unreachable!("find_deliverable returned a non-filled slot"),
                 }
             }
@@ -266,6 +322,9 @@ impl RecvBuffer {
             if let SlotState::Filled(s) = &self.slots[phys]
                 && s.msg_no == msg_no
             {
+                if !s.in_order {
+                    self.unordered_pending -= 1;
+                }
                 self.slots[phys] = SlotState::Delivered;
             }
         }
@@ -289,6 +348,11 @@ impl RecvBuffer {
         let to = (to as usize).min(self.capacity.saturating_sub(1));
         for off in from..=to {
             let phys = self.phys(off);
+            if let SlotState::Filled(s) = &self.slots[phys]
+                && !s.in_order
+            {
+                self.unordered_pending -= 1;
+            }
             if !matches!(self.slots[phys], SlotState::Delivered) {
                 self.slots[phys] = SlotState::Delivered;
             }
