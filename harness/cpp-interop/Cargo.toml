@@ -1,11 +1,11 @@
 [package]
-name = "udt-integration-tests"
+name = "udt-cpp-interop-tests"
 version.workspace = true
 edition.workspace = true
 
 [dev-dependencies]
-udt-async = { path = "../../udt-async", features = ["tokio"] }
-udt-compat = { path = "../../udt-compat" }
+udt-async = { workspace = true }
+udt-compat = { path = "../udt-compat" }
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
 futures = { version = "0.3", default-features = false, features = ["executor"] }

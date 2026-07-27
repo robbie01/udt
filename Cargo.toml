@@ -1,17 +1,28 @@
 [workspace]
 resolver = "2"
 members = [
-    "udt-compat",
-    "udt-compat/udt-sys",
-    "udt-proto",
-    "udt-async",
-    "udt-compio",
-    "udt-orig",
-    "tests/integration",
-    "tests/upstream-compat",
-    "tests/quinn-bench",
+    "harness/udt-compat",
+    "harness/udt-compat/udt-sys",
+    "harness/udt-orig",
+    "harness/cpp-interop",
+    "harness/upstream-compat",
+    "harness/quinn-bench",
 ]
 
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
+
+# The Rust implementation lives on `master`. This branch holds only the C++
+# reference implementations and third-party comparison benchmarks, so that
+# `master` is purely the Rust UDT rewrite.
+#
+# Check it out beside the main clone:
+#
+#     git worktree add ../udt-harness harness
+#     cd ../udt-harness && cargo test
+#
+# The path dependencies below resolve to that sibling checkout.
+[workspace.dependencies]
+udt-proto = { path = "../udt/udt-proto" }
+udt-async = { path = "../udt/udt-async", features = ["tokio"] }
