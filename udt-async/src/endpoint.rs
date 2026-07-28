@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use tokio::net::{ToSocketAddrs, UdpSocket};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::Notify;
 use udt_proto::{CcKind, Connection, Listener as ProtoListener, ListenerEvent, SeqNo};
 
 use crate::batch::{self, BatchIo};
@@ -36,14 +36,6 @@ pub const fn max_payload_for_mtu(mtu: u32) -> usize {
     const FIXED_OVERHEAD: u32 = 48 + udt_proto::UDT_HEADER_SIZE as u32;
     if mtu <= FIXED_OVERHEAD { 0 } else { (mtu - FIXED_OVERHEAD) as usize }
 }
-
-/// Datagrams the reader may leave queued for one connection.
-///
-/// Deep enough that a driver briefly descheduled does not lose anything, and
-/// shallow enough that a connection which has genuinely stopped keeping up
-/// starts dropping rather than growing without bound — which is what an
-/// overrun kernel socket buffer does, and what UDT's loss recovery expects.
-const DATAGRAM_BACKLOG: usize = 1024;
 
 /// Datagrams the reader takes per wakeup before dispatching them.
 ///
@@ -139,7 +131,7 @@ struct EndpointInner {
     /// readers only ever look routes up, and taking a read lock lets several
     /// of them dispatch to different connections at once. Writes happen once
     /// per connection, at accept and at close.
-    routes: RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>,
+    routes: RwLock<HashMap<SocketAddr, Arc<ConnectionInner>>>,
     listener: Mutex<Option<ListenerSlot>>,
     /// False once the `Endpoint` handle is dropped. Readers keep serving
     /// existing connections after that, and stop when the last one goes.
@@ -380,20 +372,17 @@ async fn resolve(addr: impl ToSocketAddrs) -> io::Result<SocketAddr> {
 
 /// Route `peer` to a new connection and start driving it.
 ///
-/// The channel is registered before the driver starts so that no reply can
+/// The route is registered before the driver starts so that no reply can
 /// arrive unrouted.
 fn spawn_shared(ep: &Arc<EndpointInner>, inner: &Arc<ConnectionInner>, peer: SocketAddr) {
-    let (datagram_tx, datagram_rx) = mpsc::channel::<Bytes>(DATAGRAM_BACKLOG);
     let Ok(mut routes) = ep.routes.write() else { return };
-    routes.insert(peer, datagram_tx);
+    routes.insert(peer, Arc::clone(inner));
     drop(routes);
 
     let socket = Arc::clone(&ep.socket);
     let inner = Arc::clone(inner);
     let ep = Arc::clone(ep);
-    tokio::spawn(driver::run_shared(inner, socket, peer, datagram_rx, move || {
-        ep.remove_route(peer)
-    }));
+    tokio::spawn(driver::run_shared(inner, socket, peer, move || ep.remove_route(peer)));
 }
 
 // ── Reader tasks ──────────────────────────────────────────────────────────────
@@ -420,7 +409,7 @@ async fn run_reader(ep: Arc<EndpointInner>) {
     // hashing that grouping them into a map would cost.
     let mut run: Vec<Bytes> = Vec::new();
     let mut run_peer: Option<SocketAddr> = None;
-    let mut route: Option<mpsc::Sender<Bytes>> = None;
+    let mut route: Option<Arc<ConnectionInner>> = None;
     let mut unrouted: Vec<(SocketAddr, Bytes)> = Vec::new();
 
     loop {
@@ -482,21 +471,24 @@ async fn run_reader(ep: Arc<EndpointInner>) {
 /// Hand one peer's run of datagrams to its connection.
 fn dispatch(
     peer: SocketAddr,
-    route: &Option<mpsc::Sender<Bytes>>,
+    route: &Option<Arc<ConnectionInner>>,
     run: &mut Vec<Bytes>,
     unrouted: &mut Vec<(SocketAddr, Bytes)>,
 ) {
     match route {
-        Some(tx) => {
-            // Never block: this task serves every connection on the port, so
-            // waiting on one that has stopped keeping up would stall all the
-            // others. A full channel drops, as a full socket buffer would.
-            for datagram in run.drain(..) {
-                if tx.try_send(datagram).is_err() {
-                    break;
-                }
-            }
+        Some(conn) => {
+            // One lock for the whole run. Handing the datagrams over one at a
+            // time -- through a channel, say -- charges an atomic and a
+            // possible wakeup per packet, and with receive offload a run is up
+            // to 64 of them.
+            let wake = {
+                let mut state = lock(&conn.state);
+                state.deliver(run.drain(..))
+            };
             run.clear();
+            if wake {
+                conn.shared.driver.notify_one();
+            }
         }
         None => {
             // Unknown source: only a handshake can be legitimate. The rest of
