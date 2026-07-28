@@ -74,8 +74,6 @@ mod driver;
 #[cfg(feature = "tokio")]
 mod endpoint;
 #[cfg(feature = "tokio")]
-mod pool;
-#[cfg(feature = "tokio")]
 mod util;
 
 #[cfg(feature = "tokio")]

@@ -30,8 +30,6 @@ use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use udt_proto::TransmitBuf;
 
-use crate::pool::BufferPool;
-
 /// Datagrams the platform can deliver from one receive call.
 ///
 /// 32 where `recvmmsg` exists, 1 everywhere else. Taken from [`quinn_udp`]
@@ -182,36 +180,37 @@ impl BatchIo {
 /// single datagram. Undersizing truncates the run and silently discards every
 /// datagram after the first.
 ///
-/// The buffers come from a pool and go back to it once the protocol has
-/// finished with the datagrams carved out of them, so a steady receive stream
-/// cycles the same memory instead of allocating per run.
+/// The buffers are reused across receives and the datagrams are copied out of
+/// them. Handing them out from a pool and slicing them in place instead --
+/// avoiding the copy -- was tried and measured 25% *slower*: a buffer holds a
+/// whole offload run, so an empty pool costs a 128 KB zeroed allocation where
+/// the copy allocates only the bytes that actually arrived, and the owner
+/// vtable `Bytes::from_owner` needs makes every slice clone and drop more
+/// expensive than a plain shared buffer.
 pub(crate) struct RecvBuffers {
     pub(crate) storage: Vec<Vec<u8>>,
     pub(crate) metas: Vec<RecvMeta>,
-    pool: BufferPool,
 }
 
 impl RecvBuffers {
     pub(crate) fn new(io: &BatchIo) -> Self {
         let per_datagram = 2048;
         let size = per_datagram * io.gro_segments().max(1);
-        // Enough spare for a full batch to be in flight while another is still
-        // being consumed, without holding a peak burst forever.
-        let pool = BufferPool::new(size, RECV_BATCH * 4);
-        let storage = (0..RECV_BATCH).map(|_| pool.take()).collect();
-        RecvBuffers { storage, metas: vec![RecvMeta::default(); RECV_BATCH], pool }
+        RecvBuffers {
+            storage: (0..RECV_BATCH).map(|_| vec![0u8; size]).collect(),
+            metas: vec![RecvMeta::default(); RECV_BATCH],
+        }
     }
 
-    /// Take the datagrams out of buffer `index`, replacing it with a fresh one.
+    /// The datagrams the kernel put in buffer `index`.
     ///
-    /// The returned datagrams are slices of the buffer that was just filled --
-    /// no copy -- and that buffer rejoins the pool when the last of them is
-    /// dropped.
+    /// The run is copied once and the datagrams are slices sharing it, so the
+    /// copy is per run rather than per packet -- up to 64 of them share one.
     pub(crate) fn take_datagrams(&mut self, index: usize) -> impl Iterator<Item = Bytes> + use<> {
         let meta = self.metas[index];
-        let filled = std::mem::replace(&mut self.storage[index], self.pool.take());
-        let len = meta.len.min(filled.len());
-        let run = self.pool.wrap(filled, len);
+        let buf = &self.storage[index];
+        let len = meta.len.min(buf.len());
+        let run = Bytes::copy_from_slice(&buf[..len]);
         split_run(run, meta.stride)
     }
 }
