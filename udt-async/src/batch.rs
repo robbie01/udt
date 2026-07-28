@@ -11,7 +11,9 @@
 //!   the same peer go to the kernel as one buffer plus a segment size, and are
 //!   split below the syscall boundary. Every UDT data packet carries a full
 //!   payload except the tail of a message, so runs are long and a whole
-//!   message usually costs one transmit.
+//!   message usually costs one transmit. The protocol writes its datagrams
+//!   contiguously into a [`TransmitBuf`], so the buffer handed to the kernel is
+//!   the one the packets were built in — nothing is copied to coalesce it.
 //! * **`recvmmsg`** on receive, filling several buffers per call.
 //!
 //! Where neither exists (macOS, OpenBSD) `max_gso_segments()` reports 1 and
@@ -26,6 +28,9 @@ use bytes::Bytes;
 use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
+use udt_proto::TransmitBuf;
+
+use crate::pool::BufferPool;
 
 /// Datagrams the platform can deliver from one receive call.
 ///
@@ -35,22 +40,24 @@ use tokio::net::UdpSocket;
 /// hundred thousand packets a second is not free.
 pub(crate) const RECV_BATCH: usize = quinn_udp::BATCH_SIZE;
 
-/// Upper bound on the scratch buffer used to coalesce a GSO run.
-const MAX_COALESCE_BYTES: usize = 64 * 1024;
+/// Most bytes one segmented transmit may total.
+///
+/// The aggregate goes to the kernel as a single buffer, so it is bounded by
+/// what a datagram can be regardless of how many segments the kernel will
+/// split it into.
+const MAX_GSO_BYTES: usize = 64 * 1024;
 
 pub(crate) struct BatchIo {
     state: UdpSocketState,
     /// Segments the kernel will accept in one transmit; 1 means no offload.
     max_gso: usize,
-    /// Coalescing buffer for a GSO run. Reused across sends.
-    scratch: Vec<u8>,
 }
 
 impl BatchIo {
     pub(crate) fn new(sock: &UdpSocket) -> io::Result<Self> {
         let state = UdpSocketState::new(UdpSockRef::from(sock))?;
         let max_gso = state.max_gso_segments();
-        Ok(BatchIo { state, max_gso, scratch: Vec::new() })
+        Ok(BatchIo { state, max_gso })
     }
 
     /// Datagrams the kernel may coalesce into one receive buffer.
@@ -58,90 +65,53 @@ impl BatchIo {
         self.state.gro_segments()
     }
 
-    /// Send every datagram in `out`, coalescing runs where possible.
+    /// Write everything the protocol has queued for `peer`.
     ///
-    /// Without kernel support the copy into `scratch` would buy nothing — the
-    /// syscall count is the same either way — so that case sends one at a time.
+    /// The protocol lays its datagrams out back to back in `tx`, so a run of
+    /// equal-sized ones is already contiguous and goes to the kernel as one
+    /// segmented write with no copy at all. That is the whole reason the
+    /// protocol writes into a caller-owned buffer: previously each packet was
+    /// its own allocation and then had to be copied into a scratch buffer to be
+    /// coalesced again.
     pub(crate) async fn send_all(
         &mut self,
         sock: &UdpSocket,
         peer: SocketAddr,
-        out: &[Bytes],
+        tx: &TransmitBuf,
     ) -> io::Result<()> {
         if self.max_gso <= 1 {
-            for d in out {
-                self.send_one(sock, peer, d, None).await?;
+            // No offload, so runs mean nothing: one datagram per call.
+            for datagram in tx.datagrams() {
+                self.send_raw(sock, peer, datagram, None).await?;
             }
             return Ok(());
         }
 
-        let mut i = 0;
-        while i < out.len() {
-            let (run, seg) = self.plan_run(&out[i..]);
-            if run == 1 {
-                self.send_one(sock, peer, &out[i], None).await?;
-            } else {
-                self.scratch.clear();
-                for d in &out[i..i + run] {
-                    self.scratch.extend_from_slice(d);
-                }
-                // `scratch` is borrowed by the transmit, so the send cannot go
-                // through `send_one`'s &mut self.
-                let contents = std::mem::take(&mut self.scratch);
-                let res = Self::send_raw(&self.state, sock, peer, &contents, Some(seg)).await;
-                self.scratch = contents;
-                res?;
+        for (bytes, segment_size) in tx.runs() {
+            // A run longer than the kernel will segment in one go has to be
+            // split, but the pieces are still slices of the same buffer.
+            //
+            // Two limits apply: how many segments the kernel will split, and
+            // the 64 KiB an aggregate may total, since it travels as one
+            // buffer. Whichever binds first is rounded down to a whole number
+            // of segments, or the tail of a transmit would be a partial packet.
+            let by_count = segment_size * self.max_gso;
+            let by_bytes = (MAX_GSO_BYTES / segment_size.max(1)) * segment_size;
+            let per_transmit = by_count.min(by_bytes).max(segment_size);
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let end = (offset + per_transmit).min(bytes.len());
+                let chunk = &bytes[offset..end];
+                let segmented = chunk.len() > segment_size;
+                self.send_raw(sock, peer, chunk, segmented.then_some(segment_size)).await?;
+                offset = end;
             }
-            i += run;
         }
         Ok(())
     }
 
-    /// How many leading datagrams of `out` can go in one segmented transmit,
-    /// and the segment size to use.
-    ///
-    /// GSO requires every segment to be the segment size except the last,
-    /// which may be shorter. A UDT message has that shape already: full
-    /// payloads throughout, with only the tail packet short.
-    fn plan_run(&self, out: &[Bytes]) -> (usize, usize) {
-        let seg = out[0].len();
-        if seg == 0 {
-            return (1, seg);
-        }
-        let mut n = 1;
-        let mut bytes = seg;
-        while n < out.len()
-            && n < self.max_gso
-            && out[n].len() == seg
-            && bytes + seg <= MAX_COALESCE_BYTES
-        {
-            bytes += seg;
-            n += 1;
-        }
-        // A single shorter datagram may ride along as the final segment.
-        if n < out.len()
-            && n < self.max_gso
-            && out[n].len() < seg
-            && !out[n].is_empty()
-            && bytes + out[n].len() <= MAX_COALESCE_BYTES
-        {
-            n += 1;
-        }
-        (n, seg)
-    }
-
-    async fn send_one(
-        &mut self,
-        sock: &UdpSocket,
-        peer: SocketAddr,
-        data: &[u8],
-        segment_size: Option<usize>,
-    ) -> io::Result<()> {
-        Self::send_raw(&self.state, sock, peer, data, segment_size).await
-    }
-
     async fn send_raw(
-        state: &UdpSocketState,
+        &self,
         sock: &UdpSocket,
         peer: SocketAddr,
         data: &[u8],
@@ -149,7 +119,8 @@ impl BatchIo {
     ) -> io::Result<()> {
         let transmit =
             Transmit { destination: peer, ecn: None, contents: data, segment_size, src_ip: None };
-        sock.async_io(Interest::WRITABLE, || state.send(UdpSockRef::from(sock), &transmit)).await
+        sock.async_io(Interest::WRITABLE, || self.state.send(UdpSockRef::from(sock), &transmit))
+            .await
     }
 
     /// Receive up to `storage.len()` datagrams in one call.
@@ -205,26 +176,53 @@ impl BatchIo {
     }
 }
 
-/// Allocate receive storage sized for this socket's offload settings.
+/// Receive storage sized for this socket's offload settings.
 ///
 /// Each buffer must hold a full generic-receive-offload run rather than a
 /// single datagram. Undersizing truncates the run and silently discards every
 /// datagram after the first.
-pub(crate) fn recv_buffers(io: &BatchIo) -> (Vec<Vec<u8>>, Vec<RecvMeta>) {
-    let per_datagram = 2048;
-    let cap = per_datagram * io.gro_segments().max(1);
-    ((0..RECV_BATCH).map(|_| vec![0u8; cap]).collect(), vec![RecvMeta::default(); RECV_BATCH])
+///
+/// The buffers come from a pool and go back to it once the protocol has
+/// finished with the datagrams carved out of them, so a steady receive stream
+/// cycles the same memory instead of allocating per run.
+pub(crate) struct RecvBuffers {
+    pub(crate) storage: Vec<Vec<u8>>,
+    pub(crate) metas: Vec<RecvMeta>,
+    pool: BufferPool,
 }
 
-/// Split one received buffer into its constituent datagrams.
+impl RecvBuffers {
+    pub(crate) fn new(io: &BatchIo) -> Self {
+        let per_datagram = 2048;
+        let size = per_datagram * io.gro_segments().max(1);
+        // Enough spare for a full batch to be in flight while another is still
+        // being consumed, without holding a peak burst forever.
+        let pool = BufferPool::new(size, RECV_BATCH * 4);
+        let storage = (0..RECV_BATCH).map(|_| pool.take()).collect();
+        RecvBuffers { storage, metas: vec![RecvMeta::default(); RECV_BATCH], pool }
+    }
+
+    /// Take the datagrams out of buffer `index`, replacing it with a fresh one.
+    ///
+    /// The returned datagrams are slices of the buffer that was just filled --
+    /// no copy -- and that buffer rejoins the pool when the last of them is
+    /// dropped.
+    pub(crate) fn take_datagrams(&mut self, index: usize) -> impl Iterator<Item = Bytes> + use<> {
+        let meta = self.metas[index];
+        let filled = std::mem::replace(&mut self.storage[index], self.pool.take());
+        let len = meta.len.min(filled.len());
+        let run = self.pool.wrap(filled, len);
+        split_run(run, meta.stride)
+    }
+}
+
+/// Split a received buffer into the datagrams the kernel coalesced into it.
 ///
-/// With generic receive offload the kernel returns a run of datagrams packed
-/// into one buffer, described by `meta.stride`. The run is copied once and the
-/// datagrams are slices sharing that allocation; copying them out individually
-/// would cost an allocation and a memcpy per packet, and a run can hold 64.
-pub(crate) fn split_run(buf: &[u8], meta: &RecvMeta) -> impl Iterator<Item = Bytes> {
-    let len = meta.len.min(buf.len());
-    let stride = if meta.stride == 0 { len.max(1) } else { meta.stride };
-    let run = Bytes::copy_from_slice(&buf[..len]);
+/// With generic receive offload one buffer holds a run of datagrams described
+/// by `stride`; without it there is exactly one. Either way the datagrams are
+/// slices sharing the run, so this costs nothing per packet.
+fn split_run(run: Bytes, stride: usize) -> impl Iterator<Item = Bytes> + use<> {
+    let len = run.len();
+    let stride = if stride == 0 { len.max(1) } else { stride };
     (0..len).step_by(stride.max(1)).map(move |off| run.slice(off..(off + stride).min(len)))
 }

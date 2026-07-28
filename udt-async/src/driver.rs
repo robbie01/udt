@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use tokio::net::UdpSocket;
-use udt_proto::DisconnectReason;
+use udt_proto::{DisconnectReason, TransmitBuf};
 
 use tokio::sync::mpsc;
 
@@ -56,13 +56,13 @@ struct Pass {
 /// pass costs one acquisition rather than one per thing the driver wants. The
 /// application contends for this lock on every send and every receive, and at
 /// several hundred thousand packets a second the difference is measurable.
-fn finish_pass(state: &mut State, scratch: &mut Vec<Bytes>) -> Pass {
+fn finish_pass(state: &mut State, scratch: &mut TransmitBuf) -> Pass {
     std::mem::swap(&mut state.out, scratch);
     Pass { finished: state.error.is_some(), deadline: deadline(state) }
 }
 
 /// Take a pass without any other work to do, acquiring the lock for it.
-fn take_pass(inner: &ConnectionInner, scratch: &mut Vec<Bytes>) -> Pass {
+fn take_pass(inner: &ConnectionInner, scratch: &mut TransmitBuf) -> Pass {
     finish_pass(&mut lock(&inner.state), scratch)
 }
 
@@ -71,7 +71,7 @@ async fn write_out(
     io: &mut BatchIo,
     socket: &UdpSocket,
     peer: SocketAddr,
-    scratch: &mut Vec<Bytes>,
+    scratch: &mut TransmitBuf,
 ) -> bool {
     if scratch.is_empty() {
         return false;
@@ -113,7 +113,7 @@ pub(crate) async fn run_shared(
         on_exit();
         return;
     };
-    let mut scratch = Vec::new();
+    let mut scratch = TransmitBuf::new();
     let mut inbound: Vec<Bytes> = Vec::new();
     kick(&inner);
     let mut pass = take_pass(&inner, &mut scratch);
@@ -179,8 +179,8 @@ pub(crate) async fn run_owned(
         crate::conn::fail(&inner, DisconnectReason::PeerError);
         return;
     };
-    let (mut storage, mut metas) = batch::recv_buffers(&io);
-    let mut scratch = Vec::new();
+    let mut rx = batch::RecvBuffers::new(&io);
+    let mut scratch = TransmitBuf::new();
     let mut inbound: Vec<Bytes> = Vec::new();
     kick(&inner);
     let mut pass = take_pass(&inner, &mut scratch);
@@ -195,7 +195,7 @@ pub(crate) async fn run_owned(
         }
 
         tokio::select! {
-            result = io.recv_batch(&socket, &mut storage, &mut metas) => {
+            result = io.recv_batch(&socket, &mut rx.storage, &mut rx.metas) => {
                 let Ok(mut count) = result else { break };
                 // One call may return several datagrams via recvmmsg, and each
                 // buffer may hold several more coalesced by receive offload.
@@ -207,15 +207,15 @@ pub(crate) async fn run_owned(
                 // wakeups per packet, which costs more than the syscall does.
                 loop {
                     for i in 0..count {
-                        if metas[i].addr != peer {
+                        if rx.metas[i].addr != peer {
                             continue;
                         }
-                        inbound.extend(batch::split_run(&storage[i], &metas[i]));
+                        inbound.extend(rx.take_datagrams(i));
                     }
                     if inbound.len() >= RECV_DRAIN_CAP {
                         break;
                     }
-                    match io.try_recv_batch(&socket, &mut storage, &mut metas) {
+                    match io.try_recv_batch(&socket, &mut rx.storage, &mut rx.metas) {
                         Ok(n) if n > 0 => count = n,
                         _ => break,
                     }

@@ -413,7 +413,7 @@ fn spawn_shared(ep: &Arc<EndpointInner>, inner: &Arc<ConnectionInner>, peer: Soc
 /// and let each connection's own driver do the protocol work.
 async fn run_reader(ep: Arc<EndpointInner>) {
     let Ok(io) = BatchIo::new(&ep.socket) else { return };
-    let (mut storage, mut metas) = batch::recv_buffers(&io);
+    let mut rx = batch::RecvBuffers::new(&io);
     // Datagrams arrive from one peer at a time, so they are accumulated into a
     // run and handed over when the peer changes. That takes each connection's
     // lock once per run rather than once per datagram, without the per-packet
@@ -425,7 +425,7 @@ async fn run_reader(ep: Arc<EndpointInner>) {
 
     loop {
         let mut count = tokio::select! {
-            result = io.recv_batch(&ep.socket, &mut storage, &mut metas) => match result {
+            result = io.recv_batch(&ep.socket, &mut rx.storage, &mut rx.metas) => match result {
                 Ok(n) => n,
                 Err(_) => return,
             },
@@ -441,7 +441,7 @@ async fn run_reader(ep: Arc<EndpointInner>) {
         let mut drained = 0;
         loop {
             for i in 0..count {
-                let from = metas[i].addr;
+                let from = rx.metas[i].addr;
                 if run_peer != Some(from) {
                     if let Some(peer) = run_peer {
                         dispatch(peer, &route, &mut run, &mut unrouted);
@@ -453,13 +453,13 @@ async fn run_reader(ep: Arc<EndpointInner>) {
                 // offload; delivering it whole would hand the decoder a blob
                 // and lose all but the first packet.
                 let before = run.len();
-                run.extend(batch::split_run(&storage[i], &metas[i]));
+                run.extend(rx.take_datagrams(i));
                 drained += run.len() - before;
             }
             if drained >= RECV_DRAIN_CAP {
                 break;
             }
-            match io.try_recv_batch(&ep.socket, &mut storage, &mut metas) {
+            match io.try_recv_batch(&ep.socket, &mut rx.storage, &mut rx.metas) {
                 Ok(n) if n > 0 => count = n,
                 _ => break,
             }

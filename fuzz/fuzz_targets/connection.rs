@@ -8,12 +8,13 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use udt_proto::{CcKind, Connection, SeqNo};
+use udt_proto::{CcKind, Connection, SeqNo, TransmitBuf};
 
 fuzz_target!(|data: &[u8]| {
     // Split the input into datagram-sized chunks, length-prefixed by a byte so
     // the fuzzer can control framing as well as content.
     let mut conn = Connection::new_active(1, SeqNo::new(1000), 1500, 0, CcKind::Udt);
+    let mut tx = TransmitBuf::new();
     let mut events = Vec::new();
     let mut now = 0u64;
     let mut rest = data;
@@ -26,10 +27,10 @@ fuzz_target!(|data: &[u8]| {
         rest = tail;
 
         now += 1000;
-        conn.on_datagram(bytes::Bytes::copy_from_slice(datagram), now, &mut events);
+        conn.on_datagram(bytes::Bytes::copy_from_slice(datagram), now, &mut tx, &mut events);
+        conn.on_timer(now, &mut tx, &mut events);
         events.clear();
-        conn.on_timer(now, &mut events);
-        events.clear();
+        tx.clear();
         while conn.recv_msg().is_some() {}
     }
 });

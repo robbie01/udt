@@ -14,3 +14,4 @@ pub use crate::connection::{
 };
 pub use crate::listener::{Listener, ListenerEvent, PeerAddr};
 pub use crate::seq::{AckSeqNo, MSG_MAX, MsgNo, SEQ_MAX, SeqNo};
+pub use crate::transmit::{Runs, TransmitBuf};

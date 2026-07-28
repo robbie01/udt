@@ -10,7 +10,7 @@
 
 use std::collections::VecDeque;
 
-use udt_proto::{CcKind, Connection, Event, SendOutcome, SeqNo};
+use udt_proto::{CcKind, Connection, Event, SendOutcome, SeqNo, TransmitBuf};
 
 /// Deterministic generator. Values are only ever compared against
 /// probabilities, so a small linear congruential generator is plenty.
@@ -140,6 +140,10 @@ struct Sim {
     /// Messages each side has delivered to its application.
     a_got: Vec<bytes::Bytes>,
     b_got: Vec<bytes::Bytes>,
+    /// Outgoing datagrams, one buffer per side. Separate buffers are what let
+    /// each side be fed and drained independently.
+    a_tx: TransmitBuf,
+    b_tx: TransmitBuf,
     events: Vec<Event>,
 }
 
@@ -167,6 +171,8 @@ impl Sim {
             b_to_a: Link::new(to_a, seed ^ 0x5DEECE66D),
             a_got: Vec::new(),
             b_got: Vec::new(),
+            a_tx: TransmitBuf::new(),
+            b_tx: TransmitBuf::new(),
             events: Vec::new(),
         }
     }
@@ -190,21 +196,18 @@ impl Sim {
             return false;
         }
 
-        // Each side is fed and then drained before the other is touched: they
-        // share one event buffer, so interleaving them would post A's
-        // datagrams onto B's link.
         for datagram in self.a_to_b.take_arrived(self.now) {
-            self.b.on_datagram(datagram, self.now, &mut self.events);
+            self.b.on_datagram(datagram, self.now, &mut self.b_tx, &mut self.events);
         }
         self.drain(Side::B);
         for datagram in self.b_to_a.take_arrived(self.now) {
-            self.a.on_datagram(datagram, self.now, &mut self.events);
+            self.a.on_datagram(datagram, self.now, &mut self.a_tx, &mut self.events);
         }
         self.drain(Side::A);
 
-        self.a.on_timer(self.now, &mut self.events);
+        self.a.on_timer(self.now, &mut self.a_tx, &mut self.events);
         self.drain(Side::A);
-        self.b.on_timer(self.now, &mut self.events);
+        self.b.on_timer(self.now, &mut self.b_tx, &mut self.events);
         self.drain(Side::B);
         true
     }
@@ -212,15 +215,15 @@ impl Sim {
     /// Route one side's events: datagrams onto its outgoing link, messages
     /// into its delivered list.
     fn drain(&mut self, side: Side) {
-        let events = std::mem::take(&mut self.events);
-        for event in &events {
-            if let Event::SendDatagram(datagram) = event {
-                match side {
-                    Side::A => self.a_to_b.send(self.now, datagram.clone()),
-                    Side::B => self.b_to_a.send(self.now, datagram.clone()),
-                }
-            }
+        let (tx, link) = match side {
+            Side::A => (&mut self.a_tx, &mut self.a_to_b),
+            Side::B => (&mut self.b_tx, &mut self.b_to_a),
+        };
+        for datagram in tx.datagrams() {
+            link.send(self.now, bytes::Bytes::copy_from_slice(datagram));
         }
+        tx.clear();
+
         // Always try to read: DataReady is edge-triggered, and a message can
         // become deliverable without one when an earlier gap is filled.
         loop {
@@ -236,7 +239,6 @@ impl Sim {
                 None => break,
             }
         }
-        self.events = events;
         self.events.clear();
     }
 
@@ -273,7 +275,7 @@ impl Sim {
                     opts.ttl_ms,
                     opts.in_order,
                     self.now,
-                    &mut self.events,
+                    &mut self.a_tx,
                 ) {
                     SendOutcome::Queued => queued += 1,
                     SendOutcome::WouldBlock => {
@@ -460,7 +462,7 @@ fn a_lost_msg_drop_does_not_strand_the_receiver() {
     for _ in 0..MAX_STEPS {
         while queued < 100 {
             let payload = bytes::Bytes::from(message(queued, 8192));
-            match sim.a.send_msg(payload, Some(5), false, sim.now, &mut sim.events) {
+            match sim.a.send_msg(payload, Some(5), false, sim.now, &mut sim.a_tx) {
                 SendOutcome::Queued => queued += 1,
                 SendOutcome::WouldBlock => break,
                 SendOutcome::Rejected => panic!("send rejected"),
@@ -496,7 +498,7 @@ fn expired_messages_are_skipped_rather_than_stalling() {
     for _ in 0..MAX_STEPS {
         while queued < 100 {
             let payload = bytes::Bytes::from(message(queued, 8192));
-            match sim.a.send_msg(payload, opts.ttl_ms, opts.in_order, sim.now, &mut sim.events) {
+            match sim.a.send_msg(payload, opts.ttl_ms, opts.in_order, sim.now, &mut sim.a_tx) {
                 SendOutcome::Queued => queued += 1,
                 SendOutcome::WouldBlock => break,
                 SendOutcome::Rejected => panic!("rejected"),
@@ -532,7 +534,7 @@ fn both_directions_at_once_under_loss() {
     for _ in 0..MAX_STEPS {
         while a_queued < N {
             let m = bytes::Bytes::from(message(a_queued, 4096));
-            match sim.a.send_msg(m, None, true, sim.now, &mut sim.events) {
+            match sim.a.send_msg(m, None, true, sim.now, &mut sim.a_tx) {
                 SendOutcome::Queued => a_queued += 1,
                 _ => break,
             }
@@ -540,7 +542,7 @@ fn both_directions_at_once_under_loss() {
         sim.drain(Side::A);
         while b_queued < N {
             let m = bytes::Bytes::from(message(b_queued, 4096));
-            match sim.b.send_msg(m, None, true, sim.now, &mut sim.events) {
+            match sim.b.send_msg(m, None, true, sim.now, &mut sim.b_tx) {
                 SendOutcome::Queued => b_queued += 1,
                 _ => break,
             }
@@ -601,7 +603,7 @@ fn a_hostile_handshake_cannot_ask_for_an_enormous_allocation() {
 
     let mut conn = Connection::new_active(1, SeqNo::new(1000), 1500, 0, CcKind::Udt);
     let mut events = Vec::new();
-    conn.on_datagram(bytes::Bytes::from(hs), 1000, &mut events);
+    conn.on_datagram(bytes::Bytes::from(hs), 1000, &mut TransmitBuf::new(), &mut events);
 
     // Reaching here at all is the point: the allocation is clamped rather than
     // attempted. Whether the handshake is accepted is beside it.
@@ -623,6 +625,7 @@ fn a_repeated_handshake_reply_does_not_accept_twice() {
     let mut listener = Listener::new(1, 1500, 0, 0x1234_5678, CcKind::Udt);
     let peer = PeerAddr::from_v4([127, 0, 0, 1], 5000);
     let mut client = Connection::new_active(9, SeqNo::new(4242), 1500, 0, CcKind::Udt);
+    let mut client_tx = TransmitBuf::new();
     let mut client_events = Vec::new();
     let mut listener_events = Vec::new();
     let mut now = 1_000_000u64;
@@ -632,14 +635,10 @@ fn a_repeated_handshake_reply_does_not_accept_twice() {
     // the listener sees each stage of the handshake more than once.
     for _ in 0..40 {
         now += 10_000;
-        client.on_timer(now, &mut client_events);
-        let to_listener: Vec<_> = client_events
-            .drain(..)
-            .filter_map(|e| match e {
-                Event::SendDatagram(d) => Some(d),
-                _ => None,
-            })
-            .collect();
+        client.on_timer(now, &mut client_tx, &mut client_events);
+        let to_listener: Vec<bytes::Bytes> =
+            client_tx.datagrams().map(bytes::Bytes::copy_from_slice).collect();
+        client_tx.clear();
 
         for datagram in to_listener {
             for _ in 0..2 {
@@ -647,7 +646,7 @@ fn a_repeated_handshake_reply_does_not_accept_twice() {
                 for event in listener_events.drain(..) {
                     match event {
                         ListenerEvent::SendTo { data, .. } => {
-                            client.on_datagram(data, now, &mut client_events);
+                            client.on_datagram(data, now, &mut client_tx, &mut client_events);
                         }
                         ListenerEvent::Accept(..) => accepts += 1,
                     }
@@ -672,9 +671,7 @@ fn a_path_that_cannot_carry_full_size_packets_is_reported() {
     sim.connect();
 
     let payload = bytes::Bytes::from(message(0, 8192));
-    let mut events = Vec::new();
-    assert_eq!(sim.a.send_msg(payload, None, true, sim.now, &mut events), SendOutcome::Queued);
-    sim.events.append(&mut events);
+    assert_eq!(sim.a.send_msg(payload, None, true, sim.now, &mut sim.a_tx), SendOutcome::Queued);
     sim.drain(Side::A);
 
     for _ in 0..MAX_STEPS {

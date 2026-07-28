@@ -19,23 +19,31 @@
 //! * [`send_msg`] to queue application data,
 //! * [`recv_msg`] to take delivered messages out.
 //!
-//! The first two append [`Event`]s to a caller-owned `Vec`, reused across
-//! calls to keep the hot path allocation-free. Handle
-//! [`Event::SendDatagram`] by writing the bytes to the peer, and
-//! [`Event::DataReady`] by draining `recv_msg`.
+//! Outgoing bytes and events travel separately. Datagrams are written into a
+//! [`TransmitBuf`] you own and reuse, so the hot path allocates nothing; the
+//! same calls append [`Event`]s to a `Vec` for the things that are not bytes,
+//! such as [`Event::DataReady`], which means [`recv_msg`] has something.
 //!
 //! ```
-//! use udt_proto::{CcKind, Connection, Event, SeqNo};
+//! use udt_proto::{CcKind, Connection, Event, SeqNo, TransmitBuf};
 //!
 //! # fn now_us() -> u64 { 0 }
-//! # fn write_to_peer(_: &[u8]) {}
+//! # fn write_to_peer(_: &[u8], _segment_size: usize) {}
 //! let mut conn = Connection::new_active(1, SeqNo::new(0), 1500, now_us(), CcKind::Udt);
-//!
+//! let mut transmit = TransmitBuf::new();
 //! let mut events = Vec::new();
-//! conn.on_timer(now_us(), &mut events);
+//!
+//! conn.on_timer(now_us(), &mut transmit, &mut events);
+//!
+//! // Equal-sized datagrams come back grouped, ready for a segmented write.
+//! for (bytes, segment_size) in transmit.runs() {
+//!     write_to_peer(bytes, segment_size);
+//! }
+//! transmit.clear();
+//!
 //! for event in events.drain(..) {
-//!     if let Event::SendDatagram(datagram) = event {
-//!         write_to_peer(&datagram);
+//!     if matches!(event, Event::DataReady) {
+//!         while let Some(_message) = conn.recv_msg() {}
 //!     }
 //! }
 //! ```
@@ -94,6 +102,7 @@ mod recv_buffer;
 mod send_buffer;
 mod seq;
 mod time_window;
+mod transmit;
 
 pub use congestion::{CcKind, CongestionControl};
 pub use connection::{
@@ -101,3 +110,4 @@ pub use connection::{
 };
 pub use listener::{Listener, ListenerEvent, PeerAddr};
 pub use seq::{AckSeqNo, MSG_MAX, MsgNo, SEQ_MAX, SeqNo};
+pub use transmit::{Runs, TransmitBuf};

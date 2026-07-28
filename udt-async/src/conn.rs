@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::Notify;
-use udt_proto::{Connection, DisconnectReason, Event, SendOutcome};
+use udt_proto::{Connection, DisconnectReason, Event, SendOutcome, TransmitBuf};
 
 use crate::util::{Mutex, disconnect_err, lock, now_us};
 
@@ -67,7 +67,11 @@ impl Shared {
 pub(crate) struct State {
     pub(crate) conn: Connection,
     /// Datagrams the state machine has produced and nobody has written yet.
-    pub(crate) out: Vec<Bytes>,
+    ///
+    /// The protocol writes straight into this and the driver hands it to the
+    /// kernel, so a packet is built once, in memory that is reused for the
+    /// life of the connection.
+    pub(crate) out: TransmitBuf,
     /// Scratch for [`Event`]s. Owned by the state so it keeps its capacity
     /// across calls instead of being reallocated per datagram.
     events: Vec<Event>,
@@ -86,7 +90,7 @@ impl ConnectionInner {
         Arc::new(ConnectionInner {
             state: Mutex::new(State {
                 conn,
-                out: Vec::new(),
+                out: TransmitBuf::new(),
                 events: Vec::new(),
                 error: None,
                 connected: false,
@@ -111,7 +115,6 @@ impl State {
         let mut readable = false;
         for event in events.drain(..) {
             match event {
-                Event::SendDatagram(datagram) => self.out.push(datagram),
                 Event::DataReady => readable = true,
                 Event::Connected => {
                     self.connected = true;
@@ -145,12 +148,12 @@ impl State {
     /// at a time, that throttled a 1 GB/s connection to 6 MB/s.
     pub(crate) fn feed<I: IntoIterator<Item = Bytes>>(&mut self, datagrams: I) {
         for datagram in datagrams {
-            self.conn.on_datagram(datagram, now_us(), &mut self.events);
+            self.conn.on_datagram(datagram, now_us(), &mut self.out, &mut self.events);
         }
     }
 
     pub(crate) fn on_timer(&mut self, now: u64) {
-        self.conn.on_timer(now, &mut self.events);
+        self.conn.on_timer(now, &mut self.out, &mut self.events);
     }
 
     /// The error to report to an application call, if the connection is over.
@@ -286,7 +289,7 @@ impl Socket {
                 opts.ttl.map(|d| d.as_millis() as u32),
                 !opts.unordered,
                 now_us(),
-                &mut state.events,
+                &mut state.out,
             );
             state.absorb(&self.inner.shared);
             outcome
@@ -428,7 +431,7 @@ impl Drop for Socket {
             let state = &mut *guard;
             // Half-close rather than shutdown: a common pattern is to send and
             // immediately drop, and the data still has to reach the peer.
-            state.conn.half_close(now_us(), &mut state.events);
+            state.conn.half_close(now_us(), &mut state.out, &mut state.events);
             state.absorb(&self.inner.shared);
         }
         self.inner.shared.driver.notify_one();
