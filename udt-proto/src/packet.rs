@@ -1,3 +1,10 @@
+//! Decoded UDT packet structures.
+//!
+//! These mirror the wire format one-to-one. A few fields are decoded but not
+//! consumed by the current state machine — they are kept so the decoder stays
+//! a faithful, testable model of the format rather than only of what we
+//! happen to act on.
+
 use bytes::Bytes;
 use crate::seq::{SeqNo, MsgNo, AckSeqNo};
 use crate::handshake::Handshake;
@@ -90,6 +97,7 @@ pub struct DataHeader {
     pub boundary: MsgBoundary,
     pub in_order: bool,
     pub msg_no: MsgNo,
+    #[allow(dead_code)]
     pub timestamp_us: u32,
     pub dst_socket_id: u32,
 }
@@ -149,6 +157,14 @@ pub enum ControlBody {
     Shutdown,
     Ack2(AckSeqNo),              // ACK sub-seq no being acknowledged
     MsgDrop { msg_no: MsgNo, first: SeqNo, last: SeqNo },
-    ErrorSignal { error_code: i32 },
-    UserDefined { ext_type: u16, payload: Bytes },
+    ErrorSignal {
+        #[allow(dead_code)]
+        error_code: i32,
+    },
+    UserDefined {
+        #[allow(dead_code)]
+        ext_type: u16,
+        #[allow(dead_code)]
+        payload: Bytes,
+    },
 }

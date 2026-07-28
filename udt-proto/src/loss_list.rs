@@ -172,6 +172,7 @@ impl RcvLossList {
         }
     }
 
+    #[cfg(test)]
     pub fn contains(&self, seq: SeqNo) -> bool {
         self.ranges.iter().any(|&(s, e)| seq >= s && seq <= e)
     }
@@ -206,9 +207,6 @@ impl RcvLossList {
         out
     }
 
-    pub fn ranges(&self) -> &[(SeqNo, SeqNo)] {
-        &self.ranges
-    }
 }
 
 impl SndLossList {

@@ -106,10 +106,6 @@ impl PktTimeWindow {
         1_000_000 / median
     }
 
-    /// Minimum observed inter-packet sending interval (µs).
-    pub fn min_pkt_snd_int(&self) -> u32 {
-        if self.min_pkt_snd_int == u32::MAX { 1 } else { self.min_pkt_snd_int }
-    }
 }
 
 impl Default for PktTimeWindow {

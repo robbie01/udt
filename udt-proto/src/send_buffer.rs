@@ -199,15 +199,7 @@ impl SendBuffer {
         self.sent -= count;
     }
 
-    /// Number of blocks currently buffered (including sent-not-acked and unsent).
-    pub fn buffered(&self) -> usize {
-        self.len
-    }
 
-    /// Number of additional blocks the buffer can accept right now.
-    pub fn avail(&self) -> usize {
-        self.capacity - self.len
-    }
 
     /// Largest message, in bytes, that could ever fit in an empty buffer.
     /// A message above this size can never be queued and must be rejected

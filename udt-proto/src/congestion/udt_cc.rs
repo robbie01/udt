@@ -1,8 +1,16 @@
-use crate::seq::SeqNo;
-use super::{CcContext, CcOutput, CongestionControl};
+//! UDT's native congestion control.
+//!
+//! Rate-based rather than window-based: the controller estimates the path's
+//! capacity from packet-pair timing and paces sends to match, rather than
+//! filling a window until something drops. This is what makes UDT hold high
+//! throughput on long fat links where TCP's window growth is the limit.
 
-/// UDT's built-in AIMD congestion control (CUDTCC).
-/// Ported directly from ccc.cpp.
+use super::{CcContext, CcOutput, CongestionControl};
+use crate::seq::SeqNo;
+
+/// UDT's rate-based DAIMD controller. Build one through [`CcKind::Udt`].
+///
+/// [`CcKind::Udt`]: crate::CcKind::Udt
 pub struct UdtCc {
     rc_interval_us: u64,    // = SYN_INTERVAL (10_000 µs)
     last_rc_time_us: u64,
@@ -21,6 +29,7 @@ pub struct UdtCc {
 }
 
 impl UdtCc {
+    /// Creates a controller in slow start.
     pub fn new() -> Self {
         UdtCc {
             rc_interval_us: 0,

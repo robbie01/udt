@@ -1,3 +1,5 @@
+//! The handshake state machine for accepting incoming connections.
+
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use crate::codec;
@@ -6,11 +8,16 @@ use crate::handshake::{req_type, Handshake, SOCK_DGRAM, UDT_VERSION};
 use crate::connection::Connection;
 use crate::seq::SeqNo;
 
-/// An opaque peer address key (up to 20 bytes: 16 for IP + 4 for port).
+/// A peer's address, in whatever form the IO layer uses.
+///
+/// [`Listener`] only ever compares these for equality and hands them back, so
+/// the encoding is opaque: build one with [`from_v4`](Self::from_v4) or
+/// [`from_v6`](Self::from_v6) and use it as a routing key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PeerAddr(pub [u8; 20]);
 
 impl PeerAddr {
+    /// Builds a key from an IPv4 address and port.
     pub fn from_v4(ip: [u8; 4], port: u16) -> Self {
         let mut a = [0u8; 20];
         a[0..4].copy_from_slice(&ip);
@@ -18,6 +25,7 @@ impl PeerAddr {
         PeerAddr(a)
     }
 
+    /// Builds a key from an IPv6 address and port.
     pub fn from_v6(ip: [u8; 16], port: u16) -> Self {
         let mut a = [0u8; 20];
         a[0..16].copy_from_slice(&ip);
@@ -26,10 +34,17 @@ impl PeerAddr {
     }
 }
 
-pub enum ListenerOutput {
-    /// Send this datagram back to the peer that sent a datagram to us.
-    SendTo { addr: PeerAddr, data: Bytes },
-    /// A new incoming connection is fully established.
+/// Something the caller must act on, produced by [`Listener::on_datagram`].
+pub enum ListenerEvent {
+    /// Write `data` to `addr` as a single UDP datagram.
+    SendTo {
+        /// Where to send it.
+        addr: PeerAddr,
+        /// The datagram.
+        data: Bytes,
+    },
+    /// A peer completed the handshake. Route its future datagrams to this
+    /// [`Connection`] and hand it to the application.
     Accept(Box<Connection>, PeerAddr),
 }
 
@@ -38,7 +53,12 @@ struct PendingConn {
     their_hs: Handshake, // their initial req_type=1 handshake
 }
 
-pub struct ListenerState {
+/// Answers handshakes on one address, producing a [`Connection`] per peer.
+///
+/// The listener owns no socket of its own: feed it every datagram that arrives
+/// on the listening address and is not already routed to an established
+/// connection, then act on the [`ListenerEvent`]s it returns.
+pub struct Listener {
     socket_id: u32,
     mss: u32,
     /// Controller built fresh for each accepted connection.
@@ -53,9 +73,16 @@ pub struct ListenerState {
     enc: BytesMut,
 }
 
-impl ListenerState {
+impl Listener {
+    /// Creates a listener.
+    ///
+    /// `socket_id` identifies the listening endpoint. `mss` is the path MTU
+    /// offered to peers, `cc` the congestion controller each accepted
+    /// connection gets, and `secret` seeds the handshake cookies that make
+    /// spoofed connection attempts cheap to reject — pass a random value and
+    /// do not reuse it across listeners.
     pub fn new(socket_id: u32, mss: u32, _now_us: u64, secret: u64, cc: CcKind) -> Self {
-        ListenerState {
+        Listener {
             socket_id,
             mss,
             cc,
@@ -67,13 +94,16 @@ impl ListenerState {
         }
     }
 
-    /// Process an incoming datagram from `addr`. Emits responses and/or accepts.
+    /// Feeds one datagram received from `addr`.
+    ///
+    /// Resulting work is appended to `out`; see [`ListenerEvent`]. Anything
+    /// that is not a valid handshake is ignored.
     pub fn on_datagram(
         &mut self,
         addr: PeerAddr,
         datagram: Bytes,
         now_us: u64,
-        out: &mut Vec<ListenerOutput>,
+        out: &mut Vec<ListenerEvent>,
     ) {
         // Must be a handshake control packet
         let pkt = match codec::decode(datagram) {
@@ -110,7 +140,7 @@ impl ListenerState {
             self.pending.insert(addr.clone(), PendingConn { cookie, their_hs: hs.clone() });
             self.enc.clear();
             codec::encode_handshake(&resp, ts, hs.socket_id as u32, &mut self.enc);
-            out.push(ListenerOutput::SendTo { addr, data: self.enc.clone().freeze() });
+            out.push(ListenerEvent::SendTo { addr, data: self.enc.clone().freeze() });
         } else if hs.req_type == req_type::RESPONSE {
             // Step 2: Cookie verification + accept
             let pending_info = self.pending.get(&addr).map(|p| (p.cookie, p.their_hs.clone()));
@@ -156,13 +186,13 @@ impl ListenerState {
 
                 self.enc.clear();
                 codec::encode_handshake(&our_resp, ts, hs.socket_id as u32, &mut self.enc);
-                out.push(ListenerOutput::SendTo { addr: addr.clone(), data: self.enc.clone().freeze() });
-                out.push(ListenerOutput::Accept(Box::new(conn), addr));
+                out.push(ListenerEvent::SendTo { addr: addr.clone(), data: self.enc.clone().freeze() });
+                out.push(ListenerEvent::Accept(Box::new(conn), addr));
             } else if let Some(saved_resp) = self.accepted.get(&addr).cloned() {
                 // Duplicate req_type=-1: peer missed our response — resend it
                 self.enc.clear();
                 codec::encode_handshake(&saved_resp, ts, hs.socket_id as u32, &mut self.enc);
-                out.push(ListenerOutput::SendTo { addr, data: self.enc.clone().freeze() });
+                out.push(ListenerEvent::SendTo { addr, data: self.enc.clone().freeze() });
             }
         }
     }

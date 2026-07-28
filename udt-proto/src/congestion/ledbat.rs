@@ -89,6 +89,9 @@ enum Phase {
     Recovery,
 }
 
+/// A LEDBAT++ controller. Build one through [`CcKind::LedbatPlusPlus`].
+///
+/// [`CcKind::LedbatPlusPlus`]: crate::CcKind::LedbatPlusPlus
 pub struct Ledbat {
     phase: Phase,
     cwnd: f64,
@@ -116,6 +119,7 @@ impl Default for Ledbat {
 }
 
 impl Ledbat {
+    /// Creates a controller in slow start, with no delay measurements yet.
     pub fn new() -> Self {
         Ledbat {
             phase: Phase::SlowStart,

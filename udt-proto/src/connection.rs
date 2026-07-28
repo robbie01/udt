@@ -1,3 +1,5 @@
+//! The per-connection UDT state machine.
+
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 
@@ -65,8 +67,14 @@ fn hs_interval_us(attempts: u32) -> u64 {
     HS_BACKOFF_US.get(attempts as usize).copied().unwrap_or(HS_RESEND_US)
 }
 
+/// How a connection was opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnMode { Active, Rendezvous }
+pub enum ConnMode {
+    /// One side dialled a listener.
+    Active,
+    /// Both sides dialled each other simultaneously.
+    Rendezvous,
+}
 
 #[derive(Debug, Clone)]
 enum ConnState {
@@ -85,15 +93,34 @@ enum ConnState {
     Closed,
 }
 
-pub enum Output {
+/// Something the caller must act on, produced by [`Connection::on_datagram`]
+/// and [`Connection::on_timer`].
+pub enum Event {
+    /// Write these bytes to the peer as a single UDP datagram.
+    ///
+    /// Dropping one costs a retransmission but is not fatal; UDT assumes the
+    /// network may lose packets anyway.
     SendDatagram(Bytes),
+    /// At least one message can now be taken with [`Connection::recv_msg`].
     DataReady,
+    /// The handshake finished. Data can be sent from here on.
     Connected,
+    /// The connection is over and will emit nothing further.
     Disconnected(DisconnectReason),
 }
 
+/// Why a connection ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DisconnectReason { Shutdown, Timeout, PeerError, LocalClose }
+pub enum DisconnectReason {
+    /// The peer closed cleanly.
+    Shutdown,
+    /// The peer stopped responding.
+    Timeout,
+    /// The peer sent something unusable, or rejected the handshake.
+    PeerError,
+    /// This side called [`Connection::shutdown`].
+    LocalClose,
+}
 
 /// Result of offering a message to [`Connection::send_msg`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,27 +134,50 @@ pub enum SendOutcome {
     Rejected,
 }
 
-/// Snapshot of connection flow/congestion state for diagnostics.
+/// A point-in-time view of a connection's flow and congestion state.
+///
+/// Intended for logging, metrics and debugging. The exact set of fields is
+/// not stable.
 #[derive(Debug, Clone, Copy)]
-pub struct ConnDebug {
+pub struct ConnectionStats {
+    /// This side's socket identifier.
     pub socket_id: u32,
+    /// Whether the handshake has completed.
     pub connected: bool,
+    /// Highest sequence number the peer has acknowledged.
     pub snd_last_ack: u32,
+    /// Highest sequence number sent.
     pub snd_curr_seq: u32,
+    /// Packets sent and not yet acknowledged.
     pub snd_in_flight: usize,
+    /// Packets queued but not yet sent.
     pub snd_pending: usize,
+    /// Packets known lost and awaiting retransmission.
     pub snd_loss_len: usize,
+    /// Highest sequence number acknowledged to the peer.
     pub rcv_last_ack: u32,
+    /// Highest acknowledgement the peer has confirmed receiving.
     pub rcv_last_ack_ack: u32,
+    /// Highest sequence number received.
     pub rcv_curr_seq: u32,
+    /// Packets detected missing and awaiting retransmission from the peer.
     pub rcv_loss_len: usize,
+    /// Complete messages waiting to be read.
     pub ready_msgs: usize,
+    /// Congestion window, in packets.
     pub cwnd: f64,
+    /// Flow-control window advertised by the peer, in packets.
     pub flow_wnd: u32,
+    /// Rate at which the peer reports receiving data, in packets per second.
     pub delivery_rate_pps: u32,
+    /// Estimated path capacity, in packets per second.
     pub bandwidth_pps: u32,
+    /// Current pacing interval between sends, in microseconds.
     pub snd_period_us: f64,
+    /// Smoothed round-trip time, in microseconds.
     pub rtt_us: i32,
+    /// Consecutive expiry-timer firings without a response from the peer;
+    /// the connection gives up at 16.
     pub exp_count: u32,
 }
 
@@ -219,6 +269,14 @@ pub struct Connection {
 const PKT_ARENA_SIZE: usize = 96 * 1024;
 
 impl Connection {
+    /// Starts a connection to a peer that is listening.
+    ///
+    /// `socket_id` identifies this side and must be unique among the
+    /// connections sharing a local address. `local_isn` is the initial
+    /// sequence number, which should be random. `mss` is the path MTU in
+    /// bytes; both sides negotiate down to the smaller value.
+    ///
+    /// Nothing is sent until the first [`on_timer`](Self::on_timer) call.
     pub fn new_active(socket_id: u32, local_isn: SeqNo, mss: u32, now_us: u64, cc: CcKind) -> Self {
         let req = Handshake {
             version: UDT_VERSION,
@@ -245,6 +303,10 @@ impl Connection {
         c
     }
 
+    /// Starts a connection to a peer that is calling this at the same time.
+    ///
+    /// Arguments are as [`new_active`](Self::new_active). Because neither side
+    /// is listening, both must dial roughly simultaneously.
     pub fn new_rendezvous(socket_id: u32, local_isn: SeqNo, mss: u32, now_us: u64, cc: CcKind) -> Self {
         let req = Handshake {
             version: UDT_VERSION,
@@ -380,7 +442,12 @@ impl Connection {
 
     // ── Entry points ──────────────────────────────────────────────────────
 
-    pub fn on_datagram(&mut self, datagram: Bytes, now_us: u64, out: &mut Vec<Output>) {
+    /// Feeds one UDP payload received from the peer.
+    ///
+    /// Resulting work is appended to `out`; see [`Event`]. Reuse the same
+    /// `Vec` across calls to avoid allocating. Datagrams that are malformed or
+    /// addressed elsewhere are ignored.
+    pub fn on_datagram(&mut self, datagram: Bytes, now_us: u64, out: &mut Vec<Event>) {
         let pkt = match codec::decode(datagram) { Some(p) => p, None => return };
         // Check destination socket ID
         let ok = match &pkt {
@@ -394,7 +461,12 @@ impl Connection {
         }
     }
 
-    pub fn on_timer(&mut self, now_us: u64, out: &mut Vec<Output>) {
+    /// Advances time, appending any resulting work to `out`.
+    ///
+    /// Call this once at [`next_deadline_us`](Self::next_deadline_us), and
+    /// again after every change to the connection, since sending or receiving
+    /// can move that deadline. Calling it early is harmless.
+    pub fn on_timer(&mut self, now_us: u64, out: &mut Vec<Event>) {
         match &self.state {
             ConnState::Closed => return,
             ConnState::Connecting { deadline_us, last_req_us, conn_req, attempts, .. } => {
@@ -404,7 +476,7 @@ impl Connection {
                 let req = conn_req.clone();
                 if now_us > deadline {
                     self.state = ConnState::Closed;
-                    out.push(Output::Disconnected(DisconnectReason::Timeout));
+                    out.push(Event::Disconnected(DisconnectReason::Timeout));
                     return;
                 }
                 if now_us >= last + gap {
@@ -414,7 +486,7 @@ impl Connection {
                     }
                     self.enc.clear();
                     codec::encode_handshake(&req, self.ts(now_us), 0, &mut self.enc);
-                    out.push(Output::SendDatagram(self.enc.clone().freeze()));
+                    out.push(Event::SendDatagram(self.enc.clone().freeze()));
                 }
                 return;
             }
@@ -479,7 +551,7 @@ impl Connection {
                 && now_us.saturating_sub(self.last_rsp_us) > EXP_HARD_TIMEOUT_US
             {
                 self.state = ConnState::Closed;
-                out.push(Output::Disconnected(DisconnectReason::Timeout));
+                out.push(Event::Disconnected(DisconnectReason::Timeout));
                 return;
             }
 
@@ -502,7 +574,7 @@ impl Connection {
                 // Receiver side: keep-alive so the peer's EXP does not fire.
                 self.enc.clear();
                 codec::encode_keepalive(self.ts(now_us), self.peer_id, &mut self.enc);
-                out.push(Output::SendDatagram(self.enc.clone().freeze()));
+                out.push(Event::SendDatagram(self.enc.clone().freeze()));
             }
 
             self.exp_count += 1;
@@ -513,11 +585,15 @@ impl Connection {
         }
     }
 
-    /// Queue a message for transmission.
+    /// Queues a message for transmission.
     ///
-    /// A message is queued all-or-nothing; on [`SendOutcome::WouldBlock`] the
-    /// caller must retry the *same* payload once buffer space frees up.
-    /// Dropping a non-`Queued` message silently loses application data.
+    /// Messages are all-or-nothing: the return value says whether this one was
+    /// taken. On [`SendOutcome::WouldBlock`], retry the *same* payload once
+    /// buffer space frees up — dropping it loses application data silently.
+    ///
+    /// `ttl_ms` gives up on the message after that many milliseconds and tells
+    /// the peer to skip it. `in_order` set to `false` lets the peer deliver
+    /// this message ahead of earlier ones that are still in flight.
     #[must_use = "a message that was not Queued must be retried or reported"]
     pub fn send_msg(
         &mut self,
@@ -525,7 +601,7 @@ impl Connection {
         ttl_ms: Option<u32>,
         in_order: bool,
         now_us: u64,
-        out: &mut Vec<Output>,
+        out: &mut Vec<Event>,
     ) -> SendOutcome {
         if !matches!(self.state, ConnState::Connected) {
             return SendOutcome::Rejected;
@@ -551,12 +627,18 @@ impl Connection {
         SendOutcome::Queued
     }
 
-    /// Largest message this connection can ever accept, in bytes.
+    /// The largest message this connection will ever accept, in bytes.
+    ///
+    /// Anything longer is [`SendOutcome::Rejected`] no matter how long you
+    /// wait. Bounded by the send buffer, not the MTU: messages are split
+    /// across packets automatically.
     pub fn max_msg_bytes(&self) -> usize {
         self.snd_buf.as_ref().map_or(0, |b| b.max_msg_bytes())
     }
 
-    /// Extract the next ready message. Returns None if none available.
+    /// Takes the next complete message, if one is ready.
+    ///
+    /// Call this in a loop after [`Event::DataReady`] until it returns `None`.
     pub fn recv_msg(&mut self) -> Option<Bytes> {
         if let Some(msg) = self.ready_msgs.pop_front() {
             return Some(msg);
@@ -564,6 +646,10 @@ impl Connection {
         self.rcv_buf.as_mut()?.read_msg()
     }
 
+    /// When [`on_timer`](Self::on_timer) next needs to be called.
+    ///
+    /// `None` once the connection is closed. Re-read this after every call
+    /// into the connection, as most of them move it.
     pub fn next_deadline_us(&self) -> Option<u64> {
         match &self.state {
             ConnState::Closed => None,
@@ -578,21 +664,24 @@ impl Connection {
         }
     }
 
-    pub fn shutdown(&mut self, now_us: u64, out: &mut Vec<Output>) {
+    /// Closes immediately, telling the peer and discarding anything unsent.
+    ///
+    /// Use [`half_close`](Self::half_close) to let queued data drain first.
+    pub fn shutdown(&mut self, now_us: u64, out: &mut Vec<Event>) {
         if !matches!(self.state, ConnState::Connected) { return; }
         self.enc.clear();
         codec::encode_shutdown(self.ts(now_us), self.peer_id, &mut self.enc);
-        out.push(Output::SendDatagram(self.enc.clone().freeze()));
+        out.push(Event::SendDatagram(self.enc.clone().freeze()));
         self.state = ConnState::Closed;
-        out.push(Output::Disconnected(DisconnectReason::LocalClose));
+        out.push(Event::Disconnected(DisconnectReason::LocalClose));
     }
 
-    /// Graceful half-close: the application has finished sending.
+    /// Closes once everything already queued has been acknowledged.
     ///
-    /// If the send buffer is already empty, shuts down immediately.
-    /// Otherwise sets a flag so `on_timer` will send the Shutdown once
-    /// all queued data has been acknowledged by the peer.
-    pub fn half_close(&mut self, now_us: u64, out: &mut Vec<Output>) {
+    /// Returns without closing if data is still outstanding; the shutdown then
+    /// happens inside a later [`on_timer`](Self::on_timer). Incoming messages
+    /// keep arriving until then.
+    pub fn half_close(&mut self, now_us: u64, out: &mut Vec<Event>) {
         if !matches!(self.state, ConnState::Connected) { return; }
         if self.snd_buf.as_ref().map(|b| b.is_empty()).unwrap_or(true) {
             self.shutdown(now_us, out);
@@ -601,15 +690,14 @@ impl Connection {
         }
     }
 
-    /// Returns true when all sent data has been acknowledged by the peer
-    /// (or when no send buffer has been allocated yet).
+    /// Whether every queued message has been acknowledged by the peer.
     pub fn snd_buf_is_empty(&self) -> bool {
         self.snd_buf.as_ref().map(|b| b.is_empty()).unwrap_or(true)
     }
 
-    /// Snapshot of the flow/congestion state, for diagnostics and tests.
-    pub fn debug_state(&self) -> ConnDebug {
-        ConnDebug {
+    /// A snapshot of flow and congestion state. See [`ConnectionStats`].
+    pub fn stats(&self) -> ConnectionStats {
+        ConnectionStats {
             socket_id: self.socket_id,
             connected: matches!(self.state, ConnState::Connected),
             snd_last_ack: self.snd_last_ack.raw(),
@@ -632,8 +720,15 @@ impl Connection {
         }
     }
 
-    pub fn socket_id(&self) -> u32 { self.socket_id }
-    pub fn is_connected(&self) -> bool { matches!(self.state, ConnState::Connected) }
+    /// This side's socket identifier, as given to the constructor.
+    pub fn socket_id(&self) -> u32 {
+        self.socket_id
+    }
+
+    /// Whether the handshake has completed and data may be sent.
+    pub fn is_connected(&self) -> bool {
+        matches!(self.state, ConnState::Connected)
+    }
 
     // ── Receive path ──────────────────────────────────────────────────────
 
@@ -642,7 +737,7 @@ impl Connection {
         header: crate::packet::DataHeader,
         payload: Bytes,
         now_us: u64,
-        out: &mut Vec<Output>,
+        out: &mut Vec<Event>,
     ) {
         // Rendezvous: data means the peer completed — try to complete too.
         self.try_rendezvous_complete(now_us, out);
@@ -691,7 +786,7 @@ impl Connection {
                 // interval at high rates, after which every arrival is rejected
                 // as out-of-window until the ACK finally lands.
                 buf.reclaim();
-                out.push(Output::DataReady);
+                out.push(Event::DataReady);
             }
         }
 
@@ -726,7 +821,7 @@ impl Connection {
         }
     }
 
-    fn recv_ctrl(&mut self, body: ControlBody, now_us: u64, out: &mut Vec<Output>) {
+    fn recv_ctrl(&mut self, body: ControlBody, now_us: u64, out: &mut Vec<Event>) {
         match body {
             ControlBody::Handshake(hs) => self.recv_handshake(hs, now_us, out),
             ControlBody::KeepAlive => {
@@ -742,7 +837,7 @@ impl Connection {
             ControlBody::Ack2(asn) => self.recv_ack2(asn, now_us),
             ControlBody::Shutdown => {
                 self.state = ConnState::Closed;
-                out.push(Output::Disconnected(DisconnectReason::Shutdown));
+                out.push(Event::Disconnected(DisconnectReason::Shutdown));
             }
             ControlBody::MsgDrop { msg_no, first, last } => {
                 if let Some(buf) = self.rcv_buf.as_mut() {
@@ -766,7 +861,7 @@ impl Connection {
             }
             ControlBody::ErrorSignal { .. } => {
                 self.state = ConnState::Closed;
-                out.push(Output::Disconnected(DisconnectReason::PeerError));
+                out.push(Event::Disconnected(DisconnectReason::PeerError));
             }
             ControlBody::CongestionWarning => {
                 let ctx = self.cc_ctx(now_us);
@@ -777,7 +872,7 @@ impl Connection {
         }
     }
 
-    fn recv_handshake(&mut self, hs: Handshake, now_us: u64, out: &mut Vec<Output>) {
+    fn recv_handshake(&mut self, hs: Handshake, now_us: u64, out: &mut Vec<Event>) {
         match &self.state.clone() {
             ConnState::Connecting { mode: ConnMode::Active, conn_req, .. } => {
                 let local_req = conn_req.clone();
@@ -795,13 +890,13 @@ impl Connection {
                     }
                     self.enc.clear();
                     codec::encode_handshake(&new_req, self.ts(now_us), 0, &mut self.enc);
-                    out.push(Output::SendDatagram(self.enc.clone().freeze()));
+                    out.push(Event::SendDatagram(self.enc.clone().freeze()));
                 } else if hs.req_type == req_type::RESPONSE {
                     // Server confirmation — connection complete
                     self.do_post_connect(hs, now_us, out);
                 } else if hs.req_type == req_type::REJECTED {
                     self.state = ConnState::Closed;
-                    out.push(Output::Disconnected(DisconnectReason::PeerError));
+                    out.push(Event::Disconnected(DisconnectReason::PeerError));
                 }
             }
             ConnState::Connecting { mode: ConnMode::Rendezvous, conn_req, .. } => {
@@ -843,7 +938,7 @@ impl Connection {
                     }
                     self.enc.clear();
                     codec::encode_handshake(&new_req, self.ts(now_us), 0, &mut self.enc);
-                    out.push(Output::SendDatagram(self.enc.clone().freeze()));
+                    out.push(Event::SendDatagram(self.enc.clone().freeze()));
                 } else if local_req_type == req_type::RESPONSE && recv_req_type == req_type::RESPONSE {
                     // Both at -1 → complete
                     self.do_post_connect(hs, now_us, out);
@@ -870,7 +965,7 @@ impl Connection {
                     };
                     self.enc.clear();
                     codec::encode_handshake(&resp, self.ts(now_us), hs.socket_id as u32, &mut self.enc);
-                    out.push(Output::SendDatagram(self.enc.clone().freeze()));
+                    out.push(Event::SendDatagram(self.enc.clone().freeze()));
                 }
             _ => {}
         }
@@ -882,7 +977,7 @@ impl Connection {
     /// Called when a data or keep-alive packet arrives mid-handshake: either
     /// proves the peer considers itself connected, so the negotiation is over.
     /// No-op unless we are mid-rendezvous with a cached peer handshake.
-    fn try_rendezvous_complete(&mut self, now_us: u64, out: &mut Vec<Output>) {
+    fn try_rendezvous_complete(&mut self, now_us: u64, out: &mut Vec<Event>) {
         if let ConnState::Connecting { mode: ConnMode::Rendezvous, last_peer_hs, .. } = &self.state
             && let Some(hs) = last_peer_hs.clone()
         {
@@ -890,14 +985,14 @@ impl Connection {
         }
     }
 
-    fn do_post_connect(&mut self, hs: Handshake, now_us: u64, out: &mut Vec<Output>) {
+    fn do_post_connect(&mut self, hs: Handshake, now_us: u64, out: &mut Vec<Event>) {
         let peer_isn = SeqNo::new(hs.isn as u32 & SEQ_MAX);
         let mss = (hs.mss as u32).min(self.mss);
         let flow_wnd = hs.flight_flag_size as u32;
         self.peer_id = hs.socket_id as u32;
         self.state = ConnState::Connected;
         self.post_connect(peer_isn, mss, flow_wnd, now_us);
-        out.push(Output::Connected);
+        out.push(Event::Connected);
     }
 
     fn recv_ack(
@@ -905,7 +1000,7 @@ impl Connection {
         asn: AckSeqNo,
         payload: crate::packet::AckPayload,
         now_us: u64,
-        out: &mut Vec<Output>,
+        out: &mut Vec<Event>,
     ) {
         self.last_rsp_us = now_us;
         self.exp_count = 1;
@@ -916,7 +1011,7 @@ impl Connection {
         // not be able to advance our send buffer past the write cursor.
         if ack_seq > self.snd_curr_seq.next() {
             self.state = ConnState::Closed;
-            out.push(Output::Disconnected(DisconnectReason::PeerError));
+            out.push(Event::Disconnected(DisconnectReason::PeerError));
             return;
         }
 
@@ -963,7 +1058,7 @@ impl Connection {
             self.snd_last_ack2_us = now_us;
             self.enc.clear();
             codec::encode_ack2(asn, self.ts(now_us), self.peer_id, &mut self.enc);
-            out.push(Output::SendDatagram(self.enc.clone().freeze()));
+            out.push(Event::SendDatagram(self.enc.clone().freeze()));
         }
         // A light ACK carries only the acknowledgement point: it advances the
         // send buffer (below) but triggers no RTT, CC or ACK2 processing.
@@ -1013,7 +1108,7 @@ impl Connection {
     /// A `light` ACK carries only the acknowledgement point and does not update
     /// any local state; it exists to keep a fast sender's window open between
     /// full ACKs.
-    fn emit_ack(&mut self, now_us: u64, light: bool, out: &mut Vec<Output>) {
+    fn emit_ack(&mut self, now_us: u64, light: bool, out: &mut Vec<Event>) {
         // The acknowledgement point is the highest *contiguous* sequence number,
         // i.e. the first hole if there is one.  Acknowledging past a hole (i.e.
         // using rcv_curr_seq) tells the sender to free data the receiver never
@@ -1040,7 +1135,7 @@ impl Connection {
                 self.peer_id,
                 &mut self.enc,
             );
-            out.push(Output::SendDatagram(self.enc.clone().freeze()));
+            out.push(Event::SendDatagram(self.enc.clone().freeze()));
             return;
         }
 
@@ -1089,14 +1184,14 @@ impl Connection {
         self.last_ack_us = now_us;
         self.enc.clear();
         codec::encode_ack(asn, data_ack, Some(&full), self.ts(now_us), self.peer_id, &mut self.enc);
-        out.push(Output::SendDatagram(self.enc.clone().freeze()));
+        out.push(Event::SendDatagram(self.enc.clone().freeze()));
     }
 
     /// Expire the message sitting at the send cursor, if its TTL has run out.
     ///
     /// Returns true if a message was retired, in which case the caller should
     /// treat this as productive work and come round again.
-    fn expire_at_send_cursor(&mut self, now_us: u64, out: &mut Vec<Output>) -> bool {
+    fn expire_at_send_cursor(&mut self, now_us: u64, out: &mut Vec<Event>) -> bool {
         let cursor = match self.snd_buf.as_ref() {
             Some(b) => b.send_cursor(),
             None => return false,
@@ -1113,7 +1208,7 @@ impl Connection {
     /// sequence number. The peer is told the exact inclusive range; C++ names
     /// one sequence number too many here, so both ends forget a packet
     /// belonging to the *next* message.
-    fn expire_msg_at(&mut self, off: usize, now_us: u64, out: &mut Vec<Output>) -> bool {
+    fn expire_msg_at(&mut self, off: usize, now_us: u64, out: &mut Vec<Event>) -> bool {
         let Some((msg_no, first_off, last_off)) =
             self.snd_buf.as_mut().and_then(|b| b.expire_msg_at(off, now_us))
         else {
@@ -1130,19 +1225,19 @@ impl Connection {
 
         self.enc.clear();
         codec::encode_msg_drop(msg_no, first, last, self.ts(now_us), self.peer_id, &mut self.enc);
-        out.push(Output::SendDatagram(self.enc.clone().freeze()));
+        out.push(Event::SendDatagram(self.enc.clone().freeze()));
         true
     }
 
     /// Send a NAK for a single contiguous range, used for immediate loss
     /// reporting the moment a gap is spotted in the data stream.
-    fn emit_nak_range(&mut self, start: SeqNo, end: SeqNo, now_us: u64, out: &mut Vec<Output>) {
+    fn emit_nak_range(&mut self, start: SeqNo, end: SeqNo, now_us: u64, out: &mut Vec<Event>) {
         self.enc.clear();
         codec::encode_nak(&[(start, end)], self.ts(now_us), self.peer_id, &mut self.enc);
-        out.push(Output::SendDatagram(self.enc.clone().freeze()));
+        out.push(Event::SendDatagram(self.enc.clone().freeze()));
     }
 
-    fn emit_nak(&mut self, now_us: u64, out: &mut Vec<Output>) {
+    fn emit_nak(&mut self, now_us: u64, out: &mut Vec<Event>) {
         let max_words = (self.payload_size / 4) as usize;
         let words = self.rcv_loss.to_nak_payload(max_words);
         if words.is_empty() { return; }
@@ -1163,7 +1258,7 @@ impl Connection {
         }
         self.enc.clear();
         codec::encode_nak(&ranges, self.ts(now_us), self.peer_id, &mut self.enc);
-        out.push(Output::SendDatagram(self.enc.clone().freeze()));
+        out.push(Event::SendDatagram(self.enc.clone().freeze()));
     }
 
     /// Try to pack one outbound data packet.
@@ -1173,7 +1268,7 @@ impl Connection {
     /// SYN interval are batched in one loop.  This is necessary because tokio
     /// timers have ~1 ms granularity and cannot honour sub-millisecond
     /// `pkt_snd_period_us` values individually.
-    fn pack_data(&mut self, now_us: u64, burst_end: u64, out: &mut Vec<Output>) -> bool {
+    fn pack_data(&mut self, now_us: u64, burst_end: u64, out: &mut Vec<Event>) -> bool {
         if burst_end < self.next_snd_us { return false; }
 
         // Retire any message at the send cursor whose TTL has run out, before
@@ -1247,7 +1342,7 @@ impl Connection {
         }
         self.pkt_arena.extend_from_slice(&hdr_bytes);
         self.pkt_arena.extend_from_slice(&payload_bytes);
-        out.push(Output::SendDatagram(self.pkt_arena.split_to(total).freeze()));
+        out.push(Event::SendDatagram(self.pkt_arena.split_to(total).freeze()));
 
         self.snd_tw.on_pkt_arrival(now_us);
         // Accumulate next_snd_us rather than resetting relative to now_us.

@@ -1,25 +1,23 @@
-//! Batched UDP send/receive.
+//! Batched UDP send and receive.
 //!
-//! The profile of a saturated single connection is roughly 95% `sendto` and
-//! `recvfrom`, with `sendto` outnumbering `recvfrom` about two to one — the
-//! receive path already drains everything queued per wakeup, while a plain UDP
-//! send is one datagram per system call. This module closes that asymmetry
-//! where the platform allows it.
+//! A saturated connection spends roughly 95% of its time in `sendto` and
+//! `recvfrom`, and sends outnumber receives about two to one: the receive path
+//! already drains everything queued per wakeup, while a plain UDP send costs
+//! one syscall per datagram. Two kernel offloads close that gap where the
+//! platform has them, both taken from [`quinn_udp`] so this crate keeps
+//! `forbid(unsafe_code)`:
 //!
-//! Two mechanisms, both from [`quinn_udp`], both behind a safe API so this
-//! crate keeps `forbid(unsafe_code)`:
-//!
-//! * **Segmentation offload (GSO)** on send. A run of equal-sized datagrams to
-//!   the same peer is handed to the kernel as one buffer plus a segment size,
-//!   and split into individual packets below the syscall boundary. UDT data
-//!   packets are all exactly one payload except the tail of each message, so
-//!   runs are long — a full message is one transmit.
+//! * **Segmentation offload (GSO)** on send. Equal-sized datagrams bound for
+//!   the same peer go to the kernel as one buffer plus a segment size, and are
+//!   split below the syscall boundary. Every UDT data packet carries a full
+//!   payload except the tail of a message, so runs are long and a whole
+//!   message usually costs one transmit.
 //! * **`recvmmsg`** on receive, filling several buffers per call.
 //!
-//! Where neither exists — macOS, OpenBSD — `max_gso_segments()` reports 1 and
-//! the code below degrades to exactly the per-datagram behaviour it replaces.
-//! That fallback is the path exercised by this repository's own test suite;
-//! **the batched paths are compiled but not covered by any test run on macOS.**
+//! Where neither exists (macOS, OpenBSD) `max_gso_segments()` reports 1 and
+//! everything here falls back to the per-datagram behaviour it replaces.
+//! Note that CI on macOS therefore exercises only the fallback: changes to the
+//! batched paths need testing on Linux.
 
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
@@ -57,9 +55,8 @@ impl BatchIo {
 
     /// Send every datagram in `out`, coalescing runs where possible.
     ///
-    /// Coalescing is only worthwhile when the kernel will actually split the
-    /// buffer for us; otherwise the copy into `scratch` would be pure overhead
-    /// on top of the same number of syscalls.
+    /// Without kernel support the copy into `scratch` would buy nothing — the
+    /// syscall count is the same either way — so that case sends one at a time.
     pub(crate) async fn send_all(
         &mut self,
         sock: &UdpSocket,
@@ -98,9 +95,9 @@ impl BatchIo {
     /// How many leading datagrams of `out` can go in one segmented transmit,
     /// and the segment size to use.
     ///
-    /// GSO requires every segment to be the segment size except the last, which
-    /// may be shorter — exactly the shape of a UDT message, whose packets are
-    /// all one full payload but for the tail.
+    /// GSO requires every segment to be the segment size except the last,
+    /// which may be shorter. A UDT message has that shape already: full
+    /// payloads throughout, with only the tail packet short.
     fn plan_run(&self, out: &[Bytes]) -> (usize, usize) {
         let seg = out[0].len();
         if seg == 0 {
@@ -181,10 +178,9 @@ impl BatchIo {
 impl BatchIo {
     /// Non-blocking variant of [`recv_batch`](Self::recv_batch).
     ///
-    /// Where the platform has no `recvmmsg` — macOS, Windows — a batch call
-    /// returns a single datagram, so draining with this in a loop is what keeps
-    /// one wakeup from costing one packet. Returns `WouldBlock` when the socket
-    /// is empty.
+    /// On platforms without `recvmmsg` (macOS, Windows) a batch call returns a
+    /// single datagram, so callers loop on this to drain the socket rather than
+    /// paying a wakeup per packet. Returns `WouldBlock` once it is empty.
     pub(crate) fn try_recv_batch(
         &self,
         sock: &UdpSocket,
@@ -199,8 +195,8 @@ impl BatchIo {
 
 /// Allocate receive storage sized for this socket's offload settings.
 ///
-/// Each buffer must hold a full generic-receive-offload run, not a single
-/// datagram: undersizing it truncates the run and silently discards every
+/// Each buffer must hold a full generic-receive-offload run rather than a
+/// single datagram. Undersizing truncates the run and silently discards every
 /// datagram after the first.
 pub(crate) fn recv_buffers(io: &BatchIo) -> (Vec<Vec<u8>>, Vec<RecvMeta>) {
     let per_datagram = 2048;
@@ -213,11 +209,10 @@ pub(crate) fn recv_buffers(io: &BatchIo) -> (Vec<Vec<u8>>, Vec<RecvMeta>) {
 
 /// Split one received buffer into its constituent datagrams.
 ///
-/// With generic receive offload the kernel hands back a *run* of datagrams
-/// coalesced into one buffer, described by `meta.stride`. The run is copied
-/// once and the datagrams are zero-copy slices sharing that allocation —
-/// copying each datagram separately costs an allocation and a memcpy per
-/// packet where one per run will do, and up to 64 packets can share a run.
+/// With generic receive offload the kernel returns a run of datagrams packed
+/// into one buffer, described by `meta.stride`. The run is copied once and the
+/// datagrams are slices sharing that allocation; copying them out individually
+/// would cost an allocation and a memcpy per packet, and a run can hold 64.
 pub(crate) fn split_run(buf: &[u8], meta: &RecvMeta) -> impl Iterator<Item = Bytes> {
     let len = meta.len.min(buf.len());
     let stride = if meta.stride == 0 { len.max(1) } else { meta.stride };

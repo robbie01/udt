@@ -379,14 +379,11 @@ impl RecvBuffer {
         self.capacity.saturating_sub(pinned)
     }
 
+    #[cfg(test)]
     pub fn base_seq(&self) -> SeqNo {
         self.base_seq
     }
 
-    /// True if a message could be delivered right now.
-    pub fn has_ready(&self) -> bool {
-        self.maybe_ready && self.find_deliverable().is_some()
-    }
 }
 
 #[cfg(test)]

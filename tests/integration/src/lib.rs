@@ -5,7 +5,7 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::Duration;
-    use udt_async::{Endpoint, Socket};
+    use udt_async::{Endpoint, EndpointConfig, SendOptions, Socket};
 
     const SMALL: &[u8] = b"hello, world!   "; // 16 bytes — single packet
     fn medium() -> Vec<u8> { vec![0x42u8; 4096] } // 3 packets at default MSS (payload=1436B)
@@ -16,14 +16,14 @@ mod tests {
     async fn new_listener_pair(
         listener_addr: SocketAddr,
     ) -> (Socket, Socket) {
-        let ep = Endpoint::bind(listener_addr).unwrap();
-        let server_addr = ep.local_addr().unwrap();
-        let mut listener = ep.listen(4).unwrap();
+        let ep = Endpoint::bind(listener_addr).await.unwrap();
+        let server_addr = ep.local_addr();
+        let listener = ep.listen(4).unwrap();
 
         let (server_sock, client_sock) = tokio::join!(
             async { listener.accept().await.unwrap() },
             async {
-                let cep = Endpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+                let cep = Endpoint::bind("127.0.0.1:0").await.unwrap();
                 tokio::time::timeout(Duration::from_secs(5), cep.connect(server_addr))
                     .await
                     .expect("connect timed out")
@@ -34,8 +34,8 @@ mod tests {
     }
 
     async fn echo_exchange(
-        mut server: Socket,
-        mut client: Socket,
+        server: Socket,
+        client: Socket,
         payload: &[u8],
         count: usize,
     ) {
@@ -90,10 +90,10 @@ mod tests {
     // ── Scenario 4: rendezvous both new ──────────────────────────────────────
 
     async fn new_rendezvous_pair() -> (Socket, Socket) {
-        let ep_a = Endpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let ep_b = Endpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr_a = ep_a.local_addr().unwrap();
-        let addr_b = ep_b.local_addr().unwrap();
+        let ep_a = Endpoint::bind("127.0.0.1:0").await.unwrap();
+        let ep_b = Endpoint::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = ep_a.local_addr();
+        let addr_b = ep_b.local_addr();
 
         let (sock_a, sock_b) = tokio::join!(
             async {
@@ -147,16 +147,16 @@ mod tests {
     async fn s6_multi_connection_same_listener() {
         const N: usize = 4;
 
-        let ep = Endpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let server_addr = ep.local_addr().unwrap();
-        let mut listener = ep.listen(N + 1).unwrap();
+        let ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = ep.local_addr();
+        let listener = ep.listen(N + 1).unwrap();
 
         // Spawn N clients simultaneously.
         let client_tasks: Vec<_> = (0usize..N).map(|i| {
             let payload = vec![(i as u8).wrapping_add(0x41); 3000]; // 'A', 'B', 'C', 'D' repeated
             tokio::spawn(async move {
-                let cep = Endpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-                let mut sock = tokio::time::timeout(
+                let cep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+                let sock = tokio::time::timeout(
                     Duration::from_secs(5),
                     cep.connect(server_addr),
                 )
@@ -181,7 +181,7 @@ mod tests {
         // Accept N connections on the server side and echo each payload back.
         let mut server_tasks = Vec::new();
         for _ in 0..N {
-            let mut server_sock = tokio::time::timeout(
+            let server_sock = tokio::time::timeout(
                 Duration::from_secs(5),
                 listener.accept(),
             )
@@ -213,13 +213,14 @@ mod tests {
 
         // Create N pairs of endpoints.  Each pair on one "side" uses the same
         // shared Endpoint ep_a; the other side has N individual Endpoints.
-        let ep_a = Arc::new(Endpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap());
-        let eps_b: Vec<_> = (0..N)
-            .map(|_| Arc::new(Endpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap()))
-            .collect();
+        let ep_a = Arc::new(Endpoint::bind("127.0.0.1:0").await.unwrap());
+        let mut eps_b = Vec::with_capacity(N);
+        for _ in 0..N {
+            eps_b.push(Arc::new(Endpoint::bind("127.0.0.1:0").await.unwrap()));
+        }
 
-        let addr_a = ep_a.local_addr().unwrap();
-        let addrs_b: Vec<SocketAddr> = eps_b.iter().map(|e| e.local_addr().unwrap()).collect();
+        let addr_a = ep_a.local_addr();
+        let addrs_b: Vec<SocketAddr> = eps_b.iter().map(|e| e.local_addr()).collect();
 
         // Connect all N rendezvous pairs concurrently.
         let mut tasks_a: Vec<_> = addrs_b.iter().enumerate().map(|(i, &addr_b)| {
@@ -257,7 +258,7 @@ mod tests {
         };
 
         // Exchange data on each pair concurrently and verify no commingling.
-        let xfer_tasks: Vec<_> = pairs.into_iter().enumerate().map(|(i, (mut sa, mut sb, payload))| {
+        let xfer_tasks: Vec<_> = pairs.into_iter().enumerate().map(|(i, (sa, sb, payload))| {
             tokio::spawn(async move {
                 // A → B
                 tokio::time::timeout(Duration::from_secs(5), sa.send(&payload))
@@ -295,7 +296,7 @@ mod tests {
         const MSGS: usize = 2000;
         const CHUNK: usize = 8192;
 
-        let (mut server, client) = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
+        let (server, client) = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
 
         let sender = tokio::spawn(async move {
             for i in 0..MSGS {
@@ -347,13 +348,13 @@ mod tests {
         const MSGS: usize = 3000;
         const CHUNK: usize = 4096;
 
-        let (mut server, client) = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
+        let (server, client) = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
 
         let sender = tokio::spawn(async move {
             for i in 0..MSGS {
                 let chunk = vec![pattern(i); CHUNK];
                 client
-                    .send_with(&chunk, None, false)
+                    .send_with(&chunk, SendOptions::new().unordered())
                     .await
                     .expect("unordered send failed");
             }
@@ -399,12 +400,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn expired_messages_are_skipped_without_stalling() {
         const AFTER: usize = 200;
-        let (mut server, client) = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
+        let (server, client) = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
 
         // A TTL of zero expires the moment the send path reconsiders the
         // message, so this deterministically exercises the drop path.
         client
-            .send_with(&vec![0xEEu8; 8192], Some(Duration::from_millis(0)), false)
+            .send_with(&vec![0xEEu8; 8192], SendOptions::new().ttl(Duration::from_millis(0)).unordered())
             .await
             .expect("ttl send failed");
 
@@ -464,20 +465,20 @@ mod tests {
     /// A LEDBAT++ connection must carry data correctly, not just back off.
     #[tokio::test(flavor = "multi_thread")]
     async fn ledbat_transfers_correctly() {
-        use udt_async::{CcKind, EndpointConfig};
+        use udt_async::CcKind;
 
         const MSGS: usize = 400;
         const CHUNK: usize = 4096;
-        let cfg = EndpointConfig { congestion: CcKind::LedbatPlusPlus, ..Default::default() };
+        let cfg = EndpointConfig::new().congestion(CcKind::LedbatPlusPlus);
 
-        let ep = Endpoint::bind_with("127.0.0.1:0".parse().unwrap(), cfg).unwrap();
-        let server_addr = ep.local_addr().unwrap();
-        let mut listener = ep.listen(4).unwrap();
+        let ep = Endpoint::bind_with("127.0.0.1:0", cfg.clone()).await.unwrap();
+        let server_addr = ep.local_addr();
+        let listener = ep.listen(4).unwrap();
 
-        let (mut server, client) = tokio::join!(
+        let (server, client) = tokio::join!(
             async { listener.accept().await.unwrap() },
             async {
-                let cep = Endpoint::bind_with("127.0.0.1:0".parse().unwrap(), cfg).unwrap();
+                let cep = Endpoint::bind_with("127.0.0.1:0", cfg.clone()).await.unwrap();
                 tokio::time::timeout(Duration::from_secs(5), cep.connect(server_addr))
                     .await
                     .expect("ledbat connect timed out")
@@ -520,20 +521,20 @@ mod tests {
     async fn ledbat_yields_to_default_flow() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use udt_async::{CcKind, EndpointConfig};
+        use udt_async::CcKind;
 
         const CHUNK: usize = 64 * 1024;
         const RUN: Duration = Duration::from_secs(3);
 
         async fn spawn_flow(cc: CcKind, counter: Arc<AtomicUsize>, stop: Arc<AtomicUsize>) {
-            let cfg = EndpointConfig { congestion: cc, ..Default::default() };
-            let ep = Endpoint::bind_with("127.0.0.1:0".parse().unwrap(), cfg).unwrap();
-            let addr = ep.local_addr().unwrap();
-            let mut listener = ep.listen(4).unwrap();
-            let (mut server, client) = tokio::join!(
+            let cfg = EndpointConfig::new().congestion(cc);
+            let ep = Endpoint::bind_with("127.0.0.1:0", cfg.clone()).await.unwrap();
+            let addr = ep.local_addr();
+            let listener = ep.listen(4).unwrap();
+            let (server, client) = tokio::join!(
                 async { listener.accept().await.unwrap() },
                 async {
-                    let cep = Endpoint::bind_with("127.0.0.1:0".parse().unwrap(), cfg).unwrap();
+                    let cep = Endpoint::bind_with("127.0.0.1:0", cfg.clone()).await.unwrap();
                     cep.connect(addr).await.unwrap()
                 }
             );
@@ -597,7 +598,7 @@ mod tests {
     /// Every `send` must surface as exactly one `recv` of the same length.
     #[tokio::test(flavor = "multi_thread")]
     async fn message_boundaries_preserved() {
-        let (mut server, client) = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
+        let (server, client) = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
 
         let sender = tokio::spawn(async move {
             for (i, &size) in BOUNDARY_SIZES.iter().enumerate() {
@@ -708,7 +709,7 @@ mod tests {
     #[ignore]
     async fn profile_stream_rust_to_rust() {
         const ROUNDS: usize = 12;
-        let (mut server, mut client) = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
+        let (server, mut client) = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
         let chunk = vec![0x5Au8; BENCH_CHUNK];
 
         let start = std::time::Instant::now();
@@ -762,14 +763,14 @@ mod tests {
         const ROUNDS: usize = 8;
         const PER_CONN: usize = BENCH_TOTAL / 2;
 
-        let ep = Endpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let server_addr = ep.local_addr().unwrap();
-        let mut listener = ep.listen(4).unwrap();
+        let ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = ep.local_addr();
+        let listener = ep.listen(4).unwrap();
 
         let conn_tasks: Vec<_> = (0..2)
             .map(|_| {
                 tokio::spawn(async move {
-                    let cep = Endpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+                    let cep = Endpoint::bind("127.0.0.1:0").await.unwrap();
                     (cep.connect(server_addr).await.unwrap(), cep)
                 })
             })
@@ -788,10 +789,9 @@ mod tests {
         let xfer: Vec<_> = servers
             .into_iter()
             .zip(clients)
-            .map(|(mut srv, (cli, _cep))| {
+            .map(|(srv, (cli, _cep))| {
                 tokio::spawn(async move {
-                    let (_rd, wr) = cli.into_split();
-                    let wr = std::sync::Arc::new(wr);
+                    let wr = std::sync::Arc::new(cli);
                     let chunk = vec![0xAAu8; BENCH_CHUNK];
                     let mut got = 0usize;
                     for _ in 0..ROUNDS {
@@ -823,12 +823,90 @@ mod tests {
         report("profile rust 2-conn", total, start.elapsed().as_secs_f64());
     }
 
+    /// Rendezvous connections created from one endpoint all share that
+    /// endpoint's socket and its single routing task. This measures whether
+    /// that shared path is a throughput ceiling, by running the same N
+    /// concurrent transfers two ways: all from one endpoint, then each from its
+    /// own endpoint.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn rendezvous_parallel_scaling() {
+        for n in [1usize, 2, 4, 8] {
+            let shared = rendezvous_throughput(n, true).await;
+            let separate = rendezvous_throughput(n, false).await;
+            println!(
+                "[rendezvous n={n:<2}] shared endpoint {shared:>7.1} MB/s   \
+                 separate endpoints {separate:>7.1} MB/s   \
+                 ratio {:.2}",
+                shared / separate,
+            );
+        }
+    }
+
+    /// Run `n` concurrent rendezvous transfers, either all from one endpoint or
+    /// each from its own. Returns aggregate MB/s.
+    async fn rendezvous_throughput(n: usize, share_endpoint: bool) -> f64 {
+        const PER_CONN: usize = 32 * 1024 * 1024;
+
+        let hub = Arc::new(Endpoint::bind("127.0.0.1:0").await.unwrap());
+        let mut pairs = Vec::new();
+        for _ in 0..n {
+            let a = if share_endpoint {
+                Arc::clone(&hub)
+            } else {
+                Arc::new(Endpoint::bind("127.0.0.1:0").await.unwrap())
+            };
+            let b = Arc::new(Endpoint::bind("127.0.0.1:0").await.unwrap());
+            let (aa, ba) = (a.local_addr(), b.local_addr());
+            let (sa, sb) = tokio::join!(
+                async { a.connect_rendezvous(ba).await.unwrap() },
+                async { b.connect_rendezvous(aa).await.unwrap() },
+            );
+            pairs.push((sa, sb, a, b));
+        }
+
+        let start = std::time::Instant::now();
+        let tasks: Vec<_> = pairs
+            .into_iter()
+            .map(|(sa, sb, ea, eb)| {
+                tokio::spawn(async move {
+                    let chunk = vec![0x5Au8; BENCH_CHUNK];
+                    let sender = tokio::spawn(async move {
+                        let mut sent = 0usize;
+                        while sent < PER_CONN {
+                            if sa.send(&chunk).await.is_err() { break; }
+                            sent += BENCH_CHUNK;
+                        }
+                        sa
+                    });
+                    let mut buf = vec![0u8; BENCH_CHUNK * 2];
+                    let mut got = 0usize;
+                    while got < PER_CONN {
+                        match sb.recv(&mut buf).await {
+                            Ok(k) => got += k,
+                            Err(_) => break,
+                        }
+                    }
+                    let _held = sender.await.unwrap();
+                    let _keep = (ea, eb);
+                    got
+                })
+            })
+            .collect();
+
+        let mut total = 0usize;
+        for t in tasks {
+            total += t.await.unwrap();
+        }
+        total as f64 / 1e6 / start.elapsed().as_secs_f64()
+    }
+
     // ── Streaming throughput ──────────────────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn stream_rust_to_rust() {
-        let (mut server, client) = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
+        let (server, client) = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
         let chunk = vec![0x5Au8; BENCH_CHUNK];
 
         let start = std::time::Instant::now();
@@ -856,14 +934,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn stream_rust_two_connections() {
-        let ep = Endpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let server_addr = ep.local_addr().unwrap();
-        let mut listener = ep.listen(4).unwrap();
+        let ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = ep.local_addr();
+        let listener = ep.listen(4).unwrap();
 
         let conn_tasks: Vec<_> = (0..2)
             .map(|_| {
                 tokio::spawn(async move {
-                    let cep = Endpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+                    let cep = Endpoint::bind("127.0.0.1:0").await.unwrap();
                     cep.connect(server_addr).await.unwrap()
                 })
             })
@@ -882,7 +960,7 @@ mod tests {
         let xfer: Vec<_> = server_socks
             .into_iter()
             .zip(client_socks)
-            .map(|(mut srv, cli)| {
+            .map(|(srv, cli)| {
                 let chunk = vec![0xAAu8; BENCH_CHUNK];
                 tokio::spawn(async move {
                     let sender = tokio::spawn(async move {
@@ -925,7 +1003,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn pingpong_rust_to_rust() {
-        let (mut server, client) = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
+        let (server, client) = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
         let chunk = vec![0x55u8; BENCH_CHUNK];
         let mut buf = vec![0u8; BENCH_CHUNK * 2];
 

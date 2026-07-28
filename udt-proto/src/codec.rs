@@ -156,7 +156,11 @@ fn decode_nak_list(payload: &[u8]) -> Option<NakList> {
 // ── Encoder ─────────────────────────────────────────────────────────────────
 
 /// Encode a full data packet into `dst`.
-/// Header is big-endian (network byte order); payload is raw application bytes.
+///
+/// The send path uses [`encode_data_header`] instead, writing the header and
+/// payload into an arena separately; this whole-packet form exists for
+/// round-trip tests.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn encode_data(
     seq_no: SeqNo,

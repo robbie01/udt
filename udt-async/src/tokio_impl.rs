@@ -6,13 +6,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use tokio::net::UdpSocket;
+use tokio::net::{ToSocketAddrs, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::batch;
-use udt_proto::{CcKind, Connection, Output, SendOutcome};
-use udt_proto::listener::{ListenerState, ListenerOutput, PeerAddr};
-use udt_proto::seq::SeqNo;
+use udt_proto::{
+    CcKind, Connection, Event, Listener as ProtoListener, ListenerEvent, PeerAddr, SendOutcome,
+    SeqNo,
+};
 
 static SOCKET_ID: AtomicU32 = AtomicU32::new(1);
 
@@ -47,26 +48,27 @@ fn sockaddr_to_peer_addr(addr: SocketAddr) -> PeerAddr {
 
 // ── Public constants ──────────────────────────────────────────────────────────
 
-/// Size of the UDT packet header that precedes every payload (4 × u32 = 16 bytes).
-pub const UDT_HEADER_SIZE: usize = udt_proto::UDT_HEADER_SIZE;
+/// The path MTU assumed by default: 1500 bytes, standard Ethernet.
+pub const DEFAULT_MTU: u32 = 1500;
 
-/// UDP encapsulation overhead for IPv4 (20-byte IP header + 8-byte UDP header).
-pub const UDP_OVERHEAD_V4: u32 = 28;
-
-/// UDP encapsulation overhead for IPv6 (40-byte IP header + 8-byte UDP header).
-pub const UDP_OVERHEAD_V6: u32 = 48;
-
-/// Default MSS advertised in the UDT handshake for a standard Ethernet network.
+/// Largest message that fits in a single packet at the default MTU: 1436 bytes.
 ///
-/// Follows the C++ UDT wire convention: `mss` = IP-layer MTU (including IP and
-/// UDP headers).  The maximum application payload per UDT packet is therefore:
-///   `DEFAULT_MSS − UDP_OVERHEAD_V6 − UDT_HEADER_SIZE = 1500 − 48 − 16 = 1436 bytes`
+/// Longer messages are split across packets and reassembled by the peer, so
+/// this is a throughput consideration rather than a limit.
+pub const MAX_PAYLOAD_SIZE: usize = max_payload_for_mtu(DEFAULT_MTU);
+
+/// Largest message that fits in a single packet at the given path MTU.
 ///
-/// Note: the C++ implementation uses a fixed overhead of 48 bytes (IPv6-sized)
-/// for both IPv4 and IPv6 to avoid a connection-setup dependency on the peer's
-/// address family.  To maximise IPv4 throughput on a dedicated IPv4 network you
-/// can pass a custom `mss` to [`Endpoint::bind_with_mss`].
-pub const DEFAULT_MSS: u32 = 1500;
+/// Deducts worst-case IPv6 and UDP headers plus UDT's own 16-byte header, so
+/// the answer holds for both address families.
+pub const fn max_payload_for_mtu(mtu: u32) -> usize {
+    const FIXED_OVERHEAD: u32 = 48 + udt_proto::UDT_HEADER_SIZE as u32;
+    if mtu <= FIXED_OVERHEAD {
+        0
+    } else {
+        (mtu - FIXED_OVERHEAD) as usize
+    }
+}
 
 /// Maximum datagrams consumed per wakeup before returning to the event loop.
 ///
@@ -142,7 +144,7 @@ enum MuxCmd {
     RegisterRoute { peer: SocketAddr, tx: mpsc::Sender<Bytes> },
     /// Start (or replace) the listener state machine on this endpoint.
     StartListener {
-        accept_tx: mpsc::Sender<Socket>,
+        accept_tx: flume::Sender<Socket>,
         secret: u64,
         socket_id: u32,
     },
@@ -150,95 +152,207 @@ enum MuxCmd {
 
 // ── Socket ────────────────────────────────────────────────────────────────────
 
+/// An established UDT connection.
+///
+/// UDT is message-oriented: each [`send`](Self::send) is delivered as exactly
+/// one [`recv`](Self::recv) of the same length, never split or merged. In that
+/// respect it behaves like a connected [`UdpSocket`], but delivery is reliable
+/// and ordered by default.
+///
+/// All methods take `&self`, so a socket can be shared between tasks with
+/// `Arc` — one task sending while another receives is fine. Concurrent
+/// receivers each get whole messages, but which task gets which message is
+/// unspecified.
+///
+/// The connection closes when the socket is dropped.
 pub struct Socket {
     send_tx: mpsc::Sender<SendReq>,
-    recv_rx: mpsc::Receiver<Bytes>,
+    recv_rx: flume::Receiver<Bytes>,
     peer_addr: SocketAddr,
     local_addr: SocketAddr,
 }
 
-// ── Split halves ──────────────────────────────────────────────────────────────
-
-/// Owned read half returned by [`Socket::into_split`].
-pub struct OwnedReadHalf {
-    recv_rx: mpsc::Receiver<Bytes>,
-    pub peer_addr: SocketAddr,
-    pub local_addr: SocketAddr,
-}
-
-/// Owned write half returned by [`Socket::into_split`].
-pub struct OwnedWriteHalf {
-    send_tx: mpsc::Sender<SendReq>,
-    pub peer_addr: SocketAddr,
-    pub local_addr: SocketAddr,
-}
-
-/// Borrowed read half returned by [`Socket::split`].
-pub struct ReadHalf<'a> {
-    recv_rx: &'a mut mpsc::Receiver<Bytes>,
-    pub peer_addr: SocketAddr,
-    pub local_addr: SocketAddr,
-}
-
-/// Borrowed write half returned by [`Socket::split`].
-pub struct WriteHalf<'a> {
-    send_tx: &'a mpsc::Sender<SendReq>,
-    pub peer_addr: SocketAddr,
-    pub local_addr: SocketAddr,
-}
-
-impl OwnedReadHalf {
-    pub async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        recv_from_channel(&mut self.recv_rx, buf).await
-    }
-}
-
-impl OwnedWriteHalf {
-    /// Send a message, preserving order relative to earlier sends.
+impl Socket {
+    /// Sends a message, preserving order relative to earlier sends.
     ///
-    /// Use [`send_with`](Self::send_with) with `in_order = false` to let the
-    /// peer surface this message ahead of earlier ones that are still in
-    /// flight. That is a real wire-level request, not a hint: a UDT receiver
-    /// (including the C++ implementation) will deliver such a message as soon
-    /// as it is complete, so the application must be able to cope with gaps.
+    /// Waits if the connection's send buffer is full.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::BrokenPipe`] if the connection has closed.
+    ///
+    /// [`ErrorKind::BrokenPipe`]: std::io::ErrorKind::BrokenPipe
     pub async fn send(&self, buf: &[u8]) -> io::Result<()> {
-        self.send_with(buf, None, true).await
+        self.send_with(buf, SendOptions::new()).await
     }
 
-    pub async fn send_with(&self, buf: &[u8], ttl: Option<Duration>, in_order: bool) -> io::Result<()> {
-        send_via_channel(&self.send_tx, buf, ttl, in_order).await
+    /// Sends a message with a time-to-live, or permission to arrive out of
+    /// order. See [`SendOptions`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::BrokenPipe`] if the connection has closed.
+    ///
+    /// [`ErrorKind::BrokenPipe`]: std::io::ErrorKind::BrokenPipe
+    pub async fn send_with(&self, buf: &[u8], opts: SendOptions) -> io::Result<()> {
+        send_via_channel(&self.send_tx, buf, opts).await
     }
 
+    /// Sends a message if the send buffer has room, without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::WouldBlock`] if the buffer is full, or
+    /// [`ErrorKind::BrokenPipe`] if the connection has closed.
+    ///
+    /// [`ErrorKind::WouldBlock`]: std::io::ErrorKind::WouldBlock
+    /// [`ErrorKind::BrokenPipe`]: std::io::ErrorKind::BrokenPipe
+    pub fn try_send(&self, buf: &[u8]) -> io::Result<()> {
+        self.try_send_with(buf, SendOptions::new())
+    }
+
+    /// [`try_send`](Self::try_send) with the options of
+    /// [`send_with`](Self::send_with).
+    ///
+    /// # Errors
+    ///
+    /// As [`try_send`](Self::try_send).
+    pub fn try_send_with(&self, buf: &[u8], opts: SendOptions) -> io::Result<()> {
+        self.send_tx.try_send(opts.into_req(buf)).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => {
+                io::Error::new(io::ErrorKind::WouldBlock, "send buffer full")
+            }
+            mpsc::error::TrySendError::Closed(_) => closed(),
+        })
+    }
+
+    /// Receives the next message into `buf`, returning its length.
+    ///
+    /// A message longer than `buf` is truncated and the excess discarded, as
+    /// with a datagram socket. Size a buffer for the largest message the peer
+    /// will send.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::BrokenPipe`] if the connection has closed and no
+    /// messages remain.
+    ///
+    /// [`ErrorKind::BrokenPipe`]: std::io::ErrorKind::BrokenPipe
+    pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let msg = self.recv_rx.recv_async().await.map_err(|_| closed())?;
+        Ok(copy_into(&msg, buf))
+    }
+
+    /// Receives the next message as an owned buffer, avoiding a copy.
+    ///
+    /// Prefer this to [`recv`](Self::recv) when the message does not need to
+    /// land in a buffer you already own.
+    ///
+    /// # Errors
+    ///
+    /// As [`recv`](Self::recv).
+    pub async fn recv_bytes(&self) -> io::Result<Bytes> {
+        self.recv_rx.recv_async().await.map_err(|_| closed())
+    }
+
+    /// Receives a message if one is already available, without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::WouldBlock`] if no message is ready, or
+    /// [`ErrorKind::BrokenPipe`] if the connection has closed.
+    ///
+    /// [`ErrorKind::WouldBlock`]: std::io::ErrorKind::WouldBlock
+    /// [`ErrorKind::BrokenPipe`]: std::io::ErrorKind::BrokenPipe
+    pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.recv_rx.try_recv() {
+            Ok(msg) => Ok(copy_into(&msg, buf)),
+            Err(flume::TryRecvError::Empty) => {
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "no message ready"))
+            }
+            Err(flume::TryRecvError::Disconnected) => Err(closed()),
+        }
+    }
+
+    /// Waits until every message sent so far has been acknowledged by the peer.
+    ///
+    /// Messages sent after this call begins are not waited for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::BrokenPipe`] if the connection closes first.
+    ///
+    /// [`ErrorKind::BrokenPipe`]: std::io::ErrorKind::BrokenPipe
     pub async fn flush(&self) -> io::Result<()> {
         flush_via_channel(&self.send_tx).await
     }
-}
 
-impl<'a> ReadHalf<'a> {
-    pub async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        recv_from_channel(self.recv_rx, buf).await
+    /// The peer's address.
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.peer_addr
+    }
+
+    /// The local address this connection sends from.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
     }
 }
 
-impl<'a> WriteHalf<'a> {
-    /// Send a message, preserving order relative to earlier sends.
+// ── Send options ──────────────────────────────────────────────────────────────
+
+/// Per-message delivery options for [`Socket::send_with`].
+///
+/// The default is reliable, ordered delivery, the same as [`Socket::send`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SendOptions {
+    ttl: Option<Duration>,
+    unordered: bool,
+}
+
+impl SendOptions {
+    /// Reliable, ordered delivery.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Gives up on the message if it has not been delivered within `ttl`.
     ///
-    /// Use [`send_with`](Self::send_with) with `in_order = false` to let the
-    /// peer surface this message ahead of earlier ones that are still in
-    /// flight. That is a real wire-level request, not a hint: a UDT receiver
-    /// (including the C++ implementation) will deliver such a message as soon
-    /// as it is complete, so the application must be able to cope with gaps.
-    pub async fn send(&self, buf: &[u8]) -> io::Result<()> {
-        self.send_with(buf, None, true).await
+    /// The peer is told to skip it, and the connection continues with the next
+    /// message. Without a TTL a message is retried until it arrives or the
+    /// connection fails.
+    pub fn ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
+        self
     }
 
-    pub async fn send_with(&self, buf: &[u8], ttl: Option<Duration>, in_order: bool) -> io::Result<()> {
-        send_via_channel(self.send_tx, buf, ttl, in_order).await
+    /// Lets the peer deliver this message as soon as it is complete, without
+    /// waiting for earlier messages that are still in flight.
+    ///
+    /// Useful when messages are independent and latency matters more than
+    /// order. The receiving application must be able to handle them arriving
+    /// out of sequence.
+    pub fn unordered(mut self) -> Self {
+        self.unordered = true;
+        self
     }
 
-    pub async fn flush(&self) -> io::Result<()> {
-        flush_via_channel(self.send_tx).await
+    fn into_req(self, buf: &[u8]) -> SendReq {
+        SendReq::Data {
+            payload: Bytes::copy_from_slice(buf),
+            ttl_ms: self.ttl.map(|d| d.as_millis() as u32),
+            in_order: !self.unordered,
+        }
     }
+}
+
+fn closed() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "connection closed")
+}
+
+fn copy_into(msg: &[u8], buf: &mut [u8]) -> usize {
+    let n = msg.len().min(buf.len());
+    buf[..n].copy_from_slice(&msg[..n]);
+    n
 }
 
 // ── Shared helpers for send/recv channel ops ──────────────────────────────────
@@ -246,168 +360,159 @@ impl<'a> WriteHalf<'a> {
 async fn send_via_channel(
     tx: &mpsc::Sender<SendReq>,
     buf: &[u8],
-    ttl: Option<Duration>,
-    in_order: bool,
+    opts: SendOptions,
 ) -> io::Result<()> {
-    tx.send(SendReq::Data {
-        payload: Bytes::copy_from_slice(buf),
-        ttl_ms: ttl.map(|d| d.as_millis() as u32),
-        in_order,
-    })
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))
+    tx.send(opts.into_req(buf)).await.map_err(|_| closed())
 }
 
 async fn flush_via_channel(tx: &mpsc::Sender<SendReq>) -> io::Result<()> {
     let (notify, rx) = oneshot::channel::<()>();
-    tx.send(SendReq::Flush { notify })
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))?;
-    rx.await
-        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))
-}
-
-async fn recv_from_channel(rx: &mut mpsc::Receiver<Bytes>, buf: &mut [u8]) -> io::Result<usize> {
-    let msg = rx
-        .recv()
-        .await
-        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))?;
-    let n = msg.len().min(buf.len());
-    buf[..n].copy_from_slice(&msg[..n]);
-    Ok(n)
-}
-
-impl Socket {
-    /// Send a message, preserving order relative to earlier sends.
-    ///
-    /// Use [`send_with`](Self::send_with) with `in_order = false` to let the
-    /// peer surface this message ahead of earlier ones that are still in
-    /// flight. That is a real wire-level request, not a hint: a UDT receiver
-    /// (including the C++ implementation) will deliver such a message as soon
-    /// as it is complete, so the application must be able to cope with gaps.
-    pub async fn send(&self, buf: &[u8]) -> io::Result<()> {
-        self.send_with(buf, None, true).await
-    }
-
-    pub async fn send_with(
-        &self,
-        buf: &[u8],
-        ttl: Option<Duration>,
-        in_order: bool,
-    ) -> io::Result<()> {
-        send_via_channel(&self.send_tx, buf, ttl, in_order).await
-    }
-
-    /// Wait until all data queued before this call has been acknowledged by the peer.
-    ///
-    /// Concurrent sends that are enqueued *after* the first poll of the returned
-    /// future are not included in the flush barrier.
-    pub async fn flush(&self) -> io::Result<()> {
-        flush_via_channel(&self.send_tx).await
-    }
-
-    pub async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        recv_from_channel(&mut self.recv_rx, buf).await
-    }
-
-    /// Split into owned halves that can be held by separate tasks.
-    pub fn into_split(self) -> (OwnedReadHalf, OwnedWriteHalf) {
-        let Socket { send_tx, recv_rx, peer_addr, local_addr } = self;
-        (
-            OwnedReadHalf { recv_rx, peer_addr, local_addr },
-            OwnedWriteHalf { send_tx, peer_addr, local_addr },
-        )
-    }
-
-    /// Borrow split halves for use within a single scope.
-    ///
-    /// Unlike [`into_split`], neither half can outlive `self`.
-    pub fn split(&mut self) -> (ReadHalf<'_>, WriteHalf<'_>) {
-        let peer_addr = self.peer_addr;
-        let local_addr = self.local_addr;
-        (
-            ReadHalf { recv_rx: &mut self.recv_rx, peer_addr, local_addr },
-            WriteHalf { send_tx: &self.send_tx, peer_addr, local_addr },
-        )
-    }
-
-    pub fn peer_addr(&self) -> SocketAddr { self.peer_addr }
-    pub fn local_addr(&self) -> SocketAddr { self.local_addr }
+    tx.send(SendReq::Flush { notify }).await.map_err(|_| closed())?;
+    rx.await.map_err(|_| closed())
 }
 
 // ── Listener ──────────────────────────────────────────────────────────────────
 
+/// Accepts incoming UDT connections on a bound address.
+///
+/// Created by [`Endpoint::listen`]. Like [`Socket`], it takes `&self`
+/// throughout, so several tasks can accept from one listener through an `Arc`.
+/// Dropping it stops accepting; connections already returned by
+/// [`accept`](Self::accept) stay open.
 pub struct Listener {
-    accept_rx: mpsc::Receiver<Socket>,
+    accept_rx: flume::Receiver<Socket>,
     local_addr: SocketAddr,
 }
 
 impl Listener {
-    pub async fn accept(&mut self) -> io::Result<Socket> {
-        self.accept_rx
-            .recv()
-            .await
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "listener closed"))
+    /// Waits for the next incoming connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::BrokenPipe`] if the endpoint has shut down.
+    ///
+    /// [`ErrorKind::BrokenPipe`]: std::io::ErrorKind::BrokenPipe
+    pub async fn accept(&self) -> io::Result<Socket> {
+        self.accept_rx.recv_async().await.map_err(|_| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "endpoint closed")
+        })
     }
 
-    pub fn local_addr(&self) -> SocketAddr { self.local_addr }
+    /// The address this listener accepts on.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
 }
 
 // ── Endpoint ──────────────────────────────────────────────────────────────────
 
-/// Tunables for every connection created from an [`Endpoint`].
-#[derive(Debug, Clone, Copy)]
+/// Settings shared by every connection an [`Endpoint`] creates.
+///
+/// ```no_run
+/// use udt_async::{CcKind, Endpoint, EndpointConfig};
+/// # async fn f() -> std::io::Result<()> {
+/// let cfg = EndpointConfig::new().mtu(9000).congestion(CcKind::LedbatPlusPlus);
+/// let endpoint = Endpoint::bind_with("0.0.0.0:0", cfg).await?;
+/// # Ok(()) }
+/// ```
+#[derive(Debug, Clone)]
 pub struct EndpointConfig {
-    /// IP-layer MTU advertised in the handshake. See [`DEFAULT_MSS`].
-    pub mss: u32,
-    /// Congestion controller. [`CcKind::Udt`] is the default and the only one
-    /// whose behaviour matches the C++ reference;
-    /// [`CcKind::LedbatPlusPlus`] yields to competing traffic and suits
-    /// background transfers.
-    pub congestion: CcKind,
+    mss: u32,
+    congestion: CcKind,
+}
+
+impl EndpointConfig {
+    /// Default settings: a 1500-byte path MTU and UDT congestion control.
+    pub fn new() -> Self {
+        EndpointConfig { mss: DEFAULT_MTU, congestion: CcKind::default() }
+    }
+
+    /// Sets the path MTU, in bytes.
+    ///
+    /// This is the size of the largest IP packet the network path can carry
+    /// without fragmenting. 1500 is right for ordinary Ethernet and the
+    /// internet at large; raise it to 9000 on a jumbo-frame network. Both
+    /// peers negotiate down to the smaller of the two values during the
+    /// handshake.
+    ///
+    /// [`max_payload_for_mtu`] gives the resulting largest single-packet
+    /// message; larger messages are split across packets automatically.
+    ///
+    /// Values below 64 bytes are raised to 64.
+    pub fn mtu(mut self, mtu: u32) -> Self {
+        self.mss = mtu.max(64);
+        self
+    }
+
+    /// Selects the congestion control algorithm. See [`CcKind`].
+    pub fn congestion(mut self, cc: CcKind) -> Self {
+        self.congestion = cc;
+        self
+    }
 }
 
 impl Default for EndpointConfig {
     fn default() -> Self {
-        EndpointConfig { mss: DEFAULT_MSS, congestion: CcKind::default() }
+        Self::new()
     }
 }
 
+/// A bound local address that connections are made from and accepted on.
+///
+/// One endpoint can hold any number of connections. Use
+/// [`connect`](Self::connect) to reach a peer that is listening,
+/// [`listen`](Self::listen) to accept incoming connections, or
+/// [`connect_rendezvous`](Self::connect_rendezvous) when both sides dial each
+/// other at once to traverse a firewall.
+///
+/// ```no_run
+/// use udt_async::Endpoint;
+/// # async fn f() -> std::io::Result<()> {
+/// let endpoint = Endpoint::bind("0.0.0.0:0").await?;
+/// let socket = endpoint.connect("203.0.113.7:9000").await?;
+/// socket.send(b"hello").await?;
+/// # Ok(()) }
+/// ```
+///
+/// # Sharing an endpoint
+///
+/// Outgoing [`connect`](Self::connect) calls each get their own kernel socket,
+/// so they scale independently. Accepted and rendezvous connections instead
+/// share the endpoint's bound port, since that is the address the peer is
+/// sending to. On Linux the kernel hands those over in batches and sharing
+/// costs nothing measurable; on platforms without batched receive (macOS,
+/// Windows) several saturated connections on one endpoint will contend, so
+/// give a handful of bulk rendezvous transfers an endpoint each.
 pub struct Endpoint {
-    /// Shared socket for the endpoint's bound address.
-    /// The mux task is the sole *reader*; this handle is used for outbound sends
-    /// from rendezvous/accepted connections.  Active (`connect`) connections get
-    /// their own dedicated socket instead.
     socket: Arc<UdpSocket>,
-    /// Command channel to the endpoint mux task that owns the recv loop.
     mux_tx: mpsc::UnboundedSender<MuxCmd>,
     local_addr: SocketAddr,
     cfg: EndpointConfig,
 }
 
 impl Endpoint {
-    /// Bind with defaults: MSS 1500 and UDT's native congestion control.
-    pub fn bind(addr: SocketAddr) -> io::Result<Self> {
-        Self::bind_with(addr, EndpointConfig::default())
+    /// Binds an endpoint to a local address, with default settings.
+    ///
+    /// Port 0 asks the operating system for an unused port; read the result
+    /// back with [`local_addr`](Self::local_addr).
+    ///
+    /// # Errors
+    ///
+    /// Returns any error from resolving `addr` or binding the underlying UDP
+    /// socket, such as [`ErrorKind::AddrInUse`].
+    ///
+    /// [`ErrorKind::AddrInUse`]: std::io::ErrorKind::AddrInUse
+    pub async fn bind(addr: impl ToSocketAddrs) -> io::Result<Self> {
+        Self::bind_with(addr, EndpointConfig::new()).await
     }
 
-    /// Bind with an explicit MSS (IP-layer MTU).
+    /// Binds an endpoint with explicit settings. See [`EndpointConfig`].
     ///
-    /// `mss` is the IP-layer MTU advertised in the UDT handshake, following the
-    /// C++ UDT wire convention.  The maximum application payload per packet is:
-    ///   `mss − UDP_OVERHEAD_V6(48) − UDT_HEADER_SIZE(16)`
+    /// # Errors
     ///
-    /// Example: jumbo-frame IPv4 network with 9000-byte MTU:
-    /// ```ignore
-    /// let ep = Endpoint::bind_with_mss("0.0.0.0:0".parse().unwrap(), 9000)?;
-    /// // max payload = 9000 − 48 − 16 = 8936 bytes
-    /// ```
-    pub fn bind_with_mss(addr: SocketAddr, mss: u32) -> io::Result<Self> {
-        Self::bind_with(addr, EndpointConfig { mss, ..Default::default() })
-    }
-
-    /// Bind with full control over MSS and congestion control.
-    pub fn bind_with(addr: SocketAddr, cfg: EndpointConfig) -> io::Result<Self> {
+    /// As [`bind`](Self::bind).
+    pub async fn bind_with(addr: impl ToSocketAddrs, cfg: EndpointConfig) -> io::Result<Self> {
+        let addr = resolve(addr).await?;
         let mss = cfg.mss;
         let std_sock = std::net::UdpSocket::bind(addr)?;
         std_sock.set_nonblocking(true)?;
@@ -415,15 +520,21 @@ impl Endpoint {
         let socket = Arc::new(UdpSocket::from_std(std_sock)?);
         let local_addr = socket.local_addr()?;
         let (mux_tx, mux_rx) = mpsc::unbounded_channel::<MuxCmd>();
-        tokio::spawn(run_endpoint_mux(Arc::clone(&socket), mux_rx, cfg));
+        tokio::spawn(run_endpoint_mux(Arc::clone(&socket), mux_rx, cfg.clone()));
         Ok(Endpoint { socket, mux_tx, local_addr, cfg })
     }
 
-    /// Connect to a remote UDT listener.
+    /// Connects to a peer that is listening.
     ///
-    /// Each `connect()` call binds a fresh ephemeral socket, so concurrent
-    /// outgoing active connections from the same `Endpoint` are fully isolated.
-    pub async fn connect(&self, peer: SocketAddr) -> io::Result<Socket> {
+    /// Resolves once the handshake completes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::TimedOut`] if the peer does not answer.
+    ///
+    /// [`ErrorKind::TimedOut`]: std::io::ErrorKind::TimedOut
+    pub async fn connect(&self, peer: impl ToSocketAddrs) -> io::Result<Socket> {
+        let peer = resolve(peer).await?;
         let std_sock = std::net::UdpSocket::bind(outgoing_bind_addr(self.local_addr, peer))?;
         std_sock.set_nonblocking(true)?;
         configure_udp_buffers(&std_sock, self.cfg.mss);
@@ -431,12 +542,13 @@ impl Endpoint {
         let local_addr = udp.local_addr()?;
 
         let (send_tx, send_rx) = mpsc::channel::<SendReq>(256);
-        let (recv_tx, recv_rx) = mpsc::channel::<Bytes>(256);
+        let (recv_tx, recv_rx) = flume::bounded::<Bytes>(256);
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
         let socket_id = next_socket_id();
         let isn = SeqNo::new(rand::random::<u32>() & 0x7FFF_FFFF);
-        let conn = Connection::new_active(socket_id, isn, self.cfg.mss, now_us(), self.cfg.congestion);
+        let conn =
+            Connection::new_active(socket_id, isn, self.cfg.mss, now_us(), self.cfg.congestion);
 
         tokio::spawn(run_conn_driver(udp, conn, peer, None, send_rx, recv_tx, Some(connected_tx)));
 
@@ -447,25 +559,34 @@ impl Endpoint {
         Ok(Socket { send_tx, recv_rx, peer_addr: peer, local_addr })
     }
 
-    /// Rendezvous connect: both sides call this simultaneously knowing each
-    /// other's address.
+    /// Connects to a peer that is calling this at the same time.
     ///
-    /// All rendezvous connections from the same `Endpoint` share the underlying
-    /// socket through the endpoint mux, so there is exactly one `recv_from` call
-    /// in flight at any time regardless of how many are active concurrently.
-    pub async fn connect_rendezvous(&self, peer: SocketAddr) -> io::Result<Socket> {
+    /// Both sides must know each other's address in advance and dial
+    /// simultaneously. Because the first packets cross in flight, each side
+    /// punches a hole in its own firewall or NAT for the other, which lets two
+    /// peers connect with no listener in between.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::TimedOut`] if the peer never appears.
+    ///
+    /// [`ErrorKind::TimedOut`]: std::io::ErrorKind::TimedOut
+    pub async fn connect_rendezvous(&self, peer: impl ToSocketAddrs) -> io::Result<Socket> {
+        let peer = resolve(peer).await?;
         let (datagram_tx, datagram_rx) = mpsc::channel::<Bytes>(256);
         let (send_tx, send_rx) = mpsc::channel::<SendReq>(256);
-        let (recv_tx, recv_rx) = mpsc::channel::<Bytes>(256);
+        let (recv_tx, recv_rx) = flume::bounded::<Bytes>(256);
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
         // Register the route *before* spawning so no incoming packet is missed.
-        self.mux_tx.send(MuxCmd::RegisterRoute { peer, tx: datagram_tx })
+        self.mux_tx
+            .send(MuxCmd::RegisterRoute { peer, tx: datagram_tx })
             .map_err(|_| io::Error::other("endpoint closed"))?;
 
         let socket_id = next_socket_id();
         let isn = SeqNo::new(rand::random::<u32>() & 0x7FFF_FFFF);
-        let conn = Connection::new_rendezvous(socket_id, isn, self.cfg.mss, now_us(), self.cfg.congestion);
+        let conn =
+            Connection::new_rendezvous(socket_id, isn, self.cfg.mss, now_us(), self.cfg.congestion);
 
         tokio::spawn(run_conn_driver(
             Arc::clone(&self.socket),
@@ -484,23 +605,38 @@ impl Endpoint {
         Ok(Socket { send_tx, recv_rx, peer_addr: peer, local_addr: self.local_addr })
     }
 
-    /// Start listening for incoming connections.
+    /// Accepts incoming connections on this endpoint's address.
     ///
-    /// The listener state machine runs inside the endpoint mux, so `listen()`
-    /// and `connect_rendezvous()` can coexist on the same `Endpoint` without
-    /// racing on the shared socket.
+    /// `backlog` bounds how many completed connections wait to be picked up by
+    /// [`Listener::accept`] before further handshakes are refused.
+    ///
+    /// An endpoint can listen and make outgoing connections at the same time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the endpoint has shut down.
     pub fn listen(&self, backlog: usize) -> io::Result<Listener> {
-        let (accept_tx, accept_rx) = mpsc::channel::<Socket>(backlog.max(1));
+        let (accept_tx, accept_rx) = flume::bounded::<Socket>(backlog.max(1));
         let secret: u64 = rand::random();
         let socket_id = next_socket_id();
-        self.mux_tx.send(MuxCmd::StartListener { accept_tx, secret, socket_id })
+        self.mux_tx
+            .send(MuxCmd::StartListener { accept_tx, secret, socket_id })
             .map_err(|_| io::Error::other("endpoint closed"))?;
         Ok(Listener { accept_rx, local_addr: self.local_addr })
     }
 
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self.local_addr)
+    /// The address this endpoint is bound to, with any OS-assigned port
+    /// filled in.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
     }
+}
+
+async fn resolve(addr: impl ToSocketAddrs) -> io::Result<SocketAddr> {
+    tokio::net::lookup_host(addr)
+        .await?
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no address to connect to"))
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -567,8 +703,8 @@ async fn run_endpoint_mux(
     // source address → datagram forwarder for established/rendezvous connections
     let mut routes: HashMap<SocketAddr, mpsc::Sender<Bytes>> = HashMap::new();
     // optional listener state machine
-    let mut listener: Option<(ListenerState, mpsc::Sender<Socket>)> = None;
-    let mut listener_out: Vec<ListenerOutput> = Vec::new();
+    let mut listener: Option<(ProtoListener, flume::Sender<Socket>)> = None;
+    let mut listener_out: Vec<ListenerEvent> = Vec::new();
     let mut cmd_rx_closed = false;
     let mux_io = match batch::BatchIo::new(&socket) {
         Ok(io) => io,
@@ -579,7 +715,7 @@ async fn run_endpoint_mux(
     loop {
         // Prune stale listener (Listener struct was dropped by the caller).
         if let Some((_, accept_tx)) = &listener
-            && accept_tx.is_closed()
+            && accept_tx.is_disconnected()
         {
             listener = None;
         }
@@ -600,7 +736,7 @@ async fn run_endpoint_mux(
                     }
                     Some(MuxCmd::StartListener { accept_tx, secret, socket_id }) => {
                         listener = Some((
-                            ListenerState::new(socket_id, cfg.mss, now_us(), secret, cfg.congestion),
+                            ProtoListener::new(socket_id, cfg.mss, now_us(), secret, cfg.congestion),
                             accept_tx,
                         ));
                     }
@@ -669,13 +805,13 @@ async fn run_endpoint_mux(
 
                         for item in listener_out.drain(..) {
                             match item {
-                                ListenerOutput::SendTo { data, .. } => {
+                                ListenerEvent::SendTo { data, .. } => {
                                     let _ = socket.send_to(&data, from).await;
                                 }
-                                ListenerOutput::Accept(conn, _pa) => {
+                                ListenerEvent::Accept(conn, _pa) => {
                                     let (datagram_tx, datagram_rx) = mpsc::channel::<Bytes>(256);
                                     let (send_tx, send_rx) = mpsc::channel::<SendReq>(256);
-                                    let (recv_tx, recv_rx) = mpsc::channel::<Bytes>(256);
+                                    let (recv_tx, recv_rx) = flume::bounded::<Bytes>(256);
                                     routes.insert(from, datagram_tx);
                                     tokio::spawn(run_conn_driver(
                                         Arc::clone(&socket),
@@ -692,7 +828,7 @@ async fn run_endpoint_mux(
                                         peer_addr: from,
                                         local_addr,
                                     };
-                                    if accept_tx.send(sock).await.is_err() {
+                                    if accept_tx.send_async(sock).await.is_err() {
                                         listener_died = true;
                                         break;
                                     }
@@ -723,10 +859,10 @@ async fn run_conn_driver(
     peer_addr: SocketAddr,
     mut datagram_rx: Option<mpsc::Receiver<Bytes>>,
     mut send_rx: mpsc::Receiver<SendReq>,
-    recv_tx: mpsc::Sender<Bytes>,
+    recv_tx: flume::Sender<Bytes>,
     mut connected_tx: Option<oneshot::Sender<()>>,
 ) {
-    let mut out: Vec<Output> = Vec::new();
+    let mut out: Vec<Event> = Vec::new();
     // Batched IO. On platforms without segmentation offload this degrades to
     // one datagram per call, i.e. exactly the previous behaviour.
     let mut io = match batch::BatchIo::new(&socket) {
@@ -755,17 +891,17 @@ async fn run_conn_driver(
             for item in std::mem::take(&mut out) {
                 // Anything that is not a datagram ends the current run: flush
                 // first so ordering against the other side effects is preserved.
-                if !matches!(item, Output::SendDatagram(_)) && !pending.is_empty() {
+                if !matches!(item, Event::SendDatagram(_)) && !pending.is_empty() {
                     let _ = io.send_all(&socket, peer_addr, &pending).await;
                     pending.clear();
                 }
                 match item {
-                    Output::SendDatagram(bytes) => {
+                    Event::SendDatagram(bytes) => {
                         pending.push(bytes);
                     }
-                    Output::DataReady => {
+                    Event::DataReady => {
                         while let Some(msg) = conn.recv_msg() {
-                            if recv_tx.send(msg).await.is_err() {
+                            if recv_tx.send_async(msg).await.is_err() {
                                 // Application dropped the recv half — shut down.
                                 conn.shutdown(now_us(), &mut out);
                                 done = true;
@@ -773,17 +909,17 @@ async fn run_conn_driver(
                             }
                         }
                     }
-                    Output::Connected => {
+                    Event::Connected => {
                         if let Some(tx) = connected_tx.take() {
                             let _ = tx.send(());
                         }
                     }
-                    Output::Disconnected(reason) => {
+                    Event::Disconnected(reason) => {
                         if std::env::var_os("UDT_DEBUG").is_some() {
                             eprintln!(
                                 "[conn {}] disconnected: {reason:?} {:?}",
-                                conn.debug_state().socket_id,
-                                conn.debug_state(),
+                                conn.stats().socket_id,
+                                conn.stats(),
                             );
                         }
                         done = true;
@@ -795,7 +931,7 @@ async fn run_conn_driver(
         }
         // Flush any SendDatagrams that were queued after a Disconnected.
         for leftover in std::mem::take(&mut out) {
-            if let Output::SendDatagram(bytes) = leftover {
+            if let Event::SendDatagram(bytes) = leftover {
                 pending.push(bytes);
             }
         }
@@ -926,7 +1062,7 @@ fn debug_tick(conn: &Connection, tag: &str, blocked: &Option<BlockedSend>) {
     if std::env::var_os("UDT_DEBUG").is_none() {
         return;
     }
-    let st = conn.debug_state();
+    let st = conn.stats();
     // Only report connections with outstanding work; otherwise idle sockets
     // drown out the one that is actually stuck.
     let has_work = st.snd_in_flight > 0
@@ -947,7 +1083,7 @@ fn handle_send_req(
     pending_flush: &mut Option<oneshot::Sender<()>>,
     blocked: &mut Option<BlockedSend>,
     now_us: u64,
-    out: &mut Vec<Output>,
+    out: &mut Vec<Event>,
 ) {
     match req {
         Some(SendReq::Data { payload, ttl_ms, in_order }) => {
