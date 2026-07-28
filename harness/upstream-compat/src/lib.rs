@@ -78,7 +78,7 @@ mod tests {
 
         let accept = tokio::task::spawn_blocking(move || (listener.accept(), listener));
 
-        let rust_ep = Endpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let rust_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
         let client = tokio::time::timeout(T, rust_ep.connect(server_addr))
             .await
             .expect("rust connect timed out")
@@ -95,9 +95,9 @@ mod tests {
 
     /// Rust listener + upstream connector.
     async fn rust_listener_orig_connector() -> (Socket, Arc<udt_orig::Connection>, Keepalive) {
-        let ep = Endpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let server_addr = ep.local_addr().unwrap();
-        let mut listener = ep.listen(4).unwrap();
+        let ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = ep.local_addr();
+        let listener = ep.listen(4).unwrap();
 
         let connect = tokio::task::spawn_blocking(move || {
             let client_ep = udt_orig::Endpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -157,7 +157,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn upstream_connector_rust_listener_echo() {
-        let (mut server, client, _keep) = rust_listener_orig_connector().await;
+        let (server, client, _keep) = rust_listener_orig_connector().await;
         let payload = vec![0x37u8; 4096];
 
         let p = payload.clone();
@@ -222,7 +222,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn bulk_rust_to_upstream_verified() {
         let (server, client, _keep) = orig_listener_rust_connector().await;
-        let (_read_half, write) = client.into_split();
+        let write = std::sync::Arc::new(client);
         let write = Arc::new(write);
 
         let w = Arc::clone(&write);
@@ -254,7 +254,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn bulk_upstream_to_rust_verified() {
-        let (mut server, client, _keep) = rust_listener_orig_connector().await;
+        let (server, client, _keep) = rust_listener_orig_connector().await;
 
         let sender = tokio::task::spawn_blocking(move || {
             for i in 0..BULK_MSGS {
@@ -302,7 +302,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn message_boundaries_rust_to_upstream() {
         let (server, client, _keep) = orig_listener_rust_connector().await;
-        let (_read_half, write) = client.into_split();
+        let write = std::sync::Arc::new(client);
         let write = Arc::new(write);
 
         let w = Arc::clone(&write);
@@ -330,7 +330,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn message_boundaries_upstream_to_rust() {
-        let (mut server, client, _keep) = rust_listener_orig_connector().await;
+        let (server, client, _keep) = rust_listener_orig_connector().await;
 
         let sender = tokio::task::spawn_blocking(move || {
             for (i, &size) in BOUNDARY_SIZES.iter().enumerate() {
