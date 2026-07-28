@@ -595,3 +595,55 @@ fn a_hostile_handshake_cannot_ask_for_an_enormous_allocation() {
     // attempted. Whether the handshake is accepted is beside it.
     let _ = conn.stats();
 }
+
+/// A listener must not hand out two connections to one peer.
+///
+/// The handshake is stateless — the cookie is recomputed rather than
+/// remembered, so nobody can grow the listener's memory by spraying opening
+/// handshakes from spoofed addresses. But that means a peer retransmitting its
+/// reply is still presenting a cookie that verifies, and the "already accepted"
+/// check has to come first or every lost response costs a duplicate
+/// connection.
+#[test]
+fn a_repeated_handshake_reply_does_not_accept_twice() {
+    use udt_proto::{Listener, ListenerEvent, PeerAddr};
+
+    let mut listener = Listener::new(1, 1500, 0, 0x1234_5678, CcKind::Udt);
+    let peer = PeerAddr::from_v4([127, 0, 0, 1], 5000);
+    let mut client = Connection::new_active(9, SeqNo::new(4242), 1500, 0, CcKind::Udt);
+    let mut client_events = Vec::new();
+    let mut listener_events = Vec::new();
+    let mut now = 1_000_000u64;
+    let mut accepts = 0;
+
+    // Drive the exchange, replaying every datagram the client sends twice so
+    // the listener sees each stage of the handshake more than once.
+    for _ in 0..40 {
+        now += 10_000;
+        client.on_timer(now, &mut client_events);
+        let to_listener: Vec<_> = client_events
+            .drain(..)
+            .filter_map(|e| match e {
+                Event::SendDatagram(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+
+        for datagram in to_listener {
+            for _ in 0..2 {
+                listener.on_datagram(peer.clone(), datagram.clone(), now, &mut listener_events);
+                for event in listener_events.drain(..) {
+                    match event {
+                        ListenerEvent::SendTo { data, .. } => {
+                            client.on_datagram(data, now, &mut client_events);
+                        }
+                        ListenerEvent::Accept(..) => accepts += 1,
+                    }
+                }
+            }
+        }
+        client_events.clear();
+    }
+
+    assert_eq!(accepts, 1, "the listener accepted the same peer {accepts} times");
+}

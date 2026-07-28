@@ -6,7 +6,17 @@ use crate::connection::Connection;
 use crate::handshake::{Handshake, SOCK_DGRAM, UDT_VERSION, req_type};
 use crate::seq::SeqNo;
 use bytes::{Bytes, BytesMut};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+
+/// How long a completed handshake is remembered.
+///
+/// Long enough to outlive any cookie a peer could still be echoing, which is
+/// what stops a retransmitted handshake being mistaken for a new one.
+const ACCEPT_MEMORY_US: u64 = 150_000_000;
+
+/// Backstop on remembered handshakes, for a flood arriving faster than entries
+/// age out.
+const MAX_REMEMBERED_ACCEPTS: usize = 4096;
 
 /// A peer's address, in whatever form the IO layer uses.
 ///
@@ -48,11 +58,6 @@ pub enum ListenerEvent {
     Accept(Box<Connection>, PeerAddr),
 }
 
-struct PendingConn {
-    cookie: i32,
-    their_hs: Handshake, // their initial req_type=1 handshake
-}
-
 /// Answers handshakes on one address, producing a [`Connection`] per peer.
 ///
 /// The listener owns no socket of its own: feed it every datagram that arrives
@@ -64,10 +69,16 @@ pub struct Listener {
     /// Controller built fresh for each accepted connection.
     cc: CcKind,
     flight_flag_size: i32,
-    /// Pending connections awaiting the req_type=-1 echo (cookie challenge stage).
-    pending: HashMap<PeerAddr, PendingConn>,
-    /// Already-accepted connections (we resend our response if they retransmit).
-    accepted: HashMap<PeerAddr, Handshake>, // peer addr → our final response hs
+    /// Peers whose handshake completed, and the response to repeat if they
+    /// ask again because ours went missing.
+    ///
+    /// Bounded, and evicted oldest-first. Nothing here is required for
+    /// correctness — a peer that retransmits after eviction simply redoes the
+    /// cookie exchange — so a cap costs nothing and keeps a long-lived
+    /// listener from growing one entry per connection it has ever seen.
+    accepted: HashMap<PeerAddr, (u64, Handshake)>,
+    /// Insertion order for `accepted`, for eviction.
+    accepted_order: VecDeque<PeerAddr>,
     /// Secret for cookie generation (random at listener creation).
     secret: u64,
     enc: BytesMut,
@@ -87,8 +98,8 @@ impl Listener {
             mss,
             cc,
             flight_flag_size: 25600,
-            pending: HashMap::new(),
             accepted: HashMap::new(),
+            accepted_order: VecDeque::new(),
             secret,
             enc: BytesMut::with_capacity(mss as usize),
         }
@@ -137,19 +148,36 @@ impl Listener {
                 cookie,
                 peer_ip: [0u32; 4],
             };
-            self.pending.insert(addr.clone(), PendingConn { cookie, their_hs: hs.clone() });
+            // Nothing is recorded here on purpose. The cookie is derived from
+            // the address, the minute and our secret, so it can be checked
+            // again from scratch when the peer echoes it -- which is the point
+            // of a cookie. Remembering every address that has sent us an
+            // opening handshake would let anyone grow this listener's memory
+            // by spraying packets from spoofed sources, for free.
             self.enc.clear();
             codec::encode_handshake(&resp, ts, hs.socket_id as u32, &mut self.enc);
             out.push(ListenerEvent::SendTo { addr, data: self.enc.clone().freeze() });
         } else if hs.req_type == req_type::RESPONSE {
-            // Step 2: Cookie verification + accept
-            let pending_info = self.pending.get(&addr).map(|p| (p.cookie, p.their_hs.clone()));
-            if let Some((stored_cookie, _their_hs)) = pending_info {
-                let prev_cookie = self.compute_cookie(&addr, now_us.saturating_sub(60_000_000));
-                let valid = hs.cookie == stored_cookie || hs.cookie == prev_cookie;
-                if !valid {
-                    return;
-                }
+            // Step 2: cookie verification + accept.
+            //
+            // A peer we have already accepted gets its response repeated and
+            // nothing more. This has to come first: the cookie it is echoing is
+            // still valid, so falling through would hand out a second
+            // connection for the same peer every time our response went
+            // missing.
+            if let Some((_, saved_resp)) = self.accepted.get(&addr).cloned() {
+                self.enc.clear();
+                codec::encode_handshake(&saved_resp, ts, hs.socket_id as u32, &mut self.enc);
+                out.push(ListenerEvent::SendTo { addr, data: self.enc.clone().freeze() });
+                return;
+            }
+
+            // Recomputed rather than looked up. The previous minute is accepted
+            // too, so a handshake that straddles the boundary is not rejected.
+            let cookie = self.compute_cookie(&addr, now_us);
+            let prev_cookie = self.compute_cookie(&addr, now_us.saturating_sub(60_000_000));
+            if hs.cookie == cookie || hs.cookie == prev_cookie {
+                let stored_cookie = hs.cookie;
                 // C++ server sets m_iISN = hs->m_iISN (client's ISN) and echoes it
                 // back in the final response. The C++ client security check verifies
                 // m_iISN == m_ConnRes.m_iISN, so we must echo the client's ISN here.
@@ -181,8 +209,7 @@ impl Listener {
                     self.cc.build(),
                 );
 
-                self.pending.remove(&addr);
-                self.accepted.insert(addr.clone(), our_resp.clone());
+                self.remember_accepted(addr.clone(), our_resp.clone(), now_us);
 
                 self.enc.clear();
                 codec::encode_handshake(&our_resp, ts, hs.socket_id as u32, &mut self.enc);
@@ -191,11 +218,32 @@ impl Listener {
                     data: self.enc.clone().freeze(),
                 });
                 out.push(ListenerEvent::Accept(Box::new(conn), addr));
-            } else if let Some(saved_resp) = self.accepted.get(&addr).cloned() {
-                // Duplicate req_type=-1: peer missed our response — resend it
-                self.enc.clear();
-                codec::encode_handshake(&saved_resp, ts, hs.socket_id as u32, &mut self.enc);
-                out.push(ListenerEvent::SendTo { addr, data: self.enc.clone().freeze() });
+            }
+        }
+    }
+
+    /// Record the response sent to `addr`, and retire entries that no peer can
+    /// still be echoing a valid cookie for.
+    ///
+    /// Time-based rather than a plain size cap, because evicting a live entry
+    /// early is not free: the peer's cookie would still verify, and it would be
+    /// handed a second connection. Cookies stop verifying after two minutes, so
+    /// nothing older than that can cause it. The count cap is a backstop
+    /// against a flood arriving faster than entries age out.
+    fn remember_accepted(&mut self, addr: PeerAddr, resp: Handshake, now_us: u64) {
+        if self.accepted.insert(addr.clone(), (now_us, resp)).is_none() {
+            self.accepted_order.push_back(addr);
+        }
+        while let Some(oldest) = self.accepted_order.front() {
+            let expired = self
+                .accepted
+                .get(oldest)
+                .is_none_or(|(t, _)| now_us.saturating_sub(*t) > ACCEPT_MEMORY_US);
+            if !expired && self.accepted_order.len() <= MAX_REMEMBERED_ACCEPTS {
+                break;
+            }
+            if let Some(oldest) = self.accepted_order.pop_front() {
+                self.accepted.remove(&oldest);
             }
         }
     }
