@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod relay;
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
