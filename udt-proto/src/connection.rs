@@ -56,7 +56,32 @@ const SYN_US: u32 = 10_000;
 const LIGHT_ACK_INTERVAL: u32 = 64;
 const EXP_MAX: u32 = 16;
 /// Per-count minimum EXP interval (µs).  Mirrors C++ `m_ullMinExpInt = 300 000 µs`.
-const MIN_EXP_PER_COUNT_US: u64 = 300_000;
+/// Expiries spent probing the tail before assuming the whole window is lost.
+///
+/// The escalation is really "has the peer stopped hearing us at all", and
+/// `exp_count` is the only measure of that available -- it resets on any packet
+/// from the peer. With the interval floored at one control period, one expiry
+/// is 10 ms, so a single one is far too little to conclude that.
+const PROBE_EXPIRIES: u32 = 3;
+
+/// Floor on each expiry interval, in microseconds.
+///
+/// A minimum exists so that a noisy round-trip estimate cannot drive the timer
+/// down to nothing. It is *not* meant to set the pace on a short path -- the
+/// RTT-derived term already does that -- but the reference's flat 300 ms
+/// dominates it on anything under a 290 ms round trip, which is very nearly
+/// every path.
+///
+/// That matters because this timer is what recovers a lost tail. A gap in the
+/// middle of the stream is repaired by the NAK the next packet triggers, but
+/// when the loss is the last packet there is no next packet, and nothing moves
+/// until this fires. Measured on loopback with eight connections saturating the
+/// socket buffer, roughly one connection in four hit that and finished 300 or
+/// 600 ms late while its peers took 55 ms, dragging the aggregate down tenfold.
+///
+/// One control interval is the floor now: below that the protocol cannot react
+/// anyway, and above it the RTT term takes over.
+const MIN_EXP_PER_COUNT_US: u64 = SYN_US as u64;
 /// Largest round-trip time a peer may report, in microseconds.
 ///
 /// Ten seconds is far beyond any working path, and the value drives the
@@ -633,11 +658,41 @@ impl Connection {
             // Mirrors C++ checkTimers().
             if !self.snd_buf_is_empty() {
                 if self.snd_curr_seq.next() != self.snd_last_ack && self.snd_loss.is_empty() {
-                    self.snd_loss.insert(self.snd_last_ack, self.snd_curr_seq);
+                    if self.exp_count <= PROBE_EXPIRIES {
+                        // First expiry since the last forward progress: resend
+                        // only the final packet, to ask the peer where it is.
+                        //
+                        // Almost always the reason nothing is moving is that
+                        // the tail was lost -- a gap anywhere else is repaired
+                        // by the NAK the following packet triggers, and only
+                        // the last packet has nothing following it. One probe
+                        // draws out an acknowledgement or a NAK, and ordinary
+                        // recovery takes it from there.
+                        //
+                        // Assuming the whole window is lost instead costs real
+                        // traffic: at 5% loss that put 6037 packets on the wire
+                        // for 3.2 MB where 2500 sufficed.
+                        self.snd_loss.insert(self.snd_curr_seq, self.snd_curr_seq);
+                    } else {
+                        // Still nothing after a second expiry, so the peer has
+                        // genuinely stopped hearing us: resend everything.
+                        self.snd_loss.insert(self.snd_last_ack, self.snd_curr_seq);
+                    }
                 }
-                let ctx = self.cc_ctx(now_us);
-                let o = self.cc.on_timeout(ctx);
-                self.apply_cc(o);
+                // A probe is not a congestion signal.
+                //
+                // `on_timeout` collapses the window, and while the tail is
+                // merely being probed there is no evidence the path is
+                // congested -- one packet went missing and we are asking about
+                // it. Treating every probe as congestion costs real recovery
+                // speed now that expiries are 10 ms apart rather than 300: it
+                // measured 15% slower under 5% loss. RFC 8985 draws the same
+                // line for TCP's tail loss probe.
+                if self.exp_count > PROBE_EXPIRIES {
+                    let ctx = self.cc_ctx(now_us);
+                    let o = self.cc.on_timeout(ctx);
+                    self.apply_cc(o);
+                }
                 // Restart transmission immediately rather than waiting a tick.
                 self.next_snd_us = self.next_snd_us.min(now_us);
             } else {

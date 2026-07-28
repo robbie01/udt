@@ -904,14 +904,24 @@ mod tests {
                     }
                     let _held = sender.await.unwrap();
                     let _keep = (ea, eb);
-                    got
+                    (got, start.elapsed().as_secs_f64())
                 })
             })
             .collect();
 
         let mut total = 0usize;
+        let mut per_conn = Vec::new();
         for t in tasks {
-            total += t.await.unwrap();
+            let (got, secs) = t.await.unwrap();
+            total += got;
+            per_conn.push(secs);
+        }
+        // One connection finishing far after the rest drags the aggregate down
+        // by the whole factor, so report the spread when asked.
+        if std::env::var_os("UDT_PERCONN").is_some() {
+            per_conn.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let each: Vec<String> = per_conn.iter().map(|s| format!("{:.2}", s * 1e3)).collect();
+            eprintln!("    per-conn ms: {}", each.join(" "));
         }
         total as f64 / 1e6 / start.elapsed().as_secs_f64()
     }
