@@ -1139,10 +1139,6 @@ impl Connection {
                 let sample = full.bandwidth_pps as u32;
                 self.bandwidth_pps = (self.bandwidth_pps / 8) * 7 + sample / 8;
             }
-            let ctx = self.cc_ctx_ex(now_us, self.delivery_rate_pps, self.bandwidth_pps);
-            let o = self.cc.on_ack(ack_seq, ctx);
-            self.apply_cc(o);
-
             // Answer every full ACK with an ACK2, promptly.
             //
             // The peer derives its entire RTT estimate from the round trip of
@@ -1160,8 +1156,27 @@ impl Connection {
             self.snd_last_ack2_us = now_us;
             tx.push(|dst| codec::encode_ack2(asn, self.ts(now_us), self.peer_id, dst));
         }
-        // A light ACK carries only the acknowledgement point: it advances the
-        // send buffer (below) but triggers no RTT, CC or ACK2 processing.
+
+        // Congestion control sees *every* acknowledgement, light ones included.
+        //
+        // Only full ACKs used to reach it, and those fire on a 10 ms timer, so
+        // the window could not open until 10 ms after the first byte went out
+        // however fast the path was. A connection began by sending its initial
+        // window -- 16 packets, 23 KB -- and then stalling for a whole SYN
+        // interval. Measured against the C++ reference on loopback, that was
+        // an 11 ms fixed cost on every transfer: identical steady-state rates,
+        // but a 0.4 MB transfer took 15 ms against their 3.8.
+        //
+        // Light ACKs arrive every 64 packets, which is the same "acknowledge
+        // often enough to keep the window opening" role that acking every
+        // other segment plays in TCP slow start. They carry the acknowledgement
+        // point, which is all the controller needs; the RTT and rate estimates
+        // it also reads keep their values from the last full ACK.
+        if adv > 0 {
+            let ctx = self.cc_ctx_ex(now_us, self.delivery_rate_pps, self.bandwidth_pps);
+            let o = self.cc.on_ack(ack_seq, ctx);
+            self.apply_cc(o);
+        }
 
         if adv > 0 {
             self.snd_last_ack = ack_seq;

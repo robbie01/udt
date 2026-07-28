@@ -128,6 +128,7 @@ pub(crate) async fn run_shared(
             // then the datagrams to write -- all under one lock.
             let had_input = state.drain_inbox();
             if had_input {
+                state.run_due_timers(now_us());
                 state.absorb(&inner.shared);
             }
             (finish_pass(state, &mut scratch), had_input)
@@ -211,6 +212,7 @@ pub(crate) async fn run_owned(
                     let mut guard = lock(&inner.state);
                     let state = &mut *guard;
                     state.feed(inbound.drain(..));
+                    state.run_due_timers(now_us());
                     state.absorb(&inner.shared);
                     pass = finish_pass(state, &mut scratch);
                 }

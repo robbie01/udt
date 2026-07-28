@@ -200,6 +200,24 @@ impl State {
         true
     }
 
+    /// Run the protocol timers if any is already due.
+    ///
+    /// Worth doing straight after feeding in arrivals rather than waiting for
+    /// the driver's sleep to fire. Acknowledgements and the packets they
+    /// unblock both come out of `on_timer`, and a tokio sleep resolves at
+    /// millisecond granularity -- so on a path whose round trip is 0.1 ms that
+    /// put a millisecond of dead time in every feedback round, and slow start
+    /// opened its window ten times slower than the link allowed.
+    ///
+    /// Gated on the deadline rather than run unconditionally: at a million
+    /// packets a second the full timer path on every receive batch costs more
+    /// than it saves, measured at 24% on two connections.
+    pub(crate) fn run_due_timers(&mut self, now: u64) {
+        if self.conn.next_deadline_us().is_some_and(|due| due <= now) {
+            self.conn.on_timer(now, &mut self.out, &mut self.events);
+        }
+    }
+
     pub(crate) fn on_timer(&mut self, now: u64) {
         self.conn.on_timer(now, &mut self.out, &mut self.events);
     }
