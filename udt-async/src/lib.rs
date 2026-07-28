@@ -68,12 +68,19 @@
 #[cfg(feature = "tokio")]
 mod batch;
 #[cfg(feature = "tokio")]
-mod tokio_impl;
+mod conn;
+#[cfg(feature = "tokio")]
+mod driver;
+#[cfg(feature = "tokio")]
+mod endpoint;
+#[cfg(feature = "tokio")]
+mod util;
 
 #[cfg(feature = "tokio")]
-pub use tokio_impl::{
-    max_payload_for_mtu, Endpoint, EndpointConfig, Listener, SendOptions, Socket, DEFAULT_MTU,
-    MAX_PAYLOAD_SIZE,
+pub use conn::{SendOptions, Socket};
+#[cfg(feature = "tokio")]
+pub use endpoint::{
+    max_payload_for_mtu, Endpoint, EndpointConfig, Listener, DEFAULT_MTU, MAX_PAYLOAD_SIZE,
 };
 
 #[cfg(feature = "tokio")]

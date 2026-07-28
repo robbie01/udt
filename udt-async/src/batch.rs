@@ -27,8 +27,13 @@ use quinn_udp::{RecvMeta, Transmit, UdpSockRef, UdpSocketState};
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
 
-/// Datagrams received in one batch.
-pub(crate) const RECV_BATCH: usize = 32;
+/// Datagrams the platform can deliver from one receive call.
+///
+/// 32 where `recvmmsg` exists, 1 everywhere else. Taken from [`quinn_udp`]
+/// rather than guessed: asking for 32 on a platform that fills one means
+/// building 31 unused scatter-gather entries per call, which at several
+/// hundred thousand packets a second is not free.
+pub(crate) const RECV_BATCH: usize = quinn_udp::BATCH_SIZE;
 
 /// Upper bound on the scratch buffer used to coalesce a GSO run.
 const MAX_COALESCE_BYTES: usize = 64 * 1024;
@@ -157,15 +162,24 @@ impl BatchIo {
     ///
     /// Takes the backing buffers rather than `IoSliceMut`s so the caller is not
     /// left holding a borrow of them across the await, which would make the
-    /// received data unreadable in the same scope. The slice vector is rebuilt
-    /// per call — one small allocation amortised over a whole batch, against a
-    /// system call.
+    /// received data unreadable in the same scope.
     pub(crate) async fn recv_batch(
         &self,
         sock: &UdpSocket,
         storage: &mut [Vec<u8>],
         metas: &mut [RecvMeta],
     ) -> io::Result<usize> {
+        // The single-buffer case is the whole of macOS and Windows, and it is
+        // the one that runs per datagram rather than per batch — keep the
+        // scatter-gather list on the stack so the hot path never allocates.
+        if let [buf] = storage {
+            let mut bufs = [IoSliceMut::new(buf.as_mut_slice())];
+            return sock
+                .async_io(Interest::READABLE, || {
+                    self.state.recv(UdpSockRef::from(sock), &mut bufs, metas)
+                })
+                .await;
+        }
         let mut bufs: Vec<IoSliceMut<'_>> =
             storage.iter_mut().map(|b| IoSliceMut::new(b.as_mut_slice())).collect();
         sock.async_io(Interest::READABLE, || {
@@ -187,6 +201,10 @@ impl BatchIo {
         storage: &mut [Vec<u8>],
         metas: &mut [RecvMeta],
     ) -> io::Result<usize> {
+        if let [buf] = storage {
+            let mut bufs = [IoSliceMut::new(buf.as_mut_slice())];
+            return self.state.recv(UdpSockRef::from(sock), &mut bufs, metas);
+        }
         let mut bufs: Vec<IoSliceMut<'_>> =
             storage.iter_mut().map(|b| IoSliceMut::new(b.as_mut_slice())).collect();
         self.state.recv(UdpSockRef::from(sock), &mut bufs, metas)
