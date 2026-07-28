@@ -7,7 +7,6 @@ exclude = ["fuzz"]
 members = [
     "udt-proto",
     "udt-async",
-    "udt-compio",
     "tests/integration",
 ]
 
