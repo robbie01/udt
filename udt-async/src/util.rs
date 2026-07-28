@@ -4,7 +4,8 @@ use std::io;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::LazyLock;
+use std::time::Instant;
 
 use udt_proto::{DisconnectReason, PeerAddr};
 
@@ -26,8 +27,20 @@ pub(crate) fn next_socket_id() -> u32 {
     SOCKET_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Fixed point the protocol clock counts from.
+///
+/// Any origin will do, so this is just whenever the process first asked.
+static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Microseconds since this process started.
+///
+/// Monotonic by construction, which the protocol requires: round-trip
+/// estimation, the expiry timer and message TTLs all measure differences
+/// between two readings, and a wall clock stepped by NTP would corrupt every
+/// one of them. Costs the same as reading the wall clock — both are a vDSO
+/// `clock_gettime` — so the hot path is unaffected.
 pub(crate) fn now_us() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_micros() as u64
+    EPOCH.elapsed().as_micros() as u64
 }
 
 /// Lock a mutex, ignoring poisoning.

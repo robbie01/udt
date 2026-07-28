@@ -244,7 +244,10 @@ fn kick(inner: &ConnectionInner) {
 /// Periodic state dump, enabled by setting `UDT_DEBUG=1`. Compiled in but
 /// inert unless the variable is set.
 fn debug_tick(state: &State, tag: &str) {
-    if std::env::var_os("UDT_DEBUG").is_none() {
+    // Read once rather than on every tick of every connection.
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("UDT_DEBUG").is_some());
+    if !*ENABLED {
         return;
     }
     let stats = state.conn.stats();
