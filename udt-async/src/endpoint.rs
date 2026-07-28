@@ -4,17 +4,17 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use tokio::net::{ToSocketAddrs, UdpSocket};
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, Notify};
 use udt_proto::{CcKind, Connection, Listener as ProtoListener, ListenerEvent, SeqNo};
 
 use crate::batch::{self, BatchIo};
-use crate::conn::{closed_err, wait_established, ConnectionInner, Socket};
+use crate::conn::{wait_established, ConnectionInner, Socket};
 use crate::driver;
-use crate::util::{
+use crate::util::{Mutex, RwLock,
     configure_udp_buffers, lock, next_socket_id, now_us, outgoing_bind_addr, sockaddr_to_peer_addr,
 };
 
@@ -35,6 +35,14 @@ pub const fn max_payload_for_mtu(mtu: u32) -> usize {
     const FIXED_OVERHEAD: u32 = 48 + udt_proto::UDT_HEADER_SIZE as u32;
     if mtu <= FIXED_OVERHEAD { 0 } else { (mtu - FIXED_OVERHEAD) as usize }
 }
+
+/// Datagrams the reader may leave queued for one connection.
+///
+/// Deep enough that a driver briefly descheduled does not lose anything, and
+/// shallow enough that a connection which has genuinely stopped keeping up
+/// starts dropping rather than growing without bound — which is what an
+/// overrun kernel socket buffer does, and what UDT's loss recovery expects.
+const DATAGRAM_BACKLOG: usize = 1024;
 
 /// Datagrams the reader takes per wakeup before dispatching them.
 ///
@@ -111,7 +119,7 @@ struct EndpointInner {
     /// readers only ever look routes up, and taking a read lock lets several
     /// of them dispatch to different connections at once. Writes happen once
     /// per connection, at accept and at close.
-    routes: RwLock<HashMap<SocketAddr, Arc<ConnectionInner>>>,
+    routes: RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>,
     listener: Mutex<Option<ListenerSlot>>,
     /// False once the `Endpoint` handle is dropped. Readers keep serving
     /// existing connections after that, and stop when the last one goes.
@@ -291,15 +299,7 @@ impl Endpoint {
             self.inner.cfg.congestion,
         );
         let inner = ConnectionInner::new(conn);
-
-        // Routed before the driver starts, so no reply can arrive unrouted.
-        self.inner
-            .routes
-            .write()
-            .map_err(|_| closed_err())?
-            .insert(peer, Arc::clone(&inner));
-
-        spawn_shared_driver(&self.inner, Arc::clone(&inner), peer);
+        spawn_shared(&self.inner, &inner, peer);
 
         match wait_established(&inner).await {
             Ok(()) => Ok(Socket { inner, peer_addr: peer, local_addr: self.inner.local_addr }),
@@ -356,10 +356,22 @@ async fn resolve(addr: impl ToSocketAddrs) -> io::Result<SocketAddr> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no address to connect to"))
 }
 
-fn spawn_shared_driver(ep: &Arc<EndpointInner>, inner: Arc<ConnectionInner>, peer: SocketAddr) {
+/// Route `peer` to a new connection and start driving it.
+///
+/// The channel is registered before the driver starts so that no reply can
+/// arrive unrouted.
+fn spawn_shared(ep: &Arc<EndpointInner>, inner: &Arc<ConnectionInner>, peer: SocketAddr) {
+    let (datagram_tx, datagram_rx) = mpsc::channel::<Bytes>(DATAGRAM_BACKLOG);
+    let Ok(mut routes) = ep.routes.write() else { return };
+    routes.insert(peer, datagram_tx);
+    drop(routes);
+
     let socket = Arc::clone(&ep.socket);
+    let inner = Arc::clone(inner);
     let ep = Arc::clone(ep);
-    tokio::spawn(driver::run_shared(inner, socket, peer, move || ep.remove_route(peer)));
+    tokio::spawn(driver::run_shared(inner, socket, peer, datagram_rx, move || {
+        ep.remove_route(peer)
+    }));
 }
 
 // ── Reader tasks ──────────────────────────────────────────────────────────────
@@ -372,13 +384,11 @@ fn spawn_shared_driver(ep: &Arc<EndpointInner>, inner: Arc<ConnectionInner>, pee
 /// datagrams to a socket in order; two tasks reading the same socket would
 /// race to the connection and feed them out of order, which UDT reads as loss.
 /// Measured: four readers turned a 16 MB transfer that takes 0.08 s into one
-/// that never finished, the receiver stuck retransmitting a perpetual one-packet
-/// gap.
+/// that never finished, the receiver stuck retransmitting a perpetual
+/// one-packet gap.
 ///
-/// So the reader does as little as possible. It routes by peer address and
-/// appends to that connection's inbox, and the connection's own driver does
-/// the protocol work — which is the part worth parallelising, and the part
-/// that stays off this task's critical path.
+/// So the reader does as little as possible — route by peer address, forward,
+/// and let each connection's own driver do the protocol work.
 async fn run_reader(ep: Arc<EndpointInner>) {
     let Ok(io) = BatchIo::new(&ep.socket) else { return };
     let (mut storage, mut metas) = batch::recv_buffers(&io);
@@ -388,7 +398,7 @@ async fn run_reader(ep: Arc<EndpointInner>) {
     // hashing that grouping them into a map would cost.
     let mut run: Vec<Bytes> = Vec::new();
     let mut run_peer: Option<SocketAddr> = None;
-    let mut route: Option<Arc<ConnectionInner>> = None;
+    let mut route: Option<mpsc::Sender<Bytes>> = None;
     let mut unrouted: Vec<(SocketAddr, Bytes)> = Vec::new();
 
     loop {
@@ -450,23 +460,21 @@ async fn run_reader(ep: Arc<EndpointInner>) {
 /// Hand one peer's run of datagrams to its connection.
 fn dispatch(
     peer: SocketAddr,
-    route: &Option<Arc<ConnectionInner>>,
+    route: &Option<mpsc::Sender<Bytes>>,
     run: &mut Vec<Bytes>,
     unrouted: &mut Vec<(SocketAddr, Bytes)>,
 ) {
     match route {
-        Some(conn) => {
-            let wake = {
-                let mut state = lock(&conn.state);
-                let mut wake = false;
-                for datagram in run.drain(..) {
-                    wake |= state.deliver(datagram);
+        Some(tx) => {
+            // Never block: this task serves every connection on the port, so
+            // waiting on one that has stopped keeping up would stall all the
+            // others. A full channel drops, as a full socket buffer would.
+            for datagram in run.drain(..) {
+                if tx.try_send(datagram).is_err() {
+                    break;
                 }
-                wake
-            };
-            if wake {
-                conn.shared.driver.notify_one();
             }
+            run.clear();
         }
         None => {
             // Unknown source: only a handshake can be legitimate. The rest of
@@ -501,11 +509,7 @@ async fn handle_handshake(ep: &Arc<EndpointInner>, from: SocketAddr, datagram: B
             }
             ListenerEvent::Accept(conn, _) => {
                 let inner = ConnectionInner::new(*conn);
-                {
-                    let Ok(mut routes) = ep.routes.write() else { return };
-                    routes.insert(from, Arc::clone(&inner));
-                }
-                spawn_shared_driver(ep, Arc::clone(&inner), from);
+                spawn_shared(ep, &inner, from);
 
                 let socket =
                     Socket { inner, peer_addr: from, local_addr: ep.local_addr };

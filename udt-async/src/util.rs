@@ -3,8 +3,8 @@
 use std::io;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, MutexGuard};
 use std::sync::LazyLock;
+pub(crate) use std::sync::{Mutex, MutexGuard, RwLock};
 use std::time::Instant;
 
 use udt_proto::{DisconnectReason, PeerAddr};
@@ -43,12 +43,15 @@ pub(crate) fn now_us() -> u64 {
     EPOCH.elapsed().as_micros() as u64
 }
 
-/// Lock a mutex, ignoring poisoning.
+/// Lock a connection or endpoint mutex, ignoring poisoning.
 ///
 /// A panic while holding one of these leaves protocol state mid-update, which
 /// no caller can do anything useful about. Propagating the poison would turn
 /// one panicking task into a panic in every task touching the connection, so
 /// take the data and let the connection fail on its own terms instead.
+///
+/// `parking_lot` was measured here and made no difference — these sections are
+/// short and rarely contended, so spinning buys nothing.
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }

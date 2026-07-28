@@ -17,14 +17,14 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::Notify;
 use udt_proto::{Connection, DisconnectReason, Event, SendOutcome};
 
-use crate::util::{closed, disconnect_err, lock, now_us};
+use crate::util::{disconnect_err, lock, now_us, Mutex};
 
 /// Readiness signals for one connection.
 ///
@@ -64,20 +64,8 @@ impl Shared {
     }
 }
 
-/// Datagrams an endpoint reader may leave queued for one connection before it
-/// starts discarding them.
-///
-/// Reaching this means the connection's driver has fallen a whole receive
-/// buffer behind, which flow control should have prevented. Discarding from
-/// here on is what an overrun kernel socket buffer does, and UDT recovers from
-/// it the same way.
-const INBOX_LIMIT: usize = 8192;
-
 pub(crate) struct State {
     pub(crate) conn: Connection,
-    /// Datagrams delivered by an endpoint reader and not yet fed to the state
-    /// machine. Unused by connections that own their socket.
-    pub(crate) inbox: Vec<Bytes>,
     /// Datagrams the state machine has produced and nobody has written yet.
     pub(crate) out: Vec<Bytes>,
     /// Scratch for [`Event`]s. Owned by the state so it keeps its capacity
@@ -98,7 +86,6 @@ impl ConnectionInner {
         Arc::new(ConnectionInner {
             state: Mutex::new(State {
                 conn,
-                inbox: Vec::new(),
                 out: Vec::new(),
                 events: Vec::new(),
                 error: None,
@@ -162,32 +149,6 @@ impl State {
         }
     }
 
-    /// Queue a datagram for the driver to feed to the state machine.
-    ///
-    /// Returns whether the driver needs waking. The datagram is not processed
-    /// here: an endpoint reader serves every connection on its port, so doing
-    /// protocol work inline would serialise them all behind one task.
-    pub(crate) fn deliver(&mut self, datagram: Bytes) -> bool {
-        if self.inbox.len() >= INBOX_LIMIT {
-            return false;
-        }
-        self.inbox.push(datagram);
-        self.inbox.len() == 1
-    }
-
-    /// Feed everything an endpoint reader has queued to the state machine.
-    pub(crate) fn drain_inbox(&mut self) -> bool {
-        if self.inbox.is_empty() {
-            return false;
-        }
-        // Taken out so the state machine can borrow the rest of `self`, then
-        // put back so the vector keeps its capacity. No reader can refill it
-        // meanwhile — that needs the lock this method is called under.
-        let mut inbox = std::mem::take(&mut self.inbox);
-        self.feed(inbox.drain(..));
-        self.inbox = inbox;
-        true
-    }
 
     pub(crate) fn on_timer(&mut self, now: u64) {
         self.conn.on_timer(now, &mut self.events);
@@ -541,7 +502,3 @@ pub(crate) fn fail(inner: &ConnectionInner, reason: DisconnectReason) {
     inner.shared.established.notify_waiters();
 }
 
-/// Map a closed connection to an error for callers outside `Socket`.
-pub(crate) fn closed_err() -> io::Error {
-    closed()
-}

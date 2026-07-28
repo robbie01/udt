@@ -7,10 +7,9 @@
 //! * [`Endpoint::connect`] gives each connection its own kernel socket, so its
 //!   driver reads that socket itself.
 //! * Accepted and rendezvous connections share the endpoint's bound port, so
-//!   the endpoint's reader reads on their behalf and leaves datagrams in the
-//!   connection's inbox. The driver picks them up from there, which keeps the
-//!   protocol work for each connection on its own task. See
-//!   [`crate::endpoint`].
+//!   the endpoint's reader reads on their behalf and forwards datagrams over a
+//!   channel. The driver selects on that channel, which keeps each
+//!   connection's protocol work on its own task. See [`crate::endpoint`].
 //!
 //! [`Endpoint::connect`]: crate::Endpoint::connect
 
@@ -20,6 +19,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio::net::UdpSocket;
 use udt_proto::DisconnectReason;
+
+use tokio::sync::mpsc;
 
 use crate::batch::{self, BatchIo};
 use crate::conn::{ConnectionInner, State};
@@ -104,6 +105,7 @@ pub(crate) async fn run_shared(
     inner: Arc<ConnectionInner>,
     socket: Arc<UdpSocket>,
     peer: SocketAddr,
+    mut datagrams: mpsc::Receiver<Bytes>,
     on_exit: impl FnOnce(),
 ) {
     let Ok(mut io) = BatchIo::new(&socket) else {
@@ -112,44 +114,54 @@ pub(crate) async fn run_shared(
         return;
     };
     let mut scratch = Vec::new();
+    let mut inbound: Vec<Bytes> = Vec::new();
     kick(&inner);
+    let mut pass = take_pass(&inner, &mut scratch);
 
     loop {
-        // Registered before any state is examined, so a datagram or a send
-        // arriving in between still wakes this task rather than leaving it to
-        // wait for the timer.
+        // Registered before any state is examined, so a send arriving in
+        // between still wakes this task rather than leaving it to wait for the
+        // timer.
         let notified = inner.shared.driver.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-
-        let (pass, had_input) = {
-            let mut guard = lock(&inner.state);
-            let state = &mut *guard;
-            // Whatever the endpoint reader left for us, then whatever that
-            // produced, then the datagrams to write — all under one lock.
-            let had_input = state.drain_inbox();
-            if had_input {
-                state.absorb(&inner.shared);
-            }
-            (finish_pass(state, &mut scratch), had_input)
-        };
-        if had_input {
-            // Acknowledgements may have freed send-buffer space.
-            inner.shared.wake_writers();
-        }
 
         if write_out(&mut io, &socket, peer, &mut scratch).await || pass.finished {
             break;
         }
 
         tokio::select! {
-            _ = notified => {}
+            first = datagrams.recv() => {
+                let Some(first) = first else { break };
+                inbound.push(first);
+                // Take whatever else the reader has already queued, so a busy
+                // connection costs one wakeup per batch rather than per packet.
+                while inbound.len() < RECV_DRAIN_CAP {
+                    match datagrams.try_recv() {
+                        Ok(datagram) => inbound.push(datagram),
+                        Err(_) => break,
+                    }
+                }
+                {
+                    let mut guard = lock(&inner.state);
+                    let state = &mut *guard;
+                    state.feed(inbound.drain(..));
+                    state.absorb(&inner.shared);
+                    pass = finish_pass(state, &mut scratch);
+                }
+                // Acknowledgements may have freed send-buffer space.
+                inner.shared.wake_writers();
+            }
+            _ = notified => {
+                pass = take_pass(&inner, &mut scratch);
+            }
             _ = tokio::time::sleep_until(pass.deadline) => {
                 let mut guard = lock(&inner.state);
                 let state = &mut *guard;
                 state.on_timer(now_us());
                 state.absorb(&inner.shared);
                 debug_tick(state, "shared");
+                pass = finish_pass(state, &mut scratch);
             }
         }
     }
