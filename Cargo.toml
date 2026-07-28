@@ -7,6 +7,7 @@ members = [
     "harness/cpp-interop",
     "harness/upstream-compat",
     "harness/quinn-bench",
+    "harness/tcp-bench",
 ]
 
 [workspace.package]

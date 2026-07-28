@@ -11,6 +11,7 @@ the library:
 | `cpp-interop/` | Rust ↔ C++ interop tests and the C++-baseline benchmarks. |
 | `upstream-compat/` | Rust ↔ *unmodified upstream* smoke tests, blocking mode only. |
 | `quinn-bench/` | Quinn loopback throughput, as an independent reference point. |
+| `tcp-bench/` | Kernel TCP loopback throughput — the ceiling to read UDT against. |
 
 ## Using it
 

@@ -1288,6 +1288,7 @@ name = "udt-async"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "quinn-udp",
  "rand 0.9.5",
  "socket2",
  "tokio",
