@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod livelock;
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
