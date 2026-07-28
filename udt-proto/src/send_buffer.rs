@@ -149,10 +149,24 @@ impl SendBuffer {
             return None;
         }
         let msg_no = b.msg_no;
+        let (first, last) = self.msg_bounds(off, msg_no);
+        for i in first..=last {
+            if let Some(p) = self.slots[(self.head + i) % self.capacity].as_mut() {
+                p.dropped = true;
+            }
+        }
+        // Consume the sequence numbers these blocks occupy.
+        self.sent = self.sent.max(last + 1);
+        Some((msg_no, first, last))
+    }
 
-        // A message is contiguous, so walk out in both directions. Walking back
-        // matters: if part of the message was already sent, those blocks must be
-        // dropped too or they stay on the loss list forever.
+    /// The offsets a message spans, given any offset inside it.
+    ///
+    /// Messages occupy contiguous blocks, so this walks out in both directions.
+    /// Walking *back* matters: part of the message may already have been sent,
+    /// and those blocks have to be covered too or they sit on the loss list
+    /// forever.
+    fn msg_bounds(&self, off: usize, msg_no: MsgNo) -> (usize, usize) {
         let mut first = off;
         while first > 0 {
             match self.slots[(self.head + first - 1) % self.capacity].as_ref() {
@@ -167,14 +181,24 @@ impl SendBuffer {
                 _ => break,
             }
         }
-        for i in first..=last {
-            if let Some(p) = self.slots[(self.head + i) % self.capacity].as_mut() {
-                p.dropped = true;
-            }
+        (first, last)
+    }
+
+    /// The message at `off` if it has already been given up on.
+    ///
+    /// Lets the caller re-notify a peer that is still asking for a range which
+    /// was dropped, rather than leaving it waiting for packets that will never
+    /// be sent.
+    pub fn dropped_msg_at(&self, off: usize) -> Option<(MsgNo, usize, usize)> {
+        if off >= self.len {
+            return None;
         }
-        // Consume the sequence numbers these blocks occupy.
-        self.sent = self.sent.max(last + 1);
-        Some((msg_no, first, last))
+        let b = self.slots[(self.head + off) % self.capacity].as_ref()?;
+        if !b.dropped {
+            return None;
+        }
+        let (first, last) = self.msg_bounds(off, b.msg_no);
+        Some((b.msg_no, first, last))
     }
 
     /// Acknowledge `count` blocks (freeing them from the head of the buffer).

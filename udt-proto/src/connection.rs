@@ -1229,6 +1229,25 @@ impl Connection {
         true
     }
 
+    /// Re-announce a dropped message's range to a peer still asking for it.
+    ///
+    /// Returns whether anything was sent.
+    fn resend_msg_drop_at(&mut self, off: u32, now_us: u64, out: &mut Vec<Event>) -> bool {
+        let Some((msg_no, first_off, last_off)) =
+            self.snd_buf.as_ref().and_then(|b| b.dropped_msg_at(off as usize))
+        else {
+            return false;
+        };
+        let first = self.snd_last_ack.add(first_off as u32);
+        let last = self.snd_last_ack.add(last_off as u32);
+        self.snd_loss.remove_range(first, last);
+
+        self.enc.clear();
+        codec::encode_msg_drop(msg_no, first, last, self.ts(now_us), self.peer_id, &mut self.enc);
+        out.push(Event::SendDatagram(self.enc.clone().freeze()));
+        true
+    }
+
     /// Send a NAK for a single contiguous range, used for immediate loss
     /// reporting the moment a gap is spotted in the data stream.
     fn emit_nak_range(&mut self, start: SeqNo, end: SeqNo, now_us: u64, out: &mut Vec<Event>) {
@@ -1292,6 +1311,13 @@ impl Connection {
             // A retransmission is also a chance to notice the TTL has expired.
             if self.expire_msg_at(off as usize, now_us, out) {
                 continue; // dropped instead of resent; try the next loss entry
+            }
+            // Still being asked for a message that was already given up on,
+            // which means the peer never got the MsgDrop -- it is a single
+            // unacknowledged datagram, so any loss strands the receiver waiting
+            // for a range that will never be sent. Say it again.
+            if self.resend_msg_drop_at(off as u32, now_us, out) {
+                continue;
             }
             // Copy the fields out to release the borrow before calling self.ts().
             let block = self
