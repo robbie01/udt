@@ -76,14 +76,33 @@ impl EndpointConfig {
     /// Sets the path MTU, in bytes.
     ///
     /// This is the largest IP packet the network path can carry without
-    /// fragmenting. 1500 is right for ordinary Ethernet and the internet at
-    /// large; raise it to 9000 on a jumbo-frame network. Peers negotiate down
-    /// to the smaller of the two values during the handshake.
+    /// fragmenting. 1500 is the default and is right for ordinary Ethernet and
+    /// most of the internet; raise it to 9000 on a jumbo-frame network. Peers
+    /// negotiate down to the smaller of the two values during the handshake.
     ///
     /// [`max_payload_for_mtu`] gives the resulting largest single-packet
     /// message. Larger messages are split across packets automatically.
     ///
+    /// # When to lower it
+    ///
+    /// Some paths carry less than 1500 — tunnels, PPPoE, and IPv6 transition
+    /// mechanisms commonly cap at 1400 to 1492 — and they discard anything
+    /// larger without saying so. Since the handshake is small it still
+    /// succeeds, so the symptom is a connection that opens and then moves no
+    /// data.
+    ///
+    /// That case is detected rather than left to hang: sends fail with
+    /// [`ErrorKind::InvalidInput`] and a message saying as much. The fix is to
+    /// set this lower. 1400 clears the common cases and 1280 is the smallest
+    /// any IPv6 path may be, at a cost of a few percent more packets for the
+    /// same data.
+    ///
+    /// There is no automatic probing. UDT has no packet type for it, and
+    /// inventing one would break interoperability with other implementations.
+    ///
     /// Values below 64 bytes are raised to 64.
+    ///
+    /// [`ErrorKind::InvalidInput`]: std::io::ErrorKind::InvalidInput
     pub fn mtu(mut self, mtu: u32) -> Self {
         self.mss = mtu.max(64);
         self

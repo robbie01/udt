@@ -61,6 +61,13 @@ const LIGHT_ACK_INTERVAL: u32 = 64;
 const EXP_MAX: u32 = 16;
 /// Per-count minimum EXP interval (µs).  Mirrors C++ `m_ullMinExpInt = 300 000 µs`.
 const MIN_EXP_PER_COUNT_US: u64 = 300_000;
+/// Expiry firings with no data acknowledged before the path is declared
+/// unusable.
+///
+/// Firings are at least [`MIN_EXP_PER_COUNT_US`] apart, so this is a couple of
+/// seconds of the peer answering while nothing this side sends arrives.
+const BLACK_HOLE_EXP_COUNT: u32 = 8;
+
 /// After EXP_MAX expirations the connection is only torn down once it has been
 /// silent for this long in total (matches C++ `5 000 000 µs` guard).
 const EXP_HARD_TIMEOUT_US: u64 = 5_000_000;
@@ -139,6 +146,14 @@ pub enum DisconnectReason {
     PeerError,
     /// This side called [`Connection::shutdown`].
     LocalClose,
+    /// Nothing this side sent ever reached the peer, though the peer is
+    /// answering.
+    ///
+    /// Almost always the path cannot carry packets of the negotiated size:
+    /// control packets are small and get through, so the connection completes
+    /// its handshake, and then every full-size data packet is silently
+    /// discarded somewhere in the middle. Retry with a smaller MTU.
+    PathMtu,
 }
 
 /// Result of offering a message to [`Connection::send_msg`].
@@ -240,6 +255,15 @@ pub struct Connection {
     next_nak_us: u64,
     next_snd_us: u64,
     last_rsp_us: u64,
+    /// Expiry firings since the last time an acknowledgement moved forward.
+    ///
+    /// Distinct from `exp_count`, which any packet from the peer resets. A peer
+    /// whose keep-alives arrive while our data does not would hold `exp_count`
+    /// at 1 forever, so on its own it cannot notice a path that carries small
+    /// packets and drops large ones.
+    exp_without_progress: u32,
+    /// Whether the peer has ever acknowledged a single byte of data.
+    data_ever_acked: bool,
     /// When the last full ACK was emitted, for re-ACK rate limiting.
     last_ack_us: u64,
     exp_count: u32,
@@ -410,6 +434,8 @@ impl Connection {
             next_nak_us: now_us + SYN_US as u64 * 4,
             next_snd_us: now_us,
             last_rsp_us: now_us,
+            exp_without_progress: 0,
+            data_ever_acked: false,
             last_ack_us: now_us,
             exp_count: 1,
             snd_last_ack2: AckSeqNo::new(0),
@@ -587,6 +613,25 @@ impl Connection {
             {
                 self.state = ConnState::Closed;
                 out.push(Event::Disconnected(DisconnectReason::Timeout));
+                return;
+            }
+
+            if !self.snd_buf_is_empty() {
+                self.exp_without_progress += 1;
+            }
+
+            // A peer that answers while nothing we send arrives means the path
+            // carries small packets and drops large ones -- so the handshake
+            // completed and every data packet since has vanished. Without this
+            // the connection never fails: the peer's keep-alives keep resetting
+            // `exp_count`, so the hard timeout is never reached and the sender
+            // retransmits into the void indefinitely.
+            if self.exp_without_progress >= BLACK_HOLE_EXP_COUNT
+                && !self.data_ever_acked
+                && !self.snd_buf_is_empty()
+            {
+                self.state = ConnState::Closed;
+                out.push(Event::Disconnected(DisconnectReason::PathMtu));
                 return;
             }
 
@@ -1066,6 +1111,12 @@ impl Connection {
         }
 
         let adv = ack_seq.offset_from(self.snd_last_ack).max(0) as usize;
+        if adv > 0 {
+            // Real forward progress: whatever the path is doing, it is
+            // carrying our data.
+            self.exp_without_progress = 0;
+            self.data_ever_acked = true;
+        }
 
         if let Some(full) = &payload.full {
             let rtt = full.rtt_us;

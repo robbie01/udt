@@ -78,6 +78,11 @@ pub(crate) fn disconnect_err(reason: DisconnectReason) -> io::Error {
         DisconnectReason::Shutdown => {
             io::Error::new(io::ErrorKind::BrokenPipe, "connection closed by peer")
         }
+        DisconnectReason::PathMtu => io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no data reached the peer though it is responding; \
+             the path likely cannot carry packets this large -- retry with a smaller MTU",
+        ),
         DisconnectReason::LocalClose => closed(),
     }
 }

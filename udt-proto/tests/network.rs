@@ -52,11 +52,14 @@ struct LinkConfig {
     /// Extra delay drawn uniformly from `0..jitter_us`. Non-zero jitter
     /// reorders packets, since a later one can draw a shorter delay.
     jitter_us: u64,
+    /// Silently discard anything larger than this, modelling a path whose MTU
+    /// is smaller than the connection negotiated.
+    mtu_limit: Option<usize>,
 }
 
 impl LinkConfig {
     fn perfect() -> Self {
-        LinkConfig { loss: 0.0, duplicate: 0.0, delay_us: 100, jitter_us: 0 }
+        LinkConfig { loss: 0.0, duplicate: 0.0, delay_us: 100, jitter_us: 0, mtu_limit: None }
     }
 
     fn lossy(loss: f64) -> Self {
@@ -65,6 +68,11 @@ impl LinkConfig {
 
     fn reordering(jitter_us: u64) -> Self {
         LinkConfig { jitter_us, ..Self::perfect() }
+    }
+
+    /// A path that carries control packets but silently eats full-size data.
+    fn mtu_limited(limit: usize) -> Self {
+        LinkConfig { mtu_limit: Some(limit), ..Self::perfect() }
     }
 }
 
@@ -86,6 +94,10 @@ impl Link {
 
     fn send(&mut self, now: u64, datagram: bytes::Bytes) {
         self.sent += 1;
+        if self.cfg.mtu_limit.is_some_and(|limit| datagram.len() > limit) {
+            self.dropped += 1;
+            return;
+        }
         if self.rng.chance(self.cfg.loss) {
             self.dropped += 1;
             return;
@@ -646,4 +658,51 @@ fn a_repeated_handshake_reply_does_not_accept_twice() {
     }
 
     assert_eq!(accepts, 1, "the listener accepted the same peer {accepts} times");
+}
+
+/// A path that carries small packets and silently discards large ones used to
+/// hang the connection forever rather than failing it. The handshake is small,
+/// so it completes; every data packet then vanishes; and the peer's keep-alives
+/// keep resetting the expiry counter, so the hard timeout is never reached and
+/// the sender retransmits into the void indefinitely.
+#[test]
+fn a_path_that_cannot_carry_full_size_packets_is_reported() {
+    // Comfortably above a handshake, well below a full data packet.
+    let mut sim = Sim::new(LinkConfig::mtu_limited(200), 4);
+    sim.connect();
+
+    let payload = bytes::Bytes::from(message(0, 8192));
+    let mut events = Vec::new();
+    assert_eq!(sim.a.send_msg(payload, None, true, sim.now, &mut events), SendOutcome::Queued);
+    sim.events.append(&mut events);
+    sim.drain(Side::A);
+
+    for _ in 0..MAX_STEPS {
+        if sim.a.stats().connected {
+            if !sim.step() {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    assert!(
+        !sim.a.stats().connected,
+        "the connection is still up after {}us with nothing delivered",
+        sim.now
+    );
+    assert_eq!(sim.b_got.len(), 0, "something got through a link that drops everything large");
+}
+
+/// The same detection must not fire on a link that is merely slow and lossy,
+/// where data does eventually get through.
+#[test]
+fn a_slow_lossy_path_is_not_mistaken_for_an_unusable_one() {
+    let cfg = LinkConfig { loss: 0.20, delay_us: 50_000, ..LinkConfig::perfect() };
+    let mut sim = Sim::new(cfg, 8);
+    sim.connect();
+    sim.transfer(20, 8192, SendOpts::ordered());
+    assert_eq!(sim.b_got.len(), 20);
+    assert!(sim.a.stats().connected, "a working connection was declared unusable");
 }
