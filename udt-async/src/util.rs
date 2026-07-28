@@ -2,8 +2,8 @@
 
 use std::io;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 pub(crate) use std::sync::{Mutex, MutexGuard, RwLock};
 use std::time::Instant;
 

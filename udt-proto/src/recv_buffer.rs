@@ -1,6 +1,6 @@
-use bytes::{Bytes, BytesMut, BufMut};
-use crate::seq::{SeqNo, MsgNo};
 use crate::packet::MsgBoundary;
+use crate::seq::{MsgNo, SeqNo};
+use bytes::{BufMut, Bytes, BytesMut};
 
 /// Outcome of [`RecvBuffer::add`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -383,16 +383,21 @@ impl RecvBuffer {
     pub fn base_seq(&self) -> SeqNo {
         self.base_seq
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn seq(n: u32) -> SeqNo { SeqNo::new(n) }
-    fn msg(n: u32) -> MsgNo { MsgNo::new(n) }
-    fn bytes(b: &[u8]) -> Bytes { Bytes::copy_from_slice(b) }
+    fn seq(n: u32) -> SeqNo {
+        SeqNo::new(n)
+    }
+    fn msg(n: u32) -> MsgNo {
+        MsgNo::new(n)
+    }
+    fn bytes(b: &[u8]) -> Bytes {
+        Bytes::copy_from_slice(b)
+    }
 
     #[test]
     fn solo_message() {
@@ -423,7 +428,10 @@ mod tests {
     #[test]
     fn duplicate_ignored() {
         let mut buf = RecvBuffer::new(16, seq(0));
-        assert_eq!(buf.add(seq(0), bytes(b"a"), MsgBoundary::Solo, msg(0), true), AddResult::Stored);
+        assert_eq!(
+            buf.add(seq(0), bytes(b"a"), MsgBoundary::Solo, msg(0), true),
+            AddResult::Stored
+        );
         assert_eq!(
             buf.add(seq(0), bytes(b"b"), MsgBoundary::Solo, msg(0), true),
             AddResult::Duplicate,
@@ -465,7 +473,9 @@ mod tests {
         for i in 0u32..4 {
             buf.add(seq(100 + i), bytes(b"a"), MsgBoundary::Solo, msg(i), true);
         }
-        for _ in 0..4 { buf.read_msg().unwrap(); }
+        for _ in 0..4 {
+            buf.read_msg().unwrap();
+        }
         buf.reclaim();
 
         for i in 0u32..4 {
@@ -486,9 +496,9 @@ mod tests {
         buf.read_msg().unwrap();
         buf.reclaim();
 
-        buf.add(seq(1), bytes(b"X"), MsgBoundary::First,  msg(1), true);
+        buf.add(seq(1), bytes(b"X"), MsgBoundary::First, msg(1), true);
         buf.add(seq(2), bytes(b"Y"), MsgBoundary::Middle, msg(1), true);
-        buf.add(seq(3), bytes(b"Z"), MsgBoundary::Last,   msg(1), true);
+        buf.add(seq(3), bytes(b"Z"), MsgBoundary::Last, msg(1), true);
         assert_eq!(&buf.read_msg().unwrap()[..], b"XYZ");
     }
 

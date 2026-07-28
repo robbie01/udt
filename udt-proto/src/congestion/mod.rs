@@ -9,9 +9,9 @@
 //! stable — see the crate-level stability note.
 
 pub mod ledbat;
-pub mod udt_cc;
 #[cfg(test)]
 mod sim;
+pub mod udt_cc;
 
 use crate::seq::SeqNo;
 

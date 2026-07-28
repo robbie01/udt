@@ -3,17 +3,17 @@
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 
-use bytes::{Bytes, BytesMut};
+use crate::ack_window::AckWindow;
 use crate::codec;
 use crate::congestion::{CcContext, CcKind, CcOutput, CongestionControl};
-use crate::handshake::{req_type, Handshake, SOCK_DGRAM, UDT_VERSION};
+use crate::handshake::{Handshake, SOCK_DGRAM, UDT_VERSION, req_type};
 use crate::loss_list::{RcvLossList, SndLossList};
-use crate::ack_window::AckWindow;
-use crate::time_window::PktTimeWindow;
-use crate::send_buffer::SendBuffer;
-use crate::recv_buffer::{AddResult, RecvBuffer};
 use crate::packet::{AckFull, ControlBody, Packet};
-use crate::seq::{AckSeqNo, SeqNo, SEQ_MAX};
+use crate::recv_buffer::{AddResult, RecvBuffer};
+use crate::send_buffer::SendBuffer;
+use crate::seq::{AckSeqNo, SEQ_MAX, SeqNo};
+use crate::time_window::PktTimeWindow;
+use bytes::{Bytes, BytesMut};
 
 /// Size of the fixed UDT packet header (4 × u32) that precedes every payload.
 pub const UDT_HEADER_SIZE: usize = 16;
@@ -35,6 +35,25 @@ const IP_AND_UDP_OVERHEAD: u32 = 48; // 40 (IPv6) + 8 (UDP) — used by C++ for 
 //   1500 − IP_AND_UDP_OVERHEAD(48) − UDT_HEADER_SIZE(16) = 1436 bytes.
 const DEFAULT_MSS: u32 = 1500;
 const DEFAULT_FLIGHT_FLAG_SIZE: u32 = 25600;
+
+/// Largest flow window a peer may advertise, in packets.
+///
+/// The handshake field is a peer-supplied `i32` and used to be trusted. It
+/// bounds nothing on our side except how much we are willing to have in
+/// flight, so clamping it costs nothing: no real receiver advertises a window
+/// of millions of packets, and the value cannot make us send faster than
+/// congestion control allows anyway.
+const MAX_FLOW_WND: u32 = 1 << 20;
+
+/// Smallest MTU a peer may negotiate.
+///
+/// Below this the payload left after headers is too small to make progress,
+/// and a peer claiming an MTU of zero would leave `payload_size` at zero.
+const MIN_MSS: u32 = IP_AND_UDP_OVERHEAD + UDT_HEADER_SIZE as u32 + 64;
+/// Ranges reserved in each loss list up front. They grow past this as needed;
+/// it is a starting size, not a limit.
+const LOSS_LIST_RESERVE: usize = 128;
+
 const DEFAULT_SND_BUF: usize = 8192;
 const DEFAULT_RCV_BUF: usize = 8192;
 const SYN_US: u32 = 10_000;
@@ -307,7 +326,13 @@ impl Connection {
     ///
     /// Arguments are as [`new_active`](Self::new_active). Because neither side
     /// is listening, both must dial roughly simultaneously.
-    pub fn new_rendezvous(socket_id: u32, local_isn: SeqNo, mss: u32, now_us: u64, cc: CcKind) -> Self {
+    pub fn new_rendezvous(
+        socket_id: u32,
+        local_isn: SeqNo,
+        mss: u32,
+        now_us: u64,
+        cc: CcKind,
+    ) -> Self {
         let req = Handshake {
             version: UDT_VERSION,
             sock_type: SOCK_DGRAM,
@@ -426,8 +451,11 @@ impl Connection {
         self.rcv_curr_seq = peer_isn.prev();
         self.snd_buf = Some(SendBuffer::new(DEFAULT_SND_BUF, self.payload_size as usize));
         self.rcv_buf = Some(RecvBuffer::new(DEFAULT_RCV_BUF, peer_isn));
-        self.snd_loss = SndLossList::new(flow_wnd as usize * 2);
-        self.rcv_loss = RcvLossList::new(flow_wnd as usize);
+        // Sized for the handful of ranges a loss list actually holds, not for
+        // the flow window: these grow on demand, and reserving a window's worth
+        // up front is what let a peer ask for a 64 GiB allocation.
+        self.snd_loss = SndLossList::new(LOSS_LIST_RESERVE);
+        self.rcv_loss = RcvLossList::new(LOSS_LIST_RESERVE);
         self.enc = BytesMut::with_capacity(mss as usize);
         let ctx = self.cc_ctx(now_us);
         let out = self.cc.init(ctx);
@@ -448,13 +476,20 @@ impl Connection {
     /// `Vec` across calls to avoid allocating. Datagrams that are malformed or
     /// addressed elsewhere are ignored.
     pub fn on_datagram(&mut self, datagram: Bytes, now_us: u64, out: &mut Vec<Event>) {
-        let pkt = match codec::decode(datagram) { Some(p) => p, None => return };
+        let pkt = match codec::decode(datagram) {
+            Some(p) => p,
+            None => return,
+        };
         // Check destination socket ID
         let ok = match &pkt {
             Packet::Data { header, .. } => header.dst_socket_id == self.socket_id,
-            Packet::Control { header, .. } => header.dst_socket_id == 0 || header.dst_socket_id == self.socket_id,
+            Packet::Control { header, .. } => {
+                header.dst_socket_id == 0 || header.dst_socket_id == self.socket_id
+            }
         };
-        if !ok { return; }
+        if !ok {
+            return;
+        }
         match pkt {
             Packet::Data { header, payload } => self.recv_data(header, payload, now_us, out),
             Packet::Control { header: _, body } => self.recv_ctrl(body, now_us, out),
@@ -622,7 +657,9 @@ impl Connection {
         self.next_snd_us = self.next_snd_us.min(now_us);
         let burst_end = now_us + SYN_US as u64;
         loop {
-            if !self.pack_data(now_us, burst_end, out) { break; }
+            if !self.pack_data(now_us, burst_end, out) {
+                break;
+            }
         }
         SendOutcome::Queued
     }
@@ -658,7 +695,9 @@ impl Connection {
             }
             ConnState::Connected => {
                 let mut t = self.next_ack_us.min(self.next_snd_us);
-                if !self.rcv_loss.is_empty() { t = t.min(self.next_nak_us); }
+                if !self.rcv_loss.is_empty() {
+                    t = t.min(self.next_nak_us);
+                }
                 Some(t.min(self.last_rsp_us + self.exp_int_us()))
             }
         }
@@ -668,7 +707,9 @@ impl Connection {
     ///
     /// Use [`half_close`](Self::half_close) to let queued data drain first.
     pub fn shutdown(&mut self, now_us: u64, out: &mut Vec<Event>) {
-        if !matches!(self.state, ConnState::Connected) { return; }
+        if !matches!(self.state, ConnState::Connected) {
+            return;
+        }
         self.enc.clear();
         codec::encode_shutdown(self.ts(now_us), self.peer_id, &mut self.enc);
         out.push(Event::SendDatagram(self.enc.clone().freeze()));
@@ -682,7 +723,9 @@ impl Connection {
     /// happens inside a later [`on_timer`](Self::on_timer). Incoming messages
     /// keep arriving until then.
     pub fn half_close(&mut self, now_us: u64, out: &mut Vec<Event>) {
-        if !matches!(self.state, ConnState::Connected) { return; }
+        if !matches!(self.state, ConnState::Connected) {
+            return;
+        }
         if self.snd_buf.as_ref().map(|b| b.is_empty()).unwrap_or(true) {
             self.shutdown(now_us, out);
         } else {
@@ -741,7 +784,9 @@ impl Connection {
     ) {
         // Rendezvous: data means the peer completed — try to complete too.
         self.try_rendezvous_complete(now_us, out);
-        if !matches!(self.state, ConnState::Connected) { return; }
+        if !matches!(self.state, ConnState::Connected) {
+            return;
+        }
 
         self.last_rsp_us = now_us;
         self.exp_count = 1;
@@ -805,8 +850,11 @@ impl Connection {
         }
 
         let probe_mod = seq.raw() & 0xF;
-        if probe_mod == 0 { self.rcv_tw.probe1_arrival(now_us); }
-        else if probe_mod == 1 { self.rcv_tw.probe2_arrival(now_us); }
+        if probe_mod == 0 {
+            self.rcv_tw.probe1_arrival(now_us);
+        } else if probe_mod == 1 {
+            self.rcv_tw.probe2_arrival(now_us);
+        }
         self.rcv_tw.on_pkt_arrival(now_us);
 
         // The ACK timer in on_timer decides when this count warrants a light
@@ -987,8 +1035,10 @@ impl Connection {
 
     fn do_post_connect(&mut self, hs: Handshake, now_us: u64, out: &mut Vec<Event>) {
         let peer_isn = SeqNo::new(hs.isn as u32 & SEQ_MAX);
-        let mss = (hs.mss as u32).min(self.mss);
-        let flow_wnd = hs.flight_flag_size as u32;
+        // Both of these are peer-supplied and reach allocation sizing, so they
+        // are clamped before use rather than trusted.
+        let mss = (hs.mss as u32).min(self.mss).max(MIN_MSS);
+        let flow_wnd = (hs.flight_flag_size.max(1) as u32).min(MAX_FLOW_WND);
         self.peer_id = hs.socket_id as u32;
         self.state = ConnState::Connected;
         self.post_connect(peer_isn, mss, flow_wnd, now_us);
@@ -1023,7 +1073,7 @@ impl Connection {
             self.rtt_us = (self.rtt_us * 7 + rtt) / 8;
             self.rtt_var_us = (self.rtt_var_us * 3 + rtt_var) / 4;
             if full.avail_buf_pkts > 0 {
-                self.flow_wnd = full.avail_buf_pkts as u32;
+                self.flow_wnd = (full.avail_buf_pkts as u32).min(MAX_FLOW_WND);
             }
             // Smooth the peer's rate reports (7/8 EWMA, ignoring non-positive
             // samples) before handing them to congestion control.  Raw per-ACK
@@ -1066,7 +1116,9 @@ impl Connection {
         if adv > 0 {
             self.snd_last_ack = ack_seq;
             self.snd_loss.remove_up_to(ack_seq.prev());
-            if let Some(buf) = self.snd_buf.as_mut() { buf.ack(adv); }
+            if let Some(buf) = self.snd_buf.as_mut() {
+                buf.ack(adv);
+            }
             // Window just opened — immediately try to pack more data rather than
             // waiting for the next on_timer tick.
             self.next_snd_us = self.next_snd_us.min(now_us);
@@ -1165,11 +1217,9 @@ impl Connection {
 
         // A minimum window of 2 is advertised even when the buffer is full, to
         // break a potential deadlock where neither side can make progress.
-        let avail = self
-            .rcv_buf
-            .as_ref()
-            .map_or(0, |b| b.avail_from(data_ack))
-            .min(i32::MAX as usize) as i32;
+        let avail =
+            self.rcv_buf.as_ref().map_or(0, |b| b.avail_from(data_ack)).min(i32::MAX as usize)
+                as i32;
         let full = AckFull {
             rtt_us: self.rtt_us,
             rtt_var_us: self.rtt_var_us,
@@ -1259,7 +1309,9 @@ impl Connection {
     fn emit_nak(&mut self, now_us: u64, out: &mut Vec<Event>) {
         let max_words = (self.payload_size / 4) as usize;
         let words = self.rcv_loss.to_nak_payload(max_words);
-        if words.is_empty() { return; }
+        if words.is_empty() {
+            return;
+        }
         let mut ranges = Vec::new();
         let mut i = 0;
         while i < words.len() {
@@ -1288,7 +1340,9 @@ impl Connection {
     /// timers have ~1 ms granularity and cannot honour sub-millisecond
     /// `pkt_snd_period_us` values individually.
     fn pack_data(&mut self, now_us: u64, burst_end: u64, out: &mut Vec<Event>) -> bool {
-        if burst_end < self.next_snd_us { return false; }
+        if burst_end < self.next_snd_us {
+            return false;
+        }
 
         // Retire any message at the send cursor whose TTL has run out, before
         // spending a transmission on it.
@@ -1327,7 +1381,12 @@ impl Connection {
                 .map(|b| (b.boundary, b.in_order, b.msg_no, b.data.clone()));
             if let Some((boundary, in_order, msg_no, data)) = block {
                 let hdr = codec::encode_data_header(
-                    s, boundary, in_order, msg_no, self.ts(now_us), self.peer_id,
+                    s,
+                    boundary,
+                    in_order,
+                    msg_no,
+                    self.ts(now_us),
+                    self.peer_id,
                 );
                 retransmit = Some((hdr, data));
                 break;
@@ -1342,19 +1401,31 @@ impl Connection {
                 // New data — this is what the congestion/flow window limits.
                 let in_flight = self.snd_buf.as_ref().map_or(0, |b| b.in_flight());
                 let max_flight = (self.cwnd.min(self.flow_wnd as f64)) as usize;
-                if in_flight >= max_flight { return false; }
+                if in_flight >= max_flight {
+                    return false;
+                }
 
                 self.snd_curr_seq = self.snd_curr_seq.next();
                 let seq = self.snd_curr_seq;
                 // Extract fields before releasing the mutable borrow so we can call self.ts() after.
-                let (boundary, in_order, msg_no, data) = match self.snd_buf.as_mut().and_then(|b| b.read_next()) {
-                    Some(block) => (block.boundary, block.in_order, block.msg_no, block.data.clone()),
-                    None => {
-                        self.snd_curr_seq = self.snd_curr_seq.prev();
-                        return false;
-                    }
-                };
-                let hdr = codec::encode_data_header(seq, boundary, in_order, msg_no, self.ts(now_us), self.peer_id);
+                let (boundary, in_order, msg_no, data) =
+                    match self.snd_buf.as_mut().and_then(|b| b.read_next()) {
+                        Some(block) => {
+                            (block.boundary, block.in_order, block.msg_no, block.data.clone())
+                        }
+                        None => {
+                            self.snd_curr_seq = self.snd_curr_seq.prev();
+                            return false;
+                        }
+                    };
+                let hdr = codec::encode_data_header(
+                    seq,
+                    boundary,
+                    in_order,
+                    msg_no,
+                    self.ts(now_us),
+                    self.peer_id,
+                );
                 (hdr, data)
             }
         };
@@ -1422,8 +1493,8 @@ impl Connection {
         if let Some(rto) = self.cc_rto_us {
             return self.exp_count as u64 * rto;
         }
-        let rtt_based =
-            self.exp_count as u64 * (self.rtt_us as u64 + 4 * self.rtt_var_us as u64) + SYN_US as u64;
+        let rtt_based = self.exp_count as u64 * (self.rtt_us as u64 + 4 * self.rtt_var_us as u64)
+            + SYN_US as u64;
         let min_based = self.exp_count as u64 * MIN_EXP_PER_COUNT_US;
         rtt_based.max(min_based)
     }

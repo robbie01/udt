@@ -16,15 +16,15 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::Notify;
 use udt_proto::{Connection, DisconnectReason, Event, SendOutcome};
 
-use crate::util::{disconnect_err, lock, now_us, Mutex};
+use crate::util::{Mutex, disconnect_err, lock, now_us};
 
 /// Readiness signals for one connection.
 ///
@@ -148,7 +148,6 @@ impl State {
             self.conn.on_datagram(datagram, now_us(), &mut self.events);
         }
     }
-
 
     pub(crate) fn on_timer(&mut self, now: u64) {
         self.conn.on_timer(now, &mut self.events);
@@ -300,8 +299,10 @@ impl Socket {
             SendOutcome::WouldBlock => Ok(SendOutcome::WouldBlock),
             // Only returned for a message no buffer size could accept, or on a
             // connection that closed between the check above and here.
-            SendOutcome::Rejected => Err(self
-                .closed_or(io::Error::new(io::ErrorKind::InvalidInput, "message too large"))),
+            SendOutcome::Rejected => {
+                Err(self
+                    .closed_or(io::Error::new(io::ErrorKind::InvalidInput, "message too large")))
+            }
         }
     }
 
@@ -501,4 +502,3 @@ pub(crate) fn fail(inner: &ConnectionInner, reason: DisconnectReason) {
     inner.shared.writable.notify_waiters();
     inner.shared.established.notify_waiters();
 }
-

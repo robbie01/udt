@@ -1,0 +1,42 @@
+name: Interop
+
+# The C++ reference implementations live on the `harness` branch and reference
+# this one by path, so the regression net has to be assembled from both.
+on:
+  push:
+    branches: [master, harness]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  interop:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Check out the Rust implementation
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          path: udt
+
+      - name: Check out the C++ harness beside it
+        uses: actions/checkout@v4
+        with:
+          ref: harness
+          path: udt-harness
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: udt-harness
+
+      # Against the modified fork, and against pristine upstream. The second is
+      # what tells us whether a change to the fork broke protocol behaviour.
+      - name: Interop tests
+        working-directory: udt-harness
+        run: cargo test --release --workspace

@@ -1,4 +1,4 @@
-use crate::seq::{SeqNo, AckSeqNo};
+use crate::seq::{AckSeqNo, SeqNo};
 
 const DEFAULT_SIZE: usize = 1024;
 

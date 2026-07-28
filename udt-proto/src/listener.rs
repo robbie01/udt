@@ -1,12 +1,12 @@
 //! The handshake state machine for accepting incoming connections.
 
-use bytes::{Bytes, BytesMut};
-use std::collections::HashMap;
 use crate::codec;
 use crate::congestion::CcKind;
-use crate::handshake::{req_type, Handshake, SOCK_DGRAM, UDT_VERSION};
 use crate::connection::Connection;
+use crate::handshake::{Handshake, SOCK_DGRAM, UDT_VERSION, req_type};
 use crate::seq::SeqNo;
+use bytes::{Bytes, BytesMut};
+use std::collections::HashMap;
 
 /// A peer's address, in whatever form the IO layer uses.
 ///
@@ -186,7 +186,10 @@ impl Listener {
 
                 self.enc.clear();
                 codec::encode_handshake(&our_resp, ts, hs.socket_id as u32, &mut self.enc);
-                out.push(ListenerEvent::SendTo { addr: addr.clone(), data: self.enc.clone().freeze() });
+                out.push(ListenerEvent::SendTo {
+                    addr: addr.clone(),
+                    data: self.enc.clone().freeze(),
+                });
                 out.push(ListenerEvent::Accept(Box::new(conn), addr));
             } else if let Some(saved_resp) = self.accepted.get(&addr).cloned() {
                 // Duplicate req_type=-1: peer missed our response — resend it
@@ -206,5 +209,4 @@ impl Listener {
         }
         h as i32
     }
-
 }

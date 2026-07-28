@@ -10,7 +10,7 @@
 
 use std::collections::VecDeque;
 
-use udt_proto::{CcKind, Connection, Event, SeqNo, SendOutcome};
+use udt_proto::{CcKind, Connection, Event, SendOutcome, SeqNo};
 
 /// Deterministic generator. Values are only ever compared against
 /// probabilities, so a small linear congruential generator is plenty.
@@ -254,9 +254,8 @@ impl Sim {
 
         for step in 0..MAX_STEPS {
             while queued < count {
-                let payload = pending
-                    .take()
-                    .unwrap_or_else(|| bytes::Bytes::from(message(queued, size)));
+                let payload =
+                    pending.take().unwrap_or_else(|| bytes::Bytes::from(message(queued, size)));
                 match self.a.send_msg(
                     payload.clone(),
                     opts.ttl_ms,
@@ -565,4 +564,34 @@ fn loss_recovery_is_not_quadratic() {
         lossy_us < clean_us * 10,
         "5% loss cost {lossy_us}us against {clean_us}us clean -- recovery is not proportional"
     );
+}
+
+/// A peer's handshake advertises its flow window, and that value used to be
+/// handed straight to `Vec::with_capacity` for the loss lists. One packet
+/// claiming a window of `i32::MAX` asked for a 68 GB allocation — a remote
+/// denial of service costing the attacker a single datagram, found by the
+/// `connection` fuzz target.
+#[test]
+fn a_hostile_handshake_cannot_ask_for_an_enormous_allocation() {
+    // Bytes taken from the crashing input: a handshake naming absurd sizes.
+    let mut hs = vec![0u8; 64];
+    hs[0] = 0x80; // control packet, type 0 (handshake)
+    let put = |v: &mut Vec<u8>, at: usize, x: i32| {
+        v[at..at + 4].copy_from_slice(&x.to_be_bytes());
+    };
+    put(&mut hs, 16, 4); // version
+    put(&mut hs, 20, 2); // SOCK_DGRAM
+    put(&mut hs, 24, i32::MAX); // initial sequence number
+    put(&mut hs, 28, i32::MAX); // MTU
+    put(&mut hs, 32, i32::MAX); // flight flag size -- the dangerous one
+    put(&mut hs, 36, 1); // request type
+    put(&mut hs, 40, 7); // socket id
+
+    let mut conn = Connection::new_active(1, SeqNo::new(1000), 1500, 0, CcKind::Udt);
+    let mut events = Vec::new();
+    conn.on_datagram(bytes::Bytes::from(hs), 1000, &mut events);
+
+    // Reaching here at all is the point: the allocation is clamped rather than
+    // attempted. Whether the handshake is accepted is beside it.
+    let _ = conn.stats();
 }

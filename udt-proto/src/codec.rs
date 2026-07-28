@@ -1,10 +1,10 @@
-use bytes::{Bytes, BytesMut, BufMut};
-use crate::handshake::{Handshake, HANDSHAKE_SIZE};
-use crate::seq::{AckSeqNo, MsgNo, SeqNo};
+use crate::handshake::{HANDSHAKE_SIZE, Handshake};
 use crate::packet::{
-    AckFull, AckPayload, ControlBody, ControlHeader, ControlType,
-    DataHeader, MsgBoundary, NakList, Packet,
+    AckFull, AckPayload, ControlBody, ControlHeader, ControlType, DataHeader, MsgBoundary, NakList,
+    Packet,
 };
+use crate::seq::{AckSeqNo, MsgNo, SeqNo};
+use bytes::{BufMut, Bytes, BytesMut};
 
 // The UDT wire format uses NETWORK BYTE ORDER (big-endian) for:
 //   • All 4 header words (both data and control packets)
@@ -45,9 +45,9 @@ pub fn decode(datagram: Bytes) -> Option<Packet> {
     } else {
         // Control packet
         let type_bits = (word0 >> 16) & 0x7FFF;
-        let ext_bits  = word0 & 0xFFFF;
+        let ext_bits = word0 & 0xFFFF;
         let ctrl_type = ControlType::from_word(type_bits, ext_bits)?;
-        let add_info  = word1;
+        let add_info = word1;
         let hdr = ControlHeader {
             ctrl_type,
             additional_info: add_info,
@@ -80,13 +80,21 @@ fn decode_ctrl_body(hdr: &ControlHeader, payload: Bytes) -> Option<ControlBody> 
             // lite would drop most flow-window updates on the floor.
             let full = if payload.len() >= 16 {
                 Some(AckFull {
-                    rtt_us:        read_be_i32(&payload[4..8]),
-                    rtt_var_us:    read_be_i32(&payload[8..12]),
-                    avail_buf_pkts:read_be_i32(&payload[12..16]),
+                    rtt_us: read_be_i32(&payload[4..8]),
+                    rtt_var_us: read_be_i32(&payload[8..12]),
+                    avail_buf_pkts: read_be_i32(&payload[12..16]),
                     // Absent in the 16-byte form.  Zero reads as "no sample"
                     // and is skipped by the rate estimators, as in C++.
-                    rcv_rate_pps:  if payload.len() >= 24 { read_be_i32(&payload[16..20]) } else { 0 },
-                    bandwidth_pps: if payload.len() >= 24 { read_be_i32(&payload[20..24]) } else { 0 },
+                    rcv_rate_pps: if payload.len() >= 24 {
+                        read_be_i32(&payload[16..20])
+                    } else {
+                        0
+                    },
+                    bandwidth_pps: if payload.len() >= 24 {
+                        read_be_i32(&payload[20..24])
+                    } else {
+                        0
+                    },
                 })
             } else {
                 None
@@ -102,27 +110,19 @@ fn decode_ctrl_body(hdr: &ControlHeader, payload: Bytes) -> Option<ControlBody> 
         }
         ControlType::CongestionWarning => Some(ControlBody::CongestionWarning),
         ControlType::Shutdown => Some(ControlBody::Shutdown),
-        ControlType::Ack2 => {
-            Some(ControlBody::Ack2(AckSeqNo::new(hdr.additional_info)))
-        }
+        ControlType::Ack2 => Some(ControlBody::Ack2(AckSeqNo::new(hdr.additional_info))),
         ControlType::MsgDrop => {
             if payload.len() < 8 {
                 return None;
             }
             let first = SeqNo::new(read_be_i32(&payload[0..4]) as u32 & 0x7FFF_FFFF);
-            let last  = SeqNo::new(read_be_i32(&payload[4..8]) as u32 & 0x7FFF_FFFF);
-            Some(ControlBody::MsgDrop {
-                msg_no: MsgNo::new(hdr.additional_info),
-                first,
-                last,
-            })
+            let last = SeqNo::new(read_be_i32(&payload[4..8]) as u32 & 0x7FFF_FFFF);
+            Some(ControlBody::MsgDrop { msg_no: MsgNo::new(hdr.additional_info), first, last })
         }
         ControlType::ErrorSignal => {
             Some(ControlBody::ErrorSignal { error_code: hdr.additional_info as i32 })
         }
-        ControlType::UserDefined(ext_type) => {
-            Some(ControlBody::UserDefined { ext_type, payload })
-        }
+        ControlType::UserDefined(ext_type) => Some(ControlBody::UserDefined { ext_type, payload }),
     }
 }
 
@@ -173,9 +173,7 @@ pub fn encode_data(
     dst: &mut BytesMut,
 ) {
     let word0 = seq_no.raw(); // bit31 = 0 (data)
-    let word1 = (boundary.bits() << 30)
-        | ((in_order as u32) << 29)
-        | (msg_no.raw() & 0x1FFF_FFFF);
+    let word1 = (boundary.bits() << 30) | ((in_order as u32) << 29) | (msg_no.raw() & 0x1FFF_FFFF);
     dst.put_u32(word0);
     dst.put_u32(word1);
     dst.put_u32(timestamp_us);
@@ -193,9 +191,7 @@ pub fn encode_data_header(
     dst_socket_id: u32,
 ) -> [u8; 16] {
     let word0 = seq_no.raw();
-    let word1 = (boundary.bits() << 30)
-        | ((in_order as u32) << 29)
-        | (msg_no.raw() & 0x1FFF_FFFF);
+    let word1 = (boundary.bits() << 30) | ((in_order as u32) << 29) | (msg_no.raw() & 0x1FFF_FFFF);
     let mut out = [0u8; 16];
     out[0..4].copy_from_slice(&word0.to_be_bytes());
     out[4..8].copy_from_slice(&word1.to_be_bytes());
@@ -217,9 +213,7 @@ pub fn encode_control(
         ControlType::UserDefined(e) => e as u32,
         _ => 0,
     };
-    let word0 = 0x8000_0000u32
-        | ((ctrl_type.type_bits() as u32) << 16)
-        | ext_bits;
+    let word0 = 0x8000_0000u32 | ((ctrl_type.type_bits() as u32) << 16) | ext_bits;
     dst.put_u32(word0);
     dst.put_u32(additional_info);
     dst.put_u32(timestamp_us);
@@ -256,9 +250,21 @@ pub fn encode_ack(
 }
 
 /// Encode an ACK2 packet.
-pub fn encode_ack2(ack_sub_seq: AckSeqNo, timestamp_us: u32, dst_socket_id: u32, dst: &mut BytesMut) {
+pub fn encode_ack2(
+    ack_sub_seq: AckSeqNo,
+    timestamp_us: u32,
+    dst_socket_id: u32,
+    dst: &mut BytesMut,
+) {
     // ACK2 has a 4-byte padding payload (C++ uses __pad for iovec requirements)
-    encode_control(ControlType::Ack2, ack_sub_seq.raw(), timestamp_us, dst_socket_id, &[0u8; 4], dst);
+    encode_control(
+        ControlType::Ack2,
+        ack_sub_seq.raw(),
+        timestamp_us,
+        dst_socket_id,
+        &[0u8; 4],
+        dst,
+    );
 }
 
 /// Encode a NAK packet from a list of (start, end) sequence ranges.
@@ -274,7 +280,7 @@ pub fn encode_nak(
             body.put_u32(start.raw()); // single, bit31 clear
         } else {
             body.put_u32(start.raw() | 0x8000_0000); // range start, bit31 set
-            body.put_u32(end.raw());                  // range end, bit31 clear
+            body.put_u32(end.raw()); // range end, bit31 clear
         }
     }
     encode_control(ControlType::Nak, 0, timestamp_us, dst_socket_id, &body, dst);
@@ -320,45 +326,79 @@ fn read_be_i32(b: &[u8]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handshake::{req_type, UDT_VERSION, SOCK_DGRAM};
+    use crate::handshake::{SOCK_DGRAM, UDT_VERSION, req_type};
     use bytes::Bytes;
 
     fn round_trip(pkt: Packet) -> Packet {
         let mut buf = BytesMut::new();
         match &pkt {
             Packet::Data { header: h, payload: p } => {
-                encode_data(h.seq_no, h.boundary, h.in_order, h.msg_no,
-                    h.timestamp_us, h.dst_socket_id, p, &mut buf);
+                encode_data(
+                    h.seq_no,
+                    h.boundary,
+                    h.in_order,
+                    h.msg_no,
+                    h.timestamp_us,
+                    h.dst_socket_id,
+                    p,
+                    &mut buf,
+                );
             }
-            Packet::Control { header: h, body } => {
-                match body {
-                    ControlBody::Handshake(hs) =>
-                        encode_handshake(hs, h.timestamp_us, h.dst_socket_id, &mut buf),
-                    ControlBody::KeepAlive =>
-                        encode_keepalive(h.timestamp_us, h.dst_socket_id, &mut buf),
-                    ControlBody::Ack(asn, payload) =>
-                        encode_ack(*asn, payload.data_ack_seq, payload.full.as_ref(),
-                            h.timestamp_us, h.dst_socket_id, &mut buf),
-                    ControlBody::Nak(nak) =>
-                        encode_nak(&nak.0, h.timestamp_us, h.dst_socket_id, &mut buf),
-                    ControlBody::CongestionWarning =>
-                        encode_control(ControlType::CongestionWarning, 0,
-                            h.timestamp_us, h.dst_socket_id, &[0u8; 4], &mut buf),
-                    ControlBody::Shutdown =>
-                        encode_shutdown(h.timestamp_us, h.dst_socket_id, &mut buf),
-                    ControlBody::Ack2(asn) =>
-                        encode_ack2(*asn, h.timestamp_us, h.dst_socket_id, &mut buf),
-                    ControlBody::MsgDrop { msg_no, first, last } =>
-                        encode_msg_drop(*msg_no, *first, *last,
-                            h.timestamp_us, h.dst_socket_id, &mut buf),
-                    ControlBody::ErrorSignal { error_code } =>
-                        encode_control(ControlType::ErrorSignal, *error_code as u32,
-                            h.timestamp_us, h.dst_socket_id, &[], &mut buf),
-                    ControlBody::UserDefined { ext_type, payload } =>
-                        encode_control(ControlType::UserDefined(*ext_type), 0,
-                            h.timestamp_us, h.dst_socket_id, payload, &mut buf),
+            Packet::Control { header: h, body } => match body {
+                ControlBody::Handshake(hs) => {
+                    encode_handshake(hs, h.timestamp_us, h.dst_socket_id, &mut buf)
                 }
-            }
+                ControlBody::KeepAlive => {
+                    encode_keepalive(h.timestamp_us, h.dst_socket_id, &mut buf)
+                }
+                ControlBody::Ack(asn, payload) => encode_ack(
+                    *asn,
+                    payload.data_ack_seq,
+                    payload.full.as_ref(),
+                    h.timestamp_us,
+                    h.dst_socket_id,
+                    &mut buf,
+                ),
+                ControlBody::Nak(nak) => {
+                    encode_nak(&nak.0, h.timestamp_us, h.dst_socket_id, &mut buf)
+                }
+                ControlBody::CongestionWarning => encode_control(
+                    ControlType::CongestionWarning,
+                    0,
+                    h.timestamp_us,
+                    h.dst_socket_id,
+                    &[0u8; 4],
+                    &mut buf,
+                ),
+                ControlBody::Shutdown => encode_shutdown(h.timestamp_us, h.dst_socket_id, &mut buf),
+                ControlBody::Ack2(asn) => {
+                    encode_ack2(*asn, h.timestamp_us, h.dst_socket_id, &mut buf)
+                }
+                ControlBody::MsgDrop { msg_no, first, last } => encode_msg_drop(
+                    *msg_no,
+                    *first,
+                    *last,
+                    h.timestamp_us,
+                    h.dst_socket_id,
+                    &mut buf,
+                ),
+                ControlBody::ErrorSignal { error_code } => encode_control(
+                    ControlType::ErrorSignal,
+                    *error_code as u32,
+                    h.timestamp_us,
+                    h.dst_socket_id,
+                    &[],
+                    &mut buf,
+                ),
+                ControlBody::UserDefined { ext_type, payload } => encode_control(
+                    ControlType::UserDefined(*ext_type),
+                    0,
+                    h.timestamp_us,
+                    h.dst_socket_id,
+                    payload,
+                    &mut buf,
+                ),
+            },
         }
         decode(buf.freeze()).expect("round-trip decode failed")
     }
@@ -446,7 +486,13 @@ mod tests {
 
     #[test]
     fn ack_full_roundtrip() {
-        let full = AckFull { rtt_us: 1000, rtt_var_us: 200, avail_buf_pkts: 8192, rcv_rate_pps: 1000, bandwidth_pps: 5000 };
+        let full = AckFull {
+            rtt_us: 1000,
+            rtt_var_us: 200,
+            avail_buf_pkts: 8192,
+            rcv_rate_pps: 1000,
+            bandwidth_pps: 5000,
+        };
         let pkt = Packet::Control {
             header: ControlHeader {
                 ctrl_type: ControlType::Ack,
@@ -541,15 +587,30 @@ mod tests {
     fn shutdown_keepalive_congestion_roundtrip() {
         for pkt in [
             Packet::Control {
-                header: ControlHeader { ctrl_type: ControlType::Shutdown, additional_info: 0, timestamp_us: 1, dst_socket_id: 2 },
+                header: ControlHeader {
+                    ctrl_type: ControlType::Shutdown,
+                    additional_info: 0,
+                    timestamp_us: 1,
+                    dst_socket_id: 2,
+                },
                 body: ControlBody::Shutdown,
             },
             Packet::Control {
-                header: ControlHeader { ctrl_type: ControlType::KeepAlive, additional_info: 0, timestamp_us: 1, dst_socket_id: 2 },
+                header: ControlHeader {
+                    ctrl_type: ControlType::KeepAlive,
+                    additional_info: 0,
+                    timestamp_us: 1,
+                    dst_socket_id: 2,
+                },
                 body: ControlBody::KeepAlive,
             },
             Packet::Control {
-                header: ControlHeader { ctrl_type: ControlType::CongestionWarning, additional_info: 0, timestamp_us: 1, dst_socket_id: 2 },
+                header: ControlHeader {
+                    ctrl_type: ControlType::CongestionWarning,
+                    additional_info: 0,
+                    timestamp_us: 1,
+                    dst_socket_id: 2,
+                },
                 body: ControlBody::CongestionWarning,
             },
         ] {
@@ -561,9 +622,9 @@ mod tests {
     #[test]
     fn data_boundary_flags() {
         for (boundary, expected) in [
-            (MsgBoundary::Solo,   0b11u32),
-            (MsgBoundary::First,  0b10),
-            (MsgBoundary::Last,   0b01),
+            (MsgBoundary::Solo, 0b11u32),
+            (MsgBoundary::First, 0b10),
+            (MsgBoundary::Last, 0b01),
             (MsgBoundary::Middle, 0b00),
         ] {
             let mut buf = BytesMut::new();

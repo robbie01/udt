@@ -10,37 +10,32 @@ mod tests {
     use udt_async::{Endpoint, EndpointConfig, SendOptions, Socket};
 
     const SMALL: &[u8] = b"hello, world!   "; // 16 bytes — single packet
-    fn medium() -> Vec<u8> { vec![0x42u8; 4096] } // 3 packets at default MSS (payload=1436B)
-    fn large() -> Vec<u8> { vec![0x7fu8; 65536] } // ~45 packets
+    fn medium() -> Vec<u8> {
+        vec![0x42u8; 4096]
+    } // 3 packets at default MSS (payload=1436B)
+    fn large() -> Vec<u8> {
+        vec![0x7fu8; 65536]
+    } // ~45 packets
 
     // ── Pure Rust helpers ────────────────────────────────────────────────────
 
-    async fn new_listener_pair(
-        listener_addr: SocketAddr,
-    ) -> (Socket, Socket) {
+    async fn new_listener_pair(listener_addr: SocketAddr) -> (Socket, Socket) {
         let ep = Endpoint::bind(listener_addr).await.unwrap();
         let server_addr = ep.local_addr();
         let listener = ep.listen(4).unwrap();
 
-        let (server_sock, client_sock) = tokio::join!(
-            async { listener.accept().await.unwrap() },
-            async {
+        let (server_sock, client_sock) =
+            tokio::join!(async { listener.accept().await.unwrap() }, async {
                 let cep = Endpoint::bind("127.0.0.1:0").await.unwrap();
                 tokio::time::timeout(Duration::from_secs(5), cep.connect(server_addr))
                     .await
                     .expect("connect timed out")
                     .expect("connect failed")
-            }
-        );
+            });
         (server_sock, client_sock)
     }
 
-    async fn echo_exchange(
-        server: Socket,
-        client: Socket,
-        payload: &[u8],
-        count: usize,
-    ) {
+    async fn echo_exchange(server: Socket, client: Socket, payload: &[u8], count: usize) {
         let mut buf = vec![0u8; 131072];
         for _ in 0..count {
             // Client → Server
@@ -132,19 +127,6 @@ mod tests {
         echo_exchange(a, b, &large(), 3).await;
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
     #[tokio::test(flavor = "multi_thread")]
     async fn s6_multi_connection_same_listener() {
         const N: usize = 4;
@@ -154,54 +136,67 @@ mod tests {
         let listener = ep.listen(N + 1).unwrap();
 
         // Spawn N clients simultaneously.
-        let client_tasks: Vec<_> = (0usize..N).map(|i| {
-            let payload = vec![(i as u8).wrapping_add(0x41); 3000]; // 'A', 'B', 'C', 'D' repeated
-            tokio::spawn(async move {
-                let cep = Endpoint::bind("127.0.0.1:0").await.unwrap();
-                let sock = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    cep.connect(server_addr),
-                )
-                .await
-                .expect("connect timed out")
-                .expect("connect failed");
+        let client_tasks: Vec<_> = (0usize..N)
+            .map(|i| {
+                let payload = vec![(i as u8).wrapping_add(0x41); 3000]; // 'A', 'B', 'C', 'D' repeated
+                tokio::spawn(async move {
+                    let cep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+                    let sock =
+                        tokio::time::timeout(Duration::from_secs(5), cep.connect(server_addr))
+                            .await
+                            .expect("connect timed out")
+                            .expect("connect failed");
 
-                // Send our distinctive payload.
-                tokio::time::timeout(Duration::from_secs(5), sock.send(&payload))
-                    .await.expect("send timed out").expect("send failed");
+                    // Send our distinctive payload.
+                    tokio::time::timeout(Duration::from_secs(5), sock.send(&payload))
+                        .await
+                        .expect("send timed out")
+                        .expect("send failed");
 
-                // Receive the echo.
-                let mut buf = vec![0u8; 131072];
-                let n = tokio::time::timeout(Duration::from_secs(5), sock.recv(&mut buf))
-                    .await.expect("recv timed out").expect("recv failed");
+                    // Receive the echo.
+                    let mut buf = vec![0u8; 131072];
+                    let n = tokio::time::timeout(Duration::from_secs(5), sock.recv(&mut buf))
+                        .await
+                        .expect("recv timed out")
+                        .expect("recv failed");
 
-                assert_eq!(&buf[..n], &payload,
-                    "client {} received wrong echo (commingling?)", i);
+                    assert_eq!(
+                        &buf[..n],
+                        &payload,
+                        "client {} received wrong echo (commingling?)",
+                        i
+                    );
+                })
             })
-        }).collect();
+            .collect();
 
         // Accept N connections on the server side and echo each payload back.
         let mut server_tasks = Vec::new();
         for _ in 0..N {
-            let server_sock = tokio::time::timeout(
-                Duration::from_secs(5),
-                listener.accept(),
-            )
-            .await
-            .expect("accept timed out")
-            .expect("accept failed");
+            let server_sock = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("accept timed out")
+                .expect("accept failed");
 
             server_tasks.push(tokio::spawn(async move {
                 let mut buf = vec![0u8; 131072];
                 let n = tokio::time::timeout(Duration::from_secs(5), server_sock.recv(&mut buf))
-                    .await.expect("server recv timed out").expect("server recv failed");
+                    .await
+                    .expect("server recv timed out")
+                    .expect("server recv failed");
                 tokio::time::timeout(Duration::from_secs(5), server_sock.send(&buf[..n]))
-                    .await.expect("server send timed out").expect("server send failed");
+                    .await
+                    .expect("server send timed out")
+                    .expect("server send failed");
             }));
         }
 
-        for t in server_tasks { t.await.unwrap(); }
-        for t in client_tasks { t.await.unwrap(); }
+        for t in server_tasks {
+            t.await.unwrap();
+        }
+        for t in client_tasks {
+            t.await.unwrap();
+        }
     }
 
     // ── Scenario 6/7: many simultaneous connections on one endpoint ───────────
@@ -225,31 +220,45 @@ mod tests {
         let addrs_b: Vec<SocketAddr> = eps_b.iter().map(|e| e.local_addr()).collect();
 
         // Connect all N rendezvous pairs concurrently.
-        let mut tasks_a: Vec<_> = addrs_b.iter().enumerate().map(|(i, &addr_b)| {
-            let ep_a = Arc::clone(&ep_a);
-            let _payload = vec![(i as u8).wrapping_add(0x61); 2000]; // 'a', 'b', 'c' repeated
-            tokio::spawn(async move {
-                tokio::time::timeout(Duration::from_secs(5), ep_a.connect_rendezvous(addr_b))
-                    .await.expect("rendezvous A timed out").expect("rendezvous A failed")
+        let mut tasks_a: Vec<_> = addrs_b
+            .iter()
+            .enumerate()
+            .map(|(i, &addr_b)| {
+                let ep_a = Arc::clone(&ep_a);
+                let _payload = vec![(i as u8).wrapping_add(0x61); 2000]; // 'a', 'b', 'c' repeated
+                tokio::spawn(async move {
+                    tokio::time::timeout(Duration::from_secs(5), ep_a.connect_rendezvous(addr_b))
+                        .await
+                        .expect("rendezvous A timed out")
+                        .expect("rendezvous A failed")
+                })
             })
-        }).collect();
+            .collect();
 
-        let mut tasks_b: Vec<_> = eps_b.iter().enumerate().map(|(i, ep_b)| {
-            let ep_b = Arc::clone(ep_b);
-            let payload = vec![(i as u8).wrapping_add(0x61); 2000];
-            tokio::spawn(async move {
-                let sock = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    ep_b.connect_rendezvous(addr_a),
-                )
-                .await.expect("rendezvous B timed out").expect("rendezvous B failed");
-                (sock, payload)
+        let mut tasks_b: Vec<_> = eps_b
+            .iter()
+            .enumerate()
+            .map(|(i, ep_b)| {
+                let ep_b = Arc::clone(ep_b);
+                let payload = vec![(i as u8).wrapping_add(0x61); 2000];
+                tokio::spawn(async move {
+                    let sock = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        ep_b.connect_rendezvous(addr_a),
+                    )
+                    .await
+                    .expect("rendezvous B timed out")
+                    .expect("rendezvous B failed");
+                    (sock, payload)
+                })
             })
-        }).collect();
+            .collect();
 
         // Collect sockets from side A.
         let mut socks_a: Vec<Socket> = Vec::new();
-        for t in tasks_a.drain(..) { socks_a.push(t.await.unwrap()); }
+        for t in tasks_a.drain(..) {
+            socks_a.push(t.await.unwrap());
+        }
         let pairs: Vec<(Socket, Socket, Vec<u8>)> = {
             let mut v = Vec::new();
             for (sa, tb) in socks_a.into_iter().zip(tasks_b.drain(..)) {
@@ -260,25 +269,39 @@ mod tests {
         };
 
         // Exchange data on each pair concurrently and verify no commingling.
-        let xfer_tasks: Vec<_> = pairs.into_iter().enumerate().map(|(i, (sa, sb, payload))| {
-            tokio::spawn(async move {
-                // A → B
-                tokio::time::timeout(Duration::from_secs(5), sa.send(&payload))
-                    .await.expect("A send timed out").expect("A send failed");
-                let mut buf = vec![0u8; 131072];
-                let n = tokio::time::timeout(Duration::from_secs(5), sb.recv(&mut buf))
-                    .await.expect("B recv timed out").expect("B recv failed");
-                assert_eq!(&buf[..n], &payload, "pair {} B received wrong data", i);
+        let xfer_tasks: Vec<_> = pairs
+            .into_iter()
+            .enumerate()
+            .map(|(i, (sa, sb, payload))| {
+                tokio::spawn(async move {
+                    // A → B
+                    tokio::time::timeout(Duration::from_secs(5), sa.send(&payload))
+                        .await
+                        .expect("A send timed out")
+                        .expect("A send failed");
+                    let mut buf = vec![0u8; 131072];
+                    let n = tokio::time::timeout(Duration::from_secs(5), sb.recv(&mut buf))
+                        .await
+                        .expect("B recv timed out")
+                        .expect("B recv failed");
+                    assert_eq!(&buf[..n], &payload, "pair {} B received wrong data", i);
 
-                // B → A echo
-                tokio::time::timeout(Duration::from_secs(5), sb.send(&buf[..n]))
-                    .await.expect("B echo timed out").expect("B echo failed");
-                let n2 = tokio::time::timeout(Duration::from_secs(5), sa.recv(&mut buf))
-                    .await.expect("A echo recv timed out").expect("A echo recv failed");
-                assert_eq!(&buf[..n2], &payload, "pair {} A received wrong echo", i);
+                    // B → A echo
+                    tokio::time::timeout(Duration::from_secs(5), sb.send(&buf[..n]))
+                        .await
+                        .expect("B echo timed out")
+                        .expect("B echo failed");
+                    let n2 = tokio::time::timeout(Duration::from_secs(5), sa.recv(&mut buf))
+                        .await
+                        .expect("A echo recv timed out")
+                        .expect("A echo recv failed");
+                    assert_eq!(&buf[..n2], &payload, "pair {} A received wrong echo", i);
+                })
             })
-        }).collect();
-        for t in xfer_tasks { t.await.unwrap(); }
+            .collect();
+        for t in xfer_tasks {
+            t.await.unwrap();
+        }
     }
 
     // ── Streaming integrity ───────────────────────────────────────────────────
@@ -371,9 +394,7 @@ mod tests {
         for i in 0..MSGS {
             let n = tokio::time::timeout(Duration::from_secs(20), server.recv(&mut buf))
                 .await
-                .unwrap_or_else(|_| {
-                    panic!("unordered stream stalled after {i} of {MSGS} messages")
-                })
+                .unwrap_or_else(|_| panic!("unordered stream stalled after {i} of {MSGS} messages"))
                 .expect("recv failed");
             assert_eq!(n, CHUNK, "message {i} has wrong length");
             let fill = buf[0];
@@ -407,7 +428,10 @@ mod tests {
         // A TTL of zero expires the moment the send path reconsiders the
         // message, so this deterministically exercises the drop path.
         client
-            .send_with(&vec![0xEEu8; 8192], SendOptions::new().ttl(Duration::from_millis(0)).unordered())
+            .send_with(
+                &vec![0xEEu8; 8192],
+                SendOptions::new().ttl(Duration::from_millis(0)).unordered(),
+            )
             .await
             .expect("ttl send failed");
 
@@ -450,19 +474,15 @@ mod tests {
     /// UDT is message-oriented: each `send` must surface as exactly one `recv`
     /// of the same length, never split or coalesced.
     const BOUNDARY_SIZES: &[usize] = &[
-        1,      // single packet, minimal
-        1435,   // one byte under a full payload
-        1436,   // exactly one full payload
-        1437,   // full payload + 1 → two packets, tiny tail
-        2872,   // exactly two full payloads
-        4308,   // exactly three full payloads
-        5000,   // three full payloads + partial tail
-        65536,  // 45 full payloads + partial tail
+        1,     // single packet, minimal
+        1435,  // one byte under a full payload
+        1436,  // exactly one full payload
+        1437,  // full payload + 1 → two packets, tiny tail
+        2872,  // exactly two full payloads
+        4308,  // exactly three full payloads
+        5000,  // three full payloads + partial tail
+        65536, // 45 full payloads + partial tail
     ];
-
-
-
-
 
     /// A LEDBAT++ connection must carry data correctly, not just back off.
     #[tokio::test(flavor = "multi_thread")]
@@ -477,16 +497,13 @@ mod tests {
         let server_addr = ep.local_addr();
         let listener = ep.listen(4).unwrap();
 
-        let (server, client) = tokio::join!(
-            async { listener.accept().await.unwrap() },
-            async {
-                let cep = Endpoint::bind_with("127.0.0.1:0", cfg.clone()).await.unwrap();
-                tokio::time::timeout(Duration::from_secs(5), cep.connect(server_addr))
-                    .await
-                    .expect("ledbat connect timed out")
-                    .expect("ledbat connect failed")
-            }
-        );
+        let (server, client) = tokio::join!(async { listener.accept().await.unwrap() }, async {
+            let cep = Endpoint::bind_with("127.0.0.1:0", cfg.clone()).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), cep.connect(server_addr))
+                .await
+                .expect("ledbat connect timed out")
+                .expect("ledbat connect failed")
+        });
 
         let sender = tokio::spawn(async move {
             for i in 0..MSGS {
@@ -533,13 +550,11 @@ mod tests {
             let ep = Endpoint::bind_with("127.0.0.1:0", cfg.clone()).await.unwrap();
             let addr = ep.local_addr();
             let listener = ep.listen(4).unwrap();
-            let (server, client) = tokio::join!(
-                async { listener.accept().await.unwrap() },
-                async {
+            let (server, client) =
+                tokio::join!(async { listener.accept().await.unwrap() }, async {
                     let cep = Endpoint::bind_with("127.0.0.1:0", cfg.clone()).await.unwrap();
                     cep.connect(addr).await.unwrap()
-                }
-            );
+                });
 
             let s = Arc::clone(&stop);
             tokio::spawn(async move {
@@ -554,7 +569,8 @@ mod tests {
 
             let mut buf = vec![0u8; CHUNK * 2];
             while stop.load(Ordering::Relaxed) == 0 {
-                match tokio::time::timeout(Duration::from_millis(500), server.recv(&mut buf)).await {
+                match tokio::time::timeout(Duration::from_millis(500), server.recv(&mut buf)).await
+                {
                     Ok(Ok(n)) => {
                         counter.fetch_add(n, Ordering::Relaxed);
                     }
@@ -590,12 +606,8 @@ mod tests {
             100.0 * led as f64 / (udt + led).max(1) as f64,
         );
         assert!(led > 0, "LEDBAT flow moved nothing at all");
-        assert!(
-            led <= udt,
-            "LEDBAT flow ({led} B) did not yield to the default flow ({udt} B)",
-        );
+        assert!(led <= udt, "LEDBAT flow ({led} B) did not yield to the default flow ({udt} B)",);
     }
-
 
     /// Every `send` must surface as exactly one `recv` of the same length.
     #[tokio::test(flavor = "multi_thread")]
@@ -644,7 +656,6 @@ mod tests {
             worst.as_secs_f64() * 1e3,
         );
     }
-
 
     const BENCH_TOTAL: usize = 128 * 1024 * 1024;
     const BENCH_CHUNK: usize = 64 * 1024;
@@ -739,7 +750,6 @@ mod tests {
         report("profile rust→rust", total, start.elapsed().as_secs_f64());
     }
 
-
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn connect_latency() {
@@ -802,7 +812,9 @@ mod tests {
                         let sender = tokio::spawn(async move {
                             let mut sent = 0usize;
                             while sent < PER_CONN {
-                                if w.send(&c).await.is_err() { break; }
+                                if w.send(&c).await.is_err() {
+                                    break;
+                                }
                                 sent += BENCH_CHUNK;
                             }
                         });
@@ -860,10 +872,9 @@ mod tests {
             };
             let b = Arc::new(Endpoint::bind("127.0.0.1:0").await.unwrap());
             let (aa, ba) = (a.local_addr(), b.local_addr());
-            let (sa, sb) = tokio::join!(
-                async { a.connect_rendezvous(ba).await.unwrap() },
-                async { b.connect_rendezvous(aa).await.unwrap() },
-            );
+            let (sa, sb) = tokio::join!(async { a.connect_rendezvous(ba).await.unwrap() }, async {
+                b.connect_rendezvous(aa).await.unwrap()
+            },);
             pairs.push((sa, sb, a, b));
         }
 
@@ -876,7 +887,9 @@ mod tests {
                     let sender = tokio::spawn(async move {
                         let mut sent = 0usize;
                         while sent < PER_CONN {
-                            if sa.send(&chunk).await.is_err() { break; }
+                            if sa.send(&chunk).await.is_err() {
+                                break;
+                            }
                             sent += BENCH_CHUNK;
                         }
                         sa
@@ -931,8 +944,6 @@ mod tests {
         report("stream rust→rust", got, elapsed);
     }
 
-
-
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn stream_rust_two_connections() {
@@ -983,11 +994,8 @@ mod tests {
                 })
             })
             .collect();
-        let totals: Vec<usize> = futures::future::join_all(xfer)
-            .await
-            .into_iter()
-            .map(|r| r.unwrap())
-            .collect();
+        let totals: Vec<usize> =
+            futures::future::join_all(xfer).await.into_iter().map(|r| r.unwrap()).collect();
         let elapsed = start.elapsed().as_secs_f64();
         report("stream rust 2-conn", totals.iter().sum(), elapsed);
     }
@@ -1016,7 +1024,4 @@ mod tests {
         }
         report_latency("pingpong rust→rust", PINGPONG_MSGS, start.elapsed().as_secs_f64());
     }
-
-
-
 }

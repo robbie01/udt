@@ -1,6 +1,6 @@
-use bytes::Bytes;
-use crate::seq::MsgNo;
 use crate::packet::MsgBoundary;
+use crate::seq::MsgNo;
+use bytes::Bytes;
 
 /// A single block in the send buffer.
 pub struct Block {
@@ -59,7 +59,13 @@ impl SendBuffer {
     /// the caller's buffer (a refcount bump each) rather than copies. Splitting
     /// a large message would otherwise memcpy the whole payload a second time.
     #[allow(clippy::result_unit_err)]
-    pub fn add(&mut self, data: Bytes, ttl_ms: Option<u32>, in_order: bool, now_us: u64) -> Result<(), ()> {
+    pub fn add(
+        &mut self,
+        data: Bytes,
+        ttl_ms: Option<u32>,
+        in_order: bool,
+        now_us: u64,
+    ) -> Result<(), ()> {
         let n_chunks = data.len().div_ceil(self.payload_size);
         if n_chunks == 0 {
             return Ok(());
@@ -222,8 +228,6 @@ impl SendBuffer {
         self.len -= count;
         self.sent -= count;
     }
-
-
 
     /// Largest message, in bytes, that could ever fit in an empty buffer.
     /// A message above this size can never be queued and must be rejected

@@ -3,6 +3,11 @@ name = "udt-proto"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Exposes internals to the fuzz targets. Not for general use: it widens the
+# public surface to things with no stability promise at all.
+fuzzing = []
+
 [dependencies]
 bytes = "1"
 rand = "0.9"

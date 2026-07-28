@@ -71,6 +71,18 @@
 pub mod congestion;
 pub mod prelude;
 
+/// Internals reachable by the fuzz targets.
+///
+/// Behind the `fuzzing` feature and hidden from the documentation: these are
+/// implementation details with no stability promise whatsoever, exposed only so
+/// that the code handling untrusted input can be fuzzed directly rather than
+/// through several layers of state machine.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzz {
+    pub use crate::codec::decode;
+}
+
 mod ack_window;
 mod codec;
 mod connection;
@@ -88,4 +100,4 @@ pub use connection::{
     ConnMode, Connection, ConnectionStats, DisconnectReason, Event, SendOutcome, UDT_HEADER_SIZE,
 };
 pub use listener::{Listener, ListenerEvent, PeerAddr};
-pub use seq::{AckSeqNo, MsgNo, SeqNo, MSG_MAX, SEQ_MAX};
+pub use seq::{AckSeqNo, MSG_MAX, MsgNo, SEQ_MAX, SeqNo};

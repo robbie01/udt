@@ -12,7 +12,7 @@ use crate::seq::SeqNo;
 ///
 /// [`CcKind::Udt`]: crate::CcKind::Udt
 pub struct UdtCc {
-    rc_interval_us: u64,    // = SYN_INTERVAL (10_000 µs)
+    rc_interval_us: u64, // = SYN_INTERVAL (10_000 µs)
     last_rc_time_us: u64,
     slow_start: bool,
     last_ack: SeqNo,
@@ -60,7 +60,9 @@ impl UdtCc {
 }
 
 impl Default for UdtCc {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CongestionControl for UdtCc {
@@ -104,7 +106,8 @@ impl CongestionControl for UdtCc {
                 if ctx.rcv_rate_pps > 0 {
                     self.pkt_snd_period_us = 1_000_000.0 / ctx.rcv_rate_pps as f64;
                 } else {
-                    self.pkt_snd_period_us = self.cwnd / (ctx.rtt_us as f64 + self.rc_interval_us as f64);
+                    self.pkt_snd_period_us =
+                        self.cwnd / (ctx.rtt_us as f64 + self.rc_interval_us as f64);
                 }
             }
         } else {
@@ -134,7 +137,8 @@ impl CongestionControl for UdtCc {
         let inc = if b <= 0.0 {
             MIN_INC
         } else {
-            let v = 10f64.powf((b * ctx.mss as f64 * 8.0).log10().ceil()) * 0.0000015 / ctx.mss as f64;
+            let v =
+                10f64.powf((b * ctx.mss as f64 * 8.0).log10().ceil()) * 0.0000015 / ctx.mss as f64;
             v.max(MIN_INC)
         };
 
@@ -156,13 +160,15 @@ impl CongestionControl for UdtCc {
 
         self.loss_flag = true;
 
-        let first_loss = if let Some(&(start, _)) = loss.first() { start } else { return self.output() };
+        let first_loss =
+            if let Some(&(start, _)) = loss.first() { start } else { return self.output() };
 
         if first_loss > self.last_dec_seq {
             self.last_dec_period = self.pkt_snd_period_us;
             self.pkt_snd_period_us = (self.pkt_snd_period_us * 1.125).ceil();
 
-            self.avg_nak_num = ((self.avg_nak_num as f64 * 0.875 + self.nak_count as f64 * 0.125).ceil()) as u32;
+            self.avg_nak_num =
+                ((self.avg_nak_num as f64 * 0.875 + self.nak_count as f64 * 0.125).ceil()) as u32;
             self.nak_count = 1;
             self.dec_count = 1;
             self.last_dec_seq = ctx.snd_curr_seq;
@@ -191,7 +197,8 @@ impl CongestionControl for UdtCc {
             if ctx.rcv_rate_pps > 0 {
                 self.pkt_snd_period_us = 1_000_000.0 / ctx.rcv_rate_pps as f64;
             } else {
-                self.pkt_snd_period_us = self.cwnd / (ctx.rtt_us as f64 + self.rc_interval_us as f64);
+                self.pkt_snd_period_us =
+                    self.cwnd / (ctx.rtt_us as f64 + self.rc_interval_us as f64);
             }
         }
         // The C++ onTimeout is commented out (only slow start handled, rest is no-op)

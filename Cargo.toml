@@ -1,5 +1,9 @@
 [workspace]
 resolver = "2"
+# The fuzz targets need nightly and are built by `cargo fuzz`, not by a
+# workspace build.
+exclude = ["fuzz"]
+
 members = [
     "udt-proto",
     "udt-async",

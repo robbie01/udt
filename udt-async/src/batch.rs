@@ -147,15 +147,9 @@ impl BatchIo {
         data: &[u8],
         segment_size: Option<usize>,
     ) -> io::Result<()> {
-        let transmit = Transmit {
-            destination: peer,
-            ecn: None,
-            contents: data,
-            segment_size,
-            src_ip: None,
-        };
-        sock.async_io(Interest::WRITABLE, || state.send(UdpSockRef::from(sock), &transmit))
-            .await
+        let transmit =
+            Transmit { destination: peer, ecn: None, contents: data, segment_size, src_ip: None };
+        sock.async_io(Interest::WRITABLE, || state.send(UdpSockRef::from(sock), &transmit)).await
     }
 
     /// Receive up to `storage.len()` datagrams in one call.
@@ -219,10 +213,7 @@ impl BatchIo {
 pub(crate) fn recv_buffers(io: &BatchIo) -> (Vec<Vec<u8>>, Vec<RecvMeta>) {
     let per_datagram = 2048;
     let cap = per_datagram * io.gro_segments().max(1);
-    (
-        (0..RECV_BATCH).map(|_| vec![0u8; cap]).collect(),
-        vec![RecvMeta::default(); RECV_BATCH],
-    )
+    ((0..RECV_BATCH).map(|_| vec![0u8; cap]).collect(), vec![RecvMeta::default(); RECV_BATCH])
 }
 
 /// Split one received buffer into its constituent datagrams.
@@ -235,7 +226,5 @@ pub(crate) fn split_run(buf: &[u8], meta: &RecvMeta) -> impl Iterator<Item = Byt
     let len = meta.len.min(buf.len());
     let stride = if meta.stride == 0 { len.max(1) } else { meta.stride };
     let run = Bytes::copy_from_slice(&buf[..len]);
-    (0..len)
-        .step_by(stride.max(1))
-        .map(move |off| run.slice(off..(off + stride).min(len)))
+    (0..len).step_by(stride.max(1)).map(move |off| run.slice(off..(off + stride).min(len)))
 }

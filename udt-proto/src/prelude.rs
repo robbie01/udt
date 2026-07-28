@@ -13,4 +13,4 @@ pub use crate::connection::{
     ConnMode, Connection, ConnectionStats, DisconnectReason, Event, SendOutcome, UDT_HEADER_SIZE,
 };
 pub use crate::listener::{Listener, ListenerEvent, PeerAddr};
-pub use crate::seq::{AckSeqNo, MsgNo, SeqNo, MSG_MAX, SEQ_MAX};
+pub use crate::seq::{AckSeqNo, MSG_MAX, MsgNo, SEQ_MAX, SeqNo};

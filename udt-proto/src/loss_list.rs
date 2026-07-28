@@ -50,9 +50,10 @@ impl SndLossList {
     pub fn remove_up_to(&mut self, ack: SeqNo) {
         self.ranges.retain(|&(_, e)| e > ack);
         if let Some((s, _)) = self.ranges.first_mut()
-            && *s <= ack {
-                *s = ack.next();
-            }
+            && *s <= ack
+        {
+            *s = ack.next();
+        }
     }
 
     /// Remove every entry in `[first, last]` — used when a message is dropped,
@@ -206,7 +207,6 @@ impl RcvLossList {
         }
         out
     }
-
 }
 
 impl SndLossList {
@@ -220,7 +220,9 @@ mod tests {
     use super::*;
     use crate::seq::SeqNo;
 
-    fn s(n: u32) -> SeqNo { SeqNo::new(n) }
+    fn s(n: u32) -> SeqNo {
+        SeqNo::new(n)
+    }
 
     #[test]
     fn snd_insert_and_pop() {

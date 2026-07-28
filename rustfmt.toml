@@ -1,0 +1,4 @@
+# Matches how this codebase is already written: a wider line, and short bodies
+# left on one line rather than exploded across three.
+max_width = 100
+use_small_heuristics = "Max"

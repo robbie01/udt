@@ -22,8 +22,8 @@
 //! delivered  = capacity × rtt × (cwnd / Σ cwnd)   // proportional share
 //! ```
 
-use crate::seq::SeqNo;
 use super::{CcContext, CongestionControl};
+use crate::seq::SeqNo;
 
 pub struct Link {
     /// Bottleneck capacity, packets per second.
@@ -154,10 +154,7 @@ mod tests {
     #[test]
     fn ledbat_yields_to_udt_cc_on_a_bottleneck() {
         let link = wan();
-        let mut flows = vec![
-            Flow::new(Box::new(UdtCc::new())),
-            Flow::new(Box::new(Ledbat::new())),
-        ];
+        let mut flows = vec![Flow::new(Box::new(UdtCc::new())), Flow::new(Box::new(Ledbat::new()))];
         run(&link, &mut flows, 4_000);
 
         let udt = flows[0].delivered;
@@ -180,12 +177,13 @@ mod tests {
         for (label, link) in [
             ("wan 50ms", wan()),
             ("lan 1ms", Link { capacity_pps: 80_000.0, base_rtt_us: 1_000.0, buffer_pkts: 800.0 }),
-            ("loopback 60us", Link { capacity_pps: 200_000.0, base_rtt_us: 60.0, buffer_pkts: 2_000.0 }),
+            (
+                "loopback 60us",
+                Link { capacity_pps: 200_000.0, base_rtt_us: 60.0, buffer_pkts: 2_000.0 },
+            ),
         ] {
-            let mut flows = vec![
-                Flow::new(Box::new(UdtCc::new())),
-                Flow::new(Box::new(Ledbat::new())),
-            ];
+            let mut flows =
+                vec![Flow::new(Box::new(UdtCc::new())), Flow::new(Box::new(Ledbat::new()))];
             let o = run(&link, &mut flows, 4_000);
             let (udt, led) = (flows[0].delivered, flows[1].delivered);
             println!(
@@ -208,10 +206,8 @@ mod tests {
         let mut solo = vec![Flow::new(Box::new(Ledbat::new()))];
         run(&link, &mut solo, 4_000);
 
-        let mut shared = vec![
-            Flow::new(Box::new(UdtCc::new())),
-            Flow::new(Box::new(Ledbat::new())),
-        ];
+        let mut shared =
+            vec![Flow::new(Box::new(UdtCc::new())), Flow::new(Box::new(Ledbat::new()))];
         run(&link, &mut shared, 4_000);
 
         assert!(

@@ -3,19 +3,20 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use tokio::net::{ToSocketAddrs, UdpSocket};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 use udt_proto::{CcKind, Connection, Listener as ProtoListener, ListenerEvent, SeqNo};
 
 use crate::batch::{self, BatchIo};
-use crate::conn::{wait_established, ConnectionInner, Socket};
+use crate::conn::{ConnectionInner, Socket, wait_established};
 use crate::driver;
-use crate::util::{Mutex, RwLock,
-    configure_udp_buffers, lock, next_socket_id, now_us, outgoing_bind_addr, sockaddr_to_peer_addr,
+use crate::util::{
+    Mutex, RwLock, configure_udp_buffers, lock, next_socket_id, now_us, outgoing_bind_addr,
+    sockaddr_to_peer_addr,
 };
 
 /// The path MTU assumed by default: 1500 bytes, standard Ethernet.
@@ -511,8 +512,7 @@ async fn handle_handshake(ep: &Arc<EndpointInner>, from: SocketAddr, datagram: B
                 let inner = ConnectionInner::new(*conn);
                 spawn_shared(ep, &inner, from);
 
-                let socket =
-                    Socket { inner, peer_addr: from, local_addr: ep.local_addr };
+                let socket = Socket { inner, peer_addr: from, local_addr: ep.local_addr };
                 let accept_tx = {
                     let guard = lock(&ep.listener);
                     guard.as_ref().map(|slot| slot.accept_tx.clone())

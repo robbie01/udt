@@ -13,8 +13,8 @@
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     use tokio::net::UdpSocket;
@@ -54,10 +54,7 @@ mod tests {
     /// Datagrams from the server go to the last address that sent us anything
     /// else, which is all the bookkeeping one connection through one relay
     /// needs.
-    async fn spawn_relay(
-        server: SocketAddr,
-        cfg: RelayConfig,
-    ) -> (SocketAddr, Arc<RelayStats>) {
+    async fn spawn_relay(server: SocketAddr, cfg: RelayConfig) -> (SocketAddr, Arc<RelayStats>) {
         let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let addr = sock.local_addr().unwrap();
         let stats = Arc::new(RelayStats::default());

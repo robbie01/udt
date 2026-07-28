@@ -2,23 +2,23 @@
 /// All fields are little-endian on the wire (C++ uses raw host-order int32_t casts).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Handshake {
-    pub version: i32,           // must be 4
-    pub sock_type: i32,         // must be 2 (SOCK_DGRAM)
-    pub isn: i32,               // initial sequence number
-    pub mss: i32,               // max segment size
-    pub flight_flag_size: i32,  // flow control window (packets)
-    pub req_type: i32,          // see ReqType constants
+    pub version: i32,          // must be 4
+    pub sock_type: i32,        // must be 2 (SOCK_DGRAM)
+    pub isn: i32,              // initial sequence number
+    pub mss: i32,              // max segment size
+    pub flight_flag_size: i32, // flow control window (packets)
+    pub req_type: i32,         // see ReqType constants
     pub socket_id: i32,
     pub cookie: i32,
-    pub peer_ip: [u32; 4],      // peer address (IPv4 in [0], rest 0; or IPv6)
+    pub peer_ip: [u32; 4], // peer address (IPv4 in [0], rest 0; or IPv6)
 }
 
 pub mod req_type {
-    pub const CONNECT: i32     =  1;
-    pub const RENDEZVOUS: i32  =  0;
-    pub const RESPONSE: i32    = -1;
-    pub const RDVZ_DONE: i32   = -2; // already-connected rendezvous retransmit ack
-    pub const REJECTED: i32    = 1002;
+    pub const CONNECT: i32 = 1;
+    pub const RENDEZVOUS: i32 = 0;
+    pub const RESPONSE: i32 = -1;
+    pub const RDVZ_DONE: i32 = -2; // already-connected rendezvous retransmit ack
+    pub const REJECTED: i32 = 1002;
 }
 
 pub const HANDSHAKE_SIZE: usize = 48;
@@ -59,20 +59,30 @@ impl Handshake {
             off += 4;
             Some(v)
         };
-        let version          = read_i32()?;
-        let sock_type        = read_i32()?;
-        let isn              = read_i32()?;
-        let mss              = read_i32()?;
+        let version = read_i32()?;
+        let sock_type = read_i32()?;
+        let isn = read_i32()?;
+        let mss = read_i32()?;
         let flight_flag_size = read_i32()?;
-        let req_type         = read_i32()?;
-        let socket_id        = read_i32()?;
-        let cookie           = read_i32()?;
+        let req_type = read_i32()?;
+        let socket_id = read_i32()?;
+        let cookie = read_i32()?;
         let mut peer_ip = [0u32; 4];
         for slot in &mut peer_ip {
             *slot = u32::from_be_bytes(buf[off..off + 4].try_into().ok()?);
             off += 4;
         }
-        Some(Handshake { version, sock_type, isn, mss, flight_flag_size, req_type, socket_id, cookie, peer_ip })
+        Some(Handshake {
+            version,
+            sock_type,
+            isn,
+            mss,
+            flight_flag_size,
+            req_type,
+            socket_id,
+            cookie,
+            peer_ip,
+        })
     }
 }
 

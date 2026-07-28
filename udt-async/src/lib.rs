@@ -80,7 +80,7 @@ mod util;
 pub use conn::{SendOptions, Socket};
 #[cfg(feature = "tokio")]
 pub use endpoint::{
-    max_payload_for_mtu, Endpoint, EndpointConfig, Listener, DEFAULT_MTU, MAX_PAYLOAD_SIZE,
+    DEFAULT_MTU, Endpoint, EndpointConfig, Listener, MAX_PAYLOAD_SIZE, max_payload_for_mtu,
 };
 
 #[cfg(feature = "tokio")]

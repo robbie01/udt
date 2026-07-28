@@ -1,0 +1,7 @@
+# Corpora grow without bound across runs. Only inputs that once triggered a
+# crash are worth committing, as seeds that keep the bug from coming back.
+target/
+corpus/*/*
+!corpus/*/oom-*
+!corpus/*/crash-*
+!corpus/*/timeout-*

@@ -5,17 +5,17 @@
 //! a faithful, testable model of the format rather than only of what we
 //! happen to act on.
 
-use bytes::Bytes;
-use crate::seq::{SeqNo, MsgNo, AckSeqNo};
 use crate::handshake::Handshake;
+use crate::seq::{AckSeqNo, MsgNo, SeqNo};
+use bytes::Bytes;
 
 /// Message boundary flags (bits 31-30 of data packet word 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MsgBoundary {
-    Solo   = 0b11, // complete single-packet message
-    First  = 0b10, // first packet of a multi-packet message
-    Last   = 0b01, // last packet
+    Solo = 0b11,   // complete single-packet message
+    First = 0b10,  // first packet of a multi-packet message
+    Last = 0b01,   // last packet
     Middle = 0b00, // middle packet
 }
 
@@ -25,7 +25,7 @@ impl MsgBoundary {
             0b11 => MsgBoundary::Solo,
             0b10 => MsgBoundary::First,
             0b01 => MsgBoundary::Last,
-            _    => MsgBoundary::Middle,
+            _ => MsgBoundary::Middle,
         }
     }
 
@@ -45,16 +45,16 @@ impl MsgBoundary {
 /// Control packet type (bits 30-16 of control packet word 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlType {
-    Handshake,          // 0x0000
-    KeepAlive,          // 0x0001
-    Ack,                // 0x0002
-    Nak,                // 0x0003
-    CongestionWarning,  // 0x0004
-    Shutdown,           // 0x0005
-    Ack2,               // 0x0006
-    MsgDrop,            // 0x0007
-    ErrorSignal,        // 0x0008
-    UserDefined(u16),   // 0x7FFF — extended type carried separately
+    Handshake,         // 0x0000
+    KeepAlive,         // 0x0001
+    Ack,               // 0x0002
+    Nak,               // 0x0003
+    CongestionWarning, // 0x0004
+    Shutdown,          // 0x0005
+    Ack2,              // 0x0006
+    MsgDrop,           // 0x0007
+    ErrorSignal,       // 0x0008
+    UserDefined(u16),  // 0x7FFF — extended type carried separately
 }
 
 impl ControlType {
@@ -76,16 +76,16 @@ impl ControlType {
 
     pub fn type_bits(self) -> u16 {
         match self {
-            ControlType::Handshake         => 0x0000,
-            ControlType::KeepAlive         => 0x0001,
-            ControlType::Ack               => 0x0002,
-            ControlType::Nak               => 0x0003,
+            ControlType::Handshake => 0x0000,
+            ControlType::KeepAlive => 0x0001,
+            ControlType::Ack => 0x0002,
+            ControlType::Nak => 0x0003,
             ControlType::CongestionWarning => 0x0004,
-            ControlType::Shutdown          => 0x0005,
-            ControlType::Ack2              => 0x0006,
-            ControlType::MsgDrop           => 0x0007,
-            ControlType::ErrorSignal       => 0x0008,
-            ControlType::UserDefined(_)    => 0x7FFF,
+            ControlType::Shutdown => 0x0005,
+            ControlType::Ack2 => 0x0006,
+            ControlType::MsgDrop => 0x0007,
+            ControlType::ErrorSignal => 0x0008,
+            ControlType::UserDefined(_) => 0x7FFF,
         }
     }
 }
@@ -136,14 +136,8 @@ pub struct AckFull {
 /// A fully parsed UDT packet.
 #[derive(Debug, Clone)]
 pub enum Packet {
-    Data {
-        header: DataHeader,
-        payload: Bytes,
-    },
-    Control {
-        header: ControlHeader,
-        body: ControlBody,
-    },
+    Data { header: DataHeader, payload: Bytes },
+    Control { header: ControlHeader, body: ControlBody },
 }
 
 /// Parsed control packet body.
@@ -151,12 +145,16 @@ pub enum Packet {
 pub enum ControlBody {
     Handshake(Handshake),
     KeepAlive,
-    Ack(AckSeqNo, AckPayload),   // (ack_sub_seq_no, payload)
+    Ack(AckSeqNo, AckPayload), // (ack_sub_seq_no, payload)
     Nak(NakList),
     CongestionWarning,
     Shutdown,
-    Ack2(AckSeqNo),              // ACK sub-seq no being acknowledged
-    MsgDrop { msg_no: MsgNo, first: SeqNo, last: SeqNo },
+    Ack2(AckSeqNo), // ACK sub-seq no being acknowledged
+    MsgDrop {
+        msg_no: MsgNo,
+        first: SeqNo,
+        last: SeqNo,
+    },
     ErrorSignal {
         #[allow(dead_code)]
         error_code: i32,

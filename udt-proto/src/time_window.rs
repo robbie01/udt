@@ -5,15 +5,15 @@
 /// - 16-slot arrival-time window → packet receive rate (pkt/s)
 /// - 64-slot probe-interval window → bandwidth estimate (pkt/s)
 pub struct PktTimeWindow {
-    arr_times: [u64; 16],     // packet arrival timestamps (µs)
+    arr_times: [u64; 16], // packet arrival timestamps (µs)
     arr_ptr: usize,
     arr_count: usize,
-    probe_times: [u32; 64],   // inter-probe intervals (µs)
+    probe_times: [u32; 64], // inter-probe intervals (µs)
     probe_ptr: usize,
     probe_count: usize,
-    probe_time: u64,               // time of last probe1 packet
+    probe_time: u64, // time of last probe1 packet
     last_arr_time: u64,
-    min_pkt_snd_int: u32,          // minimum inter-arrival interval observed (µs)
+    min_pkt_snd_int: u32, // minimum inter-arrival interval observed (µs)
 }
 
 impl PktTimeWindow {
@@ -105,7 +105,6 @@ impl PktTimeWindow {
         }
         1_000_000 / median
     }
-
 }
 
 impl Default for PktTimeWindow {
