@@ -1512,3 +1512,261 @@ impl Connection {
         now_us as u32
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packet::MsgBoundary;
+    use crate::seq::MsgNo;
+
+    /// A connection wound forward to Connected, bypassing the handshake, so a
+    /// test can reach the steady-state paths directly.
+    fn connected(now_us: u64) -> Connection {
+        let mut c = Connection::new_connected(
+            1,
+            2,
+            SeqNo::new(100),
+            SeqNo::new(500),
+            1500,
+            8192,
+            now_us,
+            CcKind::Udt.build(),
+        );
+        // new_connected leaves the first timer call to the driver.
+        let mut out = Vec::new();
+        c.on_timer(now_us, &mut out);
+        c
+    }
+
+    /// Deliver one data packet from the peer, so there is something to
+    /// acknowledge. A connection with nothing outstanding suppresses ACKs.
+    fn feed_one_packet(c: &mut Connection, seq: u32, now_us: u64) {
+        let mut buf = BytesMut::new();
+        codec::encode_data(
+            SeqNo::new(seq),
+            MsgBoundary::Solo,
+            true,
+            MsgNo::new(1),
+            0,
+            c.socket_id(),
+            b"payload",
+            &mut buf,
+        );
+        let mut out = Vec::new();
+        c.on_datagram(buf.freeze(), now_us, &mut out);
+    }
+
+    fn datagrams(out: &[Event]) -> Vec<Bytes> {
+        out.iter()
+            .filter_map(|e| match e {
+                Event::SendDatagram(d) => Some(d.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn decode_all(out: &[Event]) -> Vec<Packet> {
+        datagrams(out).into_iter().filter_map(codec::decode).collect()
+    }
+
+    #[test]
+    fn a_queued_message_is_packed_into_data_packets() {
+        let mut c = connected(1_000_000);
+        let mut out = Vec::new();
+        // Three payloads' worth, so it cannot come out as a single packet.
+        let payload = Bytes::from(vec![0xABu8; 4000]);
+        assert_eq!(c.send_msg(payload, None, true, 1_000_000, &mut out), SendOutcome::Queued);
+
+        let packets = decode_all(&out);
+        let data: Vec<_> = packets
+            .iter()
+            .filter_map(|p| match p {
+                Packet::Data { header, payload } => Some((header, payload)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(data.len(), 3, "4000 bytes should span three 1436-byte payloads");
+
+        assert!(data[0].0.boundary.is_first() && !data[0].0.boundary.is_last());
+        assert!(!data[1].0.boundary.is_first() && !data[1].0.boundary.is_last());
+        assert!(data[2].0.boundary.is_last() && !data[2].0.boundary.is_first());
+
+        let total: usize = data.iter().map(|(_, p)| p.len()).sum();
+        assert_eq!(total, 4000, "the payload was not reassembled to its original length");
+
+        // Sequence numbers run consecutively from the initial one.
+        assert_eq!(data[0].0.seq_no, SeqNo::new(100));
+        assert_eq!(data[1].0.seq_no, SeqNo::new(101));
+        assert_eq!(data[2].0.seq_no, SeqNo::new(102));
+        // One message, so one message number throughout.
+        assert_eq!(data[0].0.msg_no, data[2].0.msg_no);
+    }
+
+    #[test]
+    fn a_message_larger_than_the_buffer_is_rejected_not_deferred() {
+        let mut c = connected(1_000_000);
+        let mut out = Vec::new();
+        let huge = Bytes::from(vec![0u8; c.max_msg_bytes() + 1]);
+        // Rejected, not WouldBlock: waiting would never help.
+        assert_eq!(c.send_msg(huge, None, true, 1_000_000, &mut out), SendOutcome::Rejected);
+    }
+
+    #[test]
+    fn an_ack_is_suppressed_when_there_is_nothing_new_to_report() {
+        let mut c = connected(1_000_000);
+        let mut out = Vec::new();
+        c.emit_ack(1_000_000, false, &mut out);
+        assert!(
+            out.is_empty(),
+            "a connection with nothing outstanding should not repeat itself to the peer"
+        );
+    }
+
+    #[test]
+    fn a_full_ack_reports_the_receive_state() {
+        let mut c = connected(1_000_000);
+        feed_one_packet(&mut c, 500, 1_000_000);
+        let mut out = Vec::new();
+        c.emit_ack(1_000_100, false, &mut out);
+
+        let packets = decode_all(&out);
+        let ack = packets
+            .iter()
+            .find_map(|p| match p {
+                Packet::Control { body: ControlBody::Ack(asn, payload), .. } => {
+                    Some((asn, payload))
+                }
+                _ => None,
+            })
+            .expect("no ACK was emitted");
+        let full = ack.1.full.as_ref().expect("a full ACK should carry the extended fields");
+        assert!(full.avail_buf_pkts > 0, "the advertised window should not be zero");
+        assert_eq!(
+            ack.1.data_ack_seq,
+            SeqNo::new(501),
+            "should acknowledge one past the packet just received"
+        );
+    }
+
+    #[test]
+    fn a_light_ack_omits_the_extended_fields() {
+        let mut c = connected(1_000_000);
+        feed_one_packet(&mut c, 500, 1_000_000);
+        let mut out = Vec::new();
+        c.emit_ack(1_000_100, true, &mut out);
+        let packets = decode_all(&out);
+        let ack = packets
+            .iter()
+            .find_map(|p| match p {
+                Packet::Control { body: ControlBody::Ack(_, payload), .. } => Some(payload),
+                _ => None,
+            })
+            .expect("no ACK was emitted");
+        assert!(ack.full.is_none(), "a light ACK should carry only the sequence number");
+    }
+
+    #[test]
+    fn an_acknowledgement_for_data_never_sent_is_treated_as_hostile() {
+        let mut c = connected(1_000_000);
+        let mut out = Vec::new();
+        // Nothing has been sent, so anything above the initial sequence number
+        // is an acknowledgement of data that does not exist.
+        c.recv_ctrl(
+            ControlBody::Ack(
+                AckSeqNo::new(1),
+                crate::packet::AckPayload { data_ack_seq: SeqNo::new(9999), full: None },
+            ),
+            1_000_000,
+            &mut out,
+        );
+        assert!(
+            out.iter().any(|e| matches!(e, Event::Disconnected(DisconnectReason::PeerError))),
+            "an impossible acknowledgement should fail the connection, not advance the buffer"
+        );
+    }
+
+    #[test]
+    fn shutdown_tells_the_peer_and_reports_locally() {
+        let mut c = connected(1_000_000);
+        let mut out = Vec::new();
+        c.shutdown(1_000_000, &mut out);
+
+        assert!(
+            decode_all(&out)
+                .iter()
+                .any(|p| matches!(p, Packet::Control { body: ControlBody::Shutdown, .. })),
+            "no shutdown was sent to the peer"
+        );
+        assert!(
+            out.iter().any(|e| matches!(e, Event::Disconnected(DisconnectReason::LocalClose))),
+            "the application was not told the connection closed"
+        );
+        assert!(!c.is_connected());
+        assert_eq!(c.next_deadline_us(), None, "a closed connection should want no more timers");
+    }
+
+    #[test]
+    fn the_expiry_interval_grows_with_consecutive_silences() {
+        let mut c = connected(1_000_000);
+        c.rtt_us = 10_000;
+        c.rtt_var_us = 1_000;
+
+        c.exp_count = 1;
+        let first = c.exp_int_us();
+        c.exp_count = 4;
+        let fourth = c.exp_int_us();
+        assert!(fourth > first, "the expiry timer should back off, not stay flat");
+        assert!(first >= MIN_EXP_PER_COUNT_US, "the interval should respect its floor");
+    }
+
+    #[test]
+    fn a_congestion_controller_can_override_the_retransmission_timeout() {
+        let mut c = connected(1_000_000);
+        c.exp_count = 1;
+        let derived = c.exp_int_us();
+        c.cc_rto_us = Some(derived * 4);
+        assert_eq!(c.exp_int_us(), derived * 4, "the controller's timeout was ignored");
+    }
+
+    #[test]
+    fn the_nak_interval_tracks_the_round_trip() {
+        let mut c = connected(1_000_000);
+        c.rtt_us = 50_000;
+        assert_eq!(c.nak_int_us(), 200_000, "should be four round trips");
+        // ...but never tighter than the control interval, however fast the link.
+        c.rtt_us = 1;
+        assert_eq!(c.nak_int_us(), SYN_US as u64);
+    }
+
+    #[test]
+    fn a_datagram_for_a_different_socket_is_ignored() {
+        let mut c = connected(1_000_000);
+        let mut out = Vec::new();
+
+        // A data packet addressed to socket 999, which is not us.
+        let mut buf = BytesMut::new();
+        codec::encode_data(
+            SeqNo::new(500),
+            MsgBoundary::Solo,
+            true,
+            MsgNo::new(1),
+            0,
+            999,
+            b"not for you",
+            &mut buf,
+        );
+        c.on_datagram(buf.freeze(), 1_000_000, &mut out);
+
+        assert!(c.recv_msg().is_none(), "a misaddressed packet was delivered");
+    }
+
+    #[test]
+    fn a_truncated_datagram_is_ignored_rather_than_panicking() {
+        let mut c = connected(1_000_000);
+        let mut out = Vec::new();
+        for len in 0..16 {
+            c.on_datagram(Bytes::from(vec![0xFFu8; len]), 1_000_000, &mut out);
+        }
+        assert!(c.is_connected(), "a short datagram should be dropped, not fatal");
+    }
+}
