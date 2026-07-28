@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 pub(crate) use std::sync::{Mutex, MutexGuard, RwLock};
 use std::time::Instant;
 
-use udt_proto::{DisconnectReason, PeerAddr};
+use udt_proto::PeerAddr;
 
 /// Kernel UDP send buffer, in bytes.
 ///
@@ -65,26 +65,6 @@ pub(crate) fn sockaddr_to_peer_addr(addr: SocketAddr) -> PeerAddr {
 
 pub(crate) fn closed() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "connection closed")
-}
-
-pub(crate) fn disconnect_err(reason: DisconnectReason) -> io::Error {
-    match reason {
-        DisconnectReason::Timeout => {
-            io::Error::new(io::ErrorKind::TimedOut, "peer stopped responding")
-        }
-        DisconnectReason::PeerError => {
-            io::Error::new(io::ErrorKind::ConnectionReset, "peer rejected the connection")
-        }
-        DisconnectReason::Shutdown => {
-            io::Error::new(io::ErrorKind::BrokenPipe, "connection closed by peer")
-        }
-        DisconnectReason::PathMtu => io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "no data reached the peer though it is responding; \
-             the path likely cannot carry packets this large -- retry with a smaller MTU",
-        ),
-        DisconnectReason::LocalClose => closed(),
-    }
 }
 
 /// Size the kernel socket buffers before handing the socket to tokio.

@@ -1,235 +1,53 @@
-//! Connection state shared between the application and the IO tasks.
+//! The application's handle on a connection.
 //!
-//! The protocol state machine lives in a mutex that both sides reach into
-//! directly. A `send` locks it, hands the payload to the state machine, and
-//! takes away the datagrams that came back; a `recv` locks it and pulls a
-//! message straight out of the reassembly buffer. Nothing copies application
-//! data into a channel on the way past, and the two directions only contend
-//! for the few microseconds either one holds the lock.
+//! The protocol state machine is owned outright by the connection's driver
+//! task, and this talks to it over channels. Nothing here touches it directly.
 //!
-//! Readiness travels the other way, as [`Notify`] wakeups: whoever advances
-//! the state machine notifies whichever side that unblocked. Waiters use
-//! tokio's register-then-check ordering ([`Notified::enable`]), so a wakeup
-//! that lands between the check and the park is not lost.
+//! That is deliberate, and it was measured both ways. Sharing the state behind
+//! a mutex lets a send hand its payload straight to the state machine with no
+//! channel in between, which is faster for a single connection — but the
+//! driver's critical section is nearly all of its work, so every other task on
+//! that connection blocks behind it and the two directions stop overlapping.
+//! On Linux, with identical protocol tuning on both, that cost 35% at two
+//! connections and 39% on a rendezvous pair, against a 20% gain on one.
 //!
-//! [`Notified::enable`]: tokio::sync::futures::Notified::enable
+//! Application payloads still do not become an allocation per packet: the
+//! state machine assembles its datagrams into a [`TransmitBuf`] the driver
+//! owns and reuses.
+//!
+//! [`TransmitBuf`]: udt_proto::TransmitBuf
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::sync::Notify;
-use udt_proto::{Connection, DisconnectReason, Event, SendOutcome, TransmitBuf};
+use tokio::sync::{mpsc, oneshot};
 
-use crate::util::{Mutex, disconnect_err, lock, now_us};
+use crate::util::closed;
 
-/// Readiness signals for one connection.
+/// Work handed from the application to the driver.
+pub(crate) enum SendReq {
+    Data {
+        payload: Bytes,
+        ttl_ms: Option<u32>,
+        in_order: bool,
+    },
+    /// Resolved once everything queued before it has been acknowledged.
+    Flush {
+        notify: oneshot::Sender<()>,
+    },
+}
+
+/// Messages the driver may hold for the application before it stops taking
+/// more off the network.
 ///
-/// Separate from [`State`] so a task can wait on one without holding the lock
-/// that the task it is waiting for needs.
-#[derive(Default)]
-pub(crate) struct Shared {
-    /// A message can be read.
-    pub(crate) readable: Notify,
-    /// The send buffer may have room, or has drained.
-    pub(crate) writable: Notify,
-    /// The handshake finished, or the connection failed.
-    pub(crate) established: Notify,
-    /// The driver has work: datagrams to write, or a deadline that moved.
-    pub(crate) driver: Notify,
-    /// Whether anyone is parked on `writable`.
-    ///
-    /// [`Notify::notify_waiters`] is not free — it takes an internal lock and
-    /// walks a list — and the send buffer has room on all but a handful of the
-    /// hundreds of thousands of acknowledgements a second a busy connection
-    /// processes. This turns the common case into one relaxed atomic load.
-    write_blocked: AtomicBool,
-}
+/// Once this fills, backpressure reaches the peer through the protocol's own
+/// flow control, which is the mechanism meant to carry it.
+pub(crate) const RECV_BACKLOG: usize = 256;
 
-impl Shared {
-    /// Announce that the send buffer may have room. Cheap when nobody cares.
-    pub(crate) fn wake_writers(&self) {
-        if self.write_blocked.swap(false, Ordering::AcqRel) {
-            self.writable.notify_waiters();
-        }
-    }
-
-    /// Called before checking whether a send can proceed, so that a wakeup
-    /// arriving during the check is not lost.
-    fn expect_writable(&self) {
-        self.write_blocked.store(true, Ordering::Release);
-    }
-}
-
-/// Datagrams an endpoint reader may leave queued for one connection before it
-/// starts discarding them.
-///
-/// Reaching this means the driver has fallen a whole receive buffer behind,
-/// which flow control should have prevented. Discarding from here is what an
-/// overrun kernel socket buffer does, and UDT recovers from it the same way.
-const INBOX_LIMIT: usize = 8192;
-
-pub(crate) struct State {
-    pub(crate) conn: Connection,
-    /// Datagrams an endpoint reader has delivered but the driver has not yet
-    /// fed to the state machine. Unused by connections that own their socket.
-    ///
-    /// A plain vector under the connection's own lock, rather than a channel:
-    /// with receive offload the reader hands over a run of up to 64 datagrams
-    /// at once, and this takes the lock once for the whole run where a channel
-    /// charges an atomic and a possible wakeup for every datagram in it.
-    /// Measured on Linux, that difference is 3.2x on a single connection.
-    pub(crate) inbox: Vec<Bytes>,
-    /// Datagrams the state machine has produced and nobody has written yet.
-    ///
-    /// The protocol writes straight into this and the driver hands it to the
-    /// kernel, so a packet is built once, in memory that is reused for the
-    /// life of the connection.
-    pub(crate) out: TransmitBuf,
-    /// Scratch for [`Event`]s. Owned by the state so it keeps its capacity
-    /// across calls instead of being reallocated per datagram.
-    events: Vec<Event>,
-    /// Set once the connection has ended; every later operation fails with it.
-    pub(crate) error: Option<DisconnectReason>,
-    pub(crate) connected: bool,
-}
-
-pub(crate) struct ConnectionInner {
-    pub(crate) state: Mutex<State>,
-    pub(crate) shared: Shared,
-}
-
-impl ConnectionInner {
-    pub(crate) fn new(conn: Connection) -> Arc<Self> {
-        Arc::new(ConnectionInner {
-            state: Mutex::new(State {
-                conn,
-                inbox: Vec::new(),
-                out: TransmitBuf::new(),
-                events: Vec::new(),
-                error: None,
-                connected: false,
-            }),
-            shared: Shared::default(),
-        })
-    }
-}
-
-impl State {
-    /// Turn the events the state machine just produced into queued datagrams
-    /// and wakeups.
-    ///
-    /// Call after every entry into the state machine, with the lock still held.
-    pub(crate) fn absorb(&mut self, shared: &Shared) {
-        if self.events.is_empty() {
-            return;
-        }
-        // Swapped out rather than drained in place so the loop can push to
-        // `self.out`, and so the vector keeps its capacity.
-        let mut events = std::mem::take(&mut self.events);
-        let mut readable = false;
-        for event in events.drain(..) {
-            match event {
-                Event::DataReady => readable = true,
-                Event::Connected => {
-                    self.connected = true;
-                    shared.established.notify_waiters();
-                }
-                Event::Disconnected(reason) => {
-                    self.error.get_or_insert(reason);
-                }
-            }
-        }
-        self.events = events;
-
-        if readable {
-            shared.readable.notify_waiters();
-        }
-        if self.error.is_some() {
-            // Nothing more will arrive, so release everyone rather than
-            // leaving them parked until a timeout.
-            shared.readable.notify_waiters();
-            shared.writable.notify_waiters();
-            shared.established.notify_waiters();
-        }
-    }
-
-    /// Feed a run of datagrams to the state machine.
-    ///
-    /// The clock is read per datagram, not once for the batch. UDT estimates
-    /// the path's capacity from how far apart probe packets arrive, so giving a
-    /// whole batch one timestamp reports those probes as arriving together and
-    /// collapses the estimate — with receive offload handing over 64 datagrams
-    /// at a time, that throttled a 1 GB/s connection to 6 MB/s.
-    pub(crate) fn feed<I: IntoIterator<Item = Bytes>>(&mut self, datagrams: I) {
-        for datagram in datagrams {
-            self.conn.on_datagram(datagram, now_us(), &mut self.out, &mut self.events);
-        }
-    }
-
-    /// Queue datagrams for the driver, reporting whether it needs waking.
-    ///
-    /// They are not processed here: an endpoint reader serves every connection
-    /// on its port, so doing protocol work inline would serialise them all
-    /// behind one task.
-    pub(crate) fn deliver<I: IntoIterator<Item = Bytes>>(&mut self, datagrams: I) -> bool {
-        let was_empty = self.inbox.is_empty();
-        for datagram in datagrams {
-            if self.inbox.len() >= INBOX_LIMIT {
-                break;
-            }
-            self.inbox.push(datagram);
-        }
-        was_empty && !self.inbox.is_empty()
-    }
-
-    /// Feed everything an endpoint reader has queued to the state machine.
-    pub(crate) fn drain_inbox(&mut self) -> bool {
-        if self.inbox.is_empty() {
-            return false;
-        }
-        // Taken out so the state machine can borrow the rest of `self`, then
-        // put back to keep its capacity. No reader can refill it meanwhile --
-        // that needs the lock this is called under.
-        let mut inbox = std::mem::take(&mut self.inbox);
-        self.feed(inbox.drain(..));
-        self.inbox = inbox;
-        true
-    }
-
-    /// Run the protocol timers if any is already due.
-    ///
-    /// Worth doing straight after feeding in arrivals rather than waiting for
-    /// the driver's sleep to fire. Acknowledgements and the packets they
-    /// unblock both come out of `on_timer`, and a tokio sleep resolves at
-    /// millisecond granularity -- so on a path whose round trip is 0.1 ms that
-    /// put a millisecond of dead time in every feedback round, and slow start
-    /// opened its window ten times slower than the link allowed.
-    ///
-    /// Gated on the deadline rather than run unconditionally: at a million
-    /// packets a second the full timer path on every receive batch costs more
-    /// than it saves, measured at 24% on two connections.
-    pub(crate) fn run_due_timers(&mut self, now: u64) {
-        if self.conn.next_deadline_us().is_some_and(|due| due <= now) {
-            self.conn.on_timer(now, &mut self.out, &mut self.events);
-        }
-    }
-
-    pub(crate) fn on_timer(&mut self, now: u64) {
-        self.conn.on_timer(now, &mut self.out, &mut self.events);
-    }
-
-    /// The error to report to an application call, if the connection is over.
-    ///
-    /// Messages already reassembled stay readable after the peer closes, so
-    /// this deliberately says nothing about whether data remains.
-    fn app_error(&self) -> Option<io::Error> {
-        self.error.map(disconnect_err)
-    }
-}
+/// Send requests the application may queue before [`Socket::send`] waits.
+pub(crate) const SEND_BACKLOG: usize = 256;
 
 // ── Socket ────────────────────────────────────────────────────────────────────
 
@@ -250,7 +68,8 @@ impl State {
 ///
 /// [`UdpSocket`]: tokio::net::UdpSocket
 pub struct Socket {
-    pub(crate) inner: Arc<ConnectionInner>,
+    pub(crate) send_tx: mpsc::Sender<SendReq>,
+    pub(crate) recv_rx: flume::Receiver<Bytes>,
     pub(crate) peer_addr: SocketAddr,
     pub(crate) local_addr: SocketAddr,
 }
@@ -262,12 +81,9 @@ impl Socket {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::BrokenPipe`] if the connection has closed, or
-    /// [`ErrorKind::InvalidInput`] if the message is larger than the send
-    /// buffer can ever hold.
+    /// Returns [`ErrorKind::BrokenPipe`] if the connection has closed.
     ///
     /// [`ErrorKind::BrokenPipe`]: std::io::ErrorKind::BrokenPipe
-    /// [`ErrorKind::InvalidInput`]: std::io::ErrorKind::InvalidInput
     pub async fn send(&self, buf: &[u8]) -> io::Result<()> {
         self.send_bytes_with(Bytes::copy_from_slice(buf), SendOptions::new()).await
     }
@@ -300,31 +116,18 @@ impl Socket {
     ///
     /// As [`send`](Self::send).
     pub async fn send_bytes_with(&self, buf: Bytes, opts: SendOptions) -> io::Result<()> {
-        loop {
-            // Registered before the state is examined, so a wakeup arriving
-            // while this task holds the lock is still delivered.
-            let notified = self.inner.shared.writable.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            self.inner.shared.expect_writable();
-
-            match self.try_queue(buf.clone(), opts)? {
-                SendOutcome::Queued => return Ok(()),
-                SendOutcome::WouldBlock => {}
-                SendOutcome::Rejected => unreachable!("try_queue maps Rejected to an error"),
-            }
-            notified.await;
-        }
+        self.send_tx.send(opts.into_req(buf)).await.map_err(|_| closed())
     }
 
-    /// Sends a message if the send buffer has room, without waiting.
+    /// Sends a message if there is room to queue it, without waiting.
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::WouldBlock`] if the buffer is full, plus the
-    /// errors of [`send`](Self::send).
+    /// Returns [`ErrorKind::WouldBlock`] if there is not, or
+    /// [`ErrorKind::BrokenPipe`] if the connection has closed.
     ///
     /// [`ErrorKind::WouldBlock`]: std::io::ErrorKind::WouldBlock
+    /// [`ErrorKind::BrokenPipe`]: std::io::ErrorKind::BrokenPipe
     pub fn try_send(&self, buf: &[u8]) -> io::Result<()> {
         self.try_send_with(buf, SendOptions::new())
     }
@@ -336,47 +139,13 @@ impl Socket {
     ///
     /// As [`try_send`](Self::try_send).
     pub fn try_send_with(&self, buf: &[u8], opts: SendOptions) -> io::Result<()> {
-        match self.try_queue(Bytes::copy_from_slice(buf), opts)? {
-            SendOutcome::Queued => Ok(()),
-            _ => Err(io::Error::new(io::ErrorKind::WouldBlock, "send buffer full")),
-        }
-    }
-
-    /// Hand one message to the state machine and wake the driver if it took it.
-    fn try_queue(&self, payload: Bytes, opts: SendOptions) -> io::Result<SendOutcome> {
-        let outcome = {
-            let mut guard = lock(&self.inner.state);
-            let state = &mut *guard;
-            if let Some(e) = state.app_error() {
-                return Err(e);
+        let req = opts.into_req(Bytes::copy_from_slice(buf));
+        self.send_tx.try_send(req).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => {
+                io::Error::new(io::ErrorKind::WouldBlock, "send queue full")
             }
-            let outcome = state.conn.send_msg(
-                payload,
-                opts.ttl.map(|d| d.as_millis() as u32),
-                !opts.unordered,
-                now_us(),
-                &mut state.out,
-            );
-            state.absorb(&self.inner.shared);
-            outcome
-        };
-        match outcome {
-            SendOutcome::Queued => {
-                self.inner.shared.driver.notify_one();
-                Ok(SendOutcome::Queued)
-            }
-            SendOutcome::WouldBlock => Ok(SendOutcome::WouldBlock),
-            // Only returned for a message no buffer size could accept, or on a
-            // connection that closed between the check above and here.
-            SendOutcome::Rejected => {
-                Err(self
-                    .closed_or(io::Error::new(io::ErrorKind::InvalidInput, "message too large")))
-            }
-        }
-    }
-
-    fn closed_or(&self, otherwise: io::Error) -> io::Error {
-        lock(&self.inner.state).app_error().unwrap_or(otherwise)
+            mpsc::error::TrySendError::Closed(_) => closed(),
+        })
     }
 
     /// Receives the next message into `buf`, returning its length.
@@ -393,9 +162,7 @@ impl Socket {
     /// [`ErrorKind::BrokenPipe`]: std::io::ErrorKind::BrokenPipe
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         let msg = self.recv_bytes().await?;
-        let n = msg.len().min(buf.len());
-        buf[..n].copy_from_slice(&msg[..n]);
-        Ok(n)
+        Ok(copy_into(&msg, buf))
     }
 
     /// Receives the next message as an owned buffer, avoiding a copy.
@@ -404,16 +171,7 @@ impl Socket {
     ///
     /// As [`recv`](Self::recv).
     pub async fn recv_bytes(&self) -> io::Result<Bytes> {
-        loop {
-            let notified = self.inner.shared.readable.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-
-            match self.take_message()? {
-                Some(msg) => return Ok(msg),
-                None => notified.await,
-            }
-        }
+        self.recv_rx.recv_async().await.map_err(|_| closed())
     }
 
     /// Receives a message if one is ready, without waiting.
@@ -425,28 +183,12 @@ impl Socket {
     ///
     /// [`ErrorKind::WouldBlock`]: std::io::ErrorKind::WouldBlock
     pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        match self.take_message()? {
-            Some(msg) => {
-                let n = msg.len().min(buf.len());
-                buf[..n].copy_from_slice(&msg[..n]);
-                Ok(n)
+        match self.recv_rx.try_recv() {
+            Ok(msg) => Ok(copy_into(&msg, buf)),
+            Err(flume::TryRecvError::Empty) => {
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "no message ready"))
             }
-            None => Err(io::Error::new(io::ErrorKind::WouldBlock, "no message ready")),
-        }
-    }
-
-    /// Take one reassembled message, or report why there is none.
-    ///
-    /// Messages that arrived before the peer closed stay readable afterwards,
-    /// so the buffer is checked before the error.
-    fn take_message(&self) -> io::Result<Option<Bytes>> {
-        let mut guard = lock(&self.inner.state);
-        match guard.conn.recv_msg() {
-            Some(msg) => Ok(Some(msg)),
-            None => match guard.app_error() {
-                Some(e) => Err(e),
-                None => Ok(None),
-            },
+            Err(flume::TryRecvError::Disconnected) => Err(closed()),
         }
     }
 
@@ -456,27 +198,13 @@ impl Socket {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::BrokenPipe`] if the connection closes with data
-    /// still unacknowledged.
+    /// Returns [`ErrorKind::BrokenPipe`] if the connection closes first.
     ///
     /// [`ErrorKind::BrokenPipe`]: std::io::ErrorKind::BrokenPipe
     pub async fn flush(&self) -> io::Result<()> {
-        loop {
-            let notified = self.inner.shared.writable.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            self.inner.shared.expect_writable();
-            {
-                let state = lock(&self.inner.state);
-                if state.conn.snd_buf_is_empty() {
-                    return Ok(());
-                }
-                if let Some(e) = state.app_error() {
-                    return Err(e);
-                }
-            }
-            notified.await;
-        }
+        let (notify, done) = oneshot::channel();
+        self.send_tx.send(SendReq::Flush { notify }).await.map_err(|_| closed())?;
+        done.await.map_err(|_| closed())
     }
 
     /// The peer's address.
@@ -490,18 +218,10 @@ impl Socket {
     }
 }
 
-impl Drop for Socket {
-    fn drop(&mut self) {
-        {
-            let mut guard = lock(&self.inner.state);
-            let state = &mut *guard;
-            // Half-close rather than shutdown: a common pattern is to send and
-            // immediately drop, and the data still has to reach the peer.
-            state.conn.half_close(now_us(), &mut state.out, &mut state.events);
-            state.absorb(&self.inner.shared);
-        }
-        self.inner.shared.driver.notify_one();
-    }
+fn copy_into(msg: &[u8], buf: &mut [u8]) -> usize {
+    let n = msg.len().min(buf.len());
+    buf[..n].copy_from_slice(&msg[..n]);
+    n
 }
 
 // ── Send options ──────────────────────────────────────────────────────────────
@@ -541,33 +261,12 @@ impl SendOptions {
         self.unordered = true;
         self
     }
-}
 
-/// Wait for the handshake to finish.
-pub(crate) async fn wait_established(inner: &ConnectionInner) -> io::Result<()> {
-    loop {
-        let notified = inner.shared.established.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        {
-            let state = lock(&inner.state);
-            if state.connected {
-                return Ok(());
-            }
-            if let Some(reason) = state.error {
-                return Err(disconnect_err(reason));
-            }
+    fn into_req(self, payload: Bytes) -> SendReq {
+        SendReq::Data {
+            payload,
+            ttl_ms: self.ttl.map(|d| d.as_millis() as u32),
+            in_order: !self.unordered,
         }
-        notified.await;
     }
-}
-
-/// Report a connection as failed from outside the state machine, e.g. when the
-/// socket carrying it dies.
-pub(crate) fn fail(inner: &ConnectionInner, reason: DisconnectReason) {
-    let mut state = lock(&inner.state);
-    state.error.get_or_insert(reason);
-    inner.shared.readable.notify_waiters();
-    inner.shared.writable.notify_waiters();
-    inner.shared.established.notify_waiters();
 }

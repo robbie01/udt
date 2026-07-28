@@ -8,11 +8,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use tokio::net::{ToSocketAddrs, UdpSocket};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc, oneshot};
 use udt_proto::{CcKind, Connection, Listener as ProtoListener, ListenerEvent, SeqNo};
 
-use crate::batch::{self, BatchIo};
-use crate::conn::{ConnectionInner, Socket, wait_established};
+use crate::batch::{BatchIo, RecvBuffers};
+use crate::conn::{RECV_BACKLOG, SEND_BACKLOG, SendReq, Socket};
 use crate::driver;
 use crate::util::{
     Mutex, RwLock, configure_udp_buffers, lock, next_socket_id, now_us, outgoing_bind_addr,
@@ -37,12 +37,13 @@ pub const fn max_payload_for_mtu(mtu: u32) -> usize {
     if mtu <= FIXED_OVERHEAD { 0 } else { (mtu - FIXED_OVERHEAD) as usize }
 }
 
-/// Datagrams the reader takes per wakeup before dispatching them.
+/// Datagrams the reader may leave queued for one connection.
 ///
-/// Bounds how long one busy peer can hold the reader before every other
-/// connection on the endpoint gets a turn. Counts datagrams, not receive
-/// calls: with receive offload one buffer can hold 64.
-const RECV_DRAIN_CAP: usize = 256;
+/// Deep enough that a driver briefly descheduled loses nothing, shallow enough
+/// that one which has genuinely stopped keeping up starts dropping rather than
+/// growing without bound -- which is what an overrun socket buffer does, and
+/// what the protocol's loss recovery expects.
+const DATAGRAM_BACKLOG: usize = 256;
 
 /// Settings shared by every connection an [`Endpoint`] creates.
 ///
@@ -131,7 +132,7 @@ struct EndpointInner {
     /// readers only ever look routes up, and taking a read lock lets several
     /// of them dispatch to different connections at once. Writes happen once
     /// per connection, at accept and at close.
-    routes: RwLock<HashMap<SocketAddr, Arc<ConnectionInner>>>,
+    routes: RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>,
     listener: Mutex<Option<ListenerSlot>>,
     /// False once the `Endpoint` handle is dropped. Readers keep serving
     /// existing connections after that, and stop when the last one goes.
@@ -282,11 +283,15 @@ impl Endpoint {
             now_us(),
             self.inner.cfg.congestion,
         );
-        let inner = ConnectionInner::new(conn);
-        tokio::spawn(driver::run_owned(Arc::clone(&inner), socket, peer));
+        let (send_tx, send_rx) = mpsc::channel::<SendReq>(SEND_BACKLOG);
+        let (recv_tx, recv_rx) = flume::bounded::<Bytes>(RECV_BACKLOG);
+        let (connected_tx, connected) = oneshot::channel::<()>();
+        tokio::spawn(driver::run_owned(conn, socket, peer, send_rx, recv_tx, Some(connected_tx)));
 
-        wait_established(&inner).await?;
-        Ok(Socket { inner, peer_addr: peer, local_addr })
+        connected
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect handshake failed"))?;
+        Ok(Socket { send_tx, recv_rx, peer_addr: peer, local_addr })
     }
 
     /// Connects to a peer that is calling this at the same time.
@@ -310,13 +315,11 @@ impl Endpoint {
             now_us(),
             self.inner.cfg.congestion,
         );
-        let inner = ConnectionInner::new(conn);
-        spawn_shared(&self.inner, &inner, peer);
-
-        match wait_established(&inner).await {
-            Ok(()) => Ok(Socket { inner, peer_addr: peer, local_addr: self.inner.local_addr }),
-            Err(e) => Err(e),
-        }
+        let (socket, connected) = spawn_shared(&self.inner, conn, peer);
+        connected
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "rendezvous timed out"))?;
+        Ok(socket)
     }
 
     /// Accepts incoming connections on this endpoint's address.
@@ -370,19 +373,40 @@ async fn resolve(addr: impl ToSocketAddrs) -> io::Result<SocketAddr> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no address to connect to"))
 }
 
-/// Route `peer` to a new connection and start driving it.
+/// Route `peer` to a new connection, start driving it, and hand back the
+/// application's handle plus a signal for when the handshake completes.
 ///
 /// The route is registered before the driver starts so that no reply can
 /// arrive unrouted.
-fn spawn_shared(ep: &Arc<EndpointInner>, inner: &Arc<ConnectionInner>, peer: SocketAddr) {
-    let Ok(mut routes) = ep.routes.write() else { return };
-    routes.insert(peer, Arc::clone(inner));
-    drop(routes);
+fn spawn_shared(
+    ep: &Arc<EndpointInner>,
+    conn: Connection,
+    peer: SocketAddr,
+) -> (Socket, oneshot::Receiver<()>) {
+    let (datagram_tx, datagram_rx) = mpsc::channel::<Bytes>(DATAGRAM_BACKLOG);
+    let (send_tx, send_rx) = mpsc::channel::<SendReq>(SEND_BACKLOG);
+    let (recv_tx, recv_rx) = flume::bounded::<Bytes>(RECV_BACKLOG);
+    let (connected_tx, connected) = oneshot::channel::<()>();
 
-    let socket = Arc::clone(&ep.socket);
-    let inner = Arc::clone(inner);
-    let ep = Arc::clone(ep);
-    tokio::spawn(driver::run_shared(inner, socket, peer, move || ep.remove_route(peer)));
+    if let Ok(mut routes) = ep.routes.write() {
+        routes.insert(peer, datagram_tx);
+    }
+
+    let udp = Arc::clone(&ep.socket);
+    let owner = Arc::clone(ep);
+    tokio::spawn(driver::run_shared(
+        conn,
+        udp,
+        peer,
+        datagram_rx,
+        send_rx,
+        recv_tx,
+        Some(connected_tx),
+        move || owner.remove_route(peer),
+    ));
+
+    let socket = Socket { send_tx, recv_rx, peer_addr: peer, local_addr: ep.local_addr };
+    (socket, connected)
 }
 
 // ── Reader tasks ──────────────────────────────────────────────────────────────
@@ -402,18 +426,13 @@ fn spawn_shared(ep: &Arc<EndpointInner>, inner: &Arc<ConnectionInner>, peer: Soc
 /// and let each connection's own driver do the protocol work.
 async fn run_reader(ep: Arc<EndpointInner>) {
     let Ok(io) = BatchIo::new(&ep.socket) else { return };
-    let mut rx = batch::RecvBuffers::new(&io);
-    // Datagrams arrive from one peer at a time, so they are accumulated into a
-    // run and handed over when the peer changes. That takes each connection's
-    // lock once per run rather than once per datagram, without the per-packet
-    // hashing that grouping them into a map would cost.
-    let mut run: Vec<Bytes> = Vec::new();
-    let mut run_peer: Option<SocketAddr> = None;
-    let mut route: Option<Arc<ConnectionInner>> = None;
-    let mut unrouted: Vec<(SocketAddr, Bytes)> = Vec::new();
+    let mut rx = RecvBuffers::new(&io);
+    // Most datagrams arrive from the same peer as the last; remembering the
+    // previous route turns the hash lookup into an address comparison.
+    let mut cached: Option<(SocketAddr, mpsc::Sender<Bytes>)> = None;
 
     loop {
-        let mut count = tokio::select! {
+        let count = tokio::select! {
             result = io.recv_batch(&ep.socket, &mut rx.storage, &mut rx.metas) => match result {
                 Ok(n) => n,
                 Err(_) => return,
@@ -424,80 +443,59 @@ async fn run_reader(ep: Arc<EndpointInner>) {
             }
         };
 
-        // Drain whatever else is already queued in the same wakeup. On a
-        // platform with no `recvmmsg` a batch call returns one datagram, so
-        // without this a wakeup would cost a packet.
-        let mut drained = 0;
-        loop {
-            for i in 0..count {
-                let from = rx.metas[i].addr;
-                if run_peer != Some(from) {
-                    if let Some(peer) = run_peer {
-                        dispatch(peer, &route, &mut run, &mut unrouted);
+        // Forwarded as they are read rather than accumulated first. Holding a
+        // batch back delays the acknowledgements it would have produced, and
+        // every connection on the port pays that: buffering up to 256
+        // datagrams before dispatching any measured 28% slower across eight
+        // connections.
+        for i in 0..count {
+            let from = rx.metas[i].addr;
+            let route = match &cached {
+                Some((addr, tx)) if *addr == from => Some(tx.clone()),
+                _ => {
+                    let found = ep.routes.read().ok().and_then(|r| r.get(&from).cloned());
+                    if let Some(tx) = &found {
+                        cached = Some((from, tx.clone()));
                     }
-                    run_peer = Some(from);
-                    route = ep.routes.read().ok().and_then(|r| r.get(&from).cloned());
+                    found
                 }
-                // A buffer can hold a run of datagrams coalesced by receive
-                // offload; delivering it whole would hand the decoder a blob
-                // and lose all but the first packet.
-                let before = run.len();
-                run.extend(rx.take_datagrams(i));
-                drained += run.len() - before;
-            }
-            if drained >= RECV_DRAIN_CAP {
-                break;
-            }
-            match io.try_recv_batch(&ep.socket, &mut rx.storage, &mut rx.metas) {
-                Ok(n) if n > 0 => count = n,
-                _ => break,
-            }
-        }
-        if let Some(peer) = run_peer.take() {
-            dispatch(peer, &route, &mut run, &mut unrouted);
-            route = None;
-        }
+            };
 
-        for (from, datagram) in unrouted.drain(..) {
-            handle_handshake(&ep, from, datagram).await;
+            // A buffer can hold a run of datagrams coalesced by receive
+            // offload; delivering it whole would hand the decoder a blob and
+            // lose all but the first packet.
+            let mut datagrams = rx.take_datagrams(i);
+            match route {
+                Some(tx) => {
+                    for datagram in datagrams {
+                        // Wait rather than drop when a connection's queue is
+                        // full. Dropping looks right -- this task serves every
+                        // connection on the port -- but a dropped datagram
+                        // costs a retransmission round trip and under load that
+                        // compounds: it measured 10x worse across eight
+                        // connections, 530 MB/s against 4800. Real
+                        // backpressure, reaching the peer through flow control,
+                        // is cheaper than manufacturing loss.
+                        if let Err(mpsc::error::TrySendError::Full(d)) = tx.try_send(datagram)
+                            && tx.send(d).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+                None => {
+                    // Unknown source: only a handshake can be legitimate. The
+                    // rest of the run waits for the peer to retransmit, which
+                    // is what an opening connection does anyway.
+                    if let Some(datagram) = datagrams.next() {
+                        handle_handshake(&ep, from, datagram).await;
+                    }
+                }
+            }
         }
 
         if ep.is_spent() {
             return;
-        }
-    }
-}
-
-/// Hand one peer's run of datagrams to its connection.
-fn dispatch(
-    peer: SocketAddr,
-    route: &Option<Arc<ConnectionInner>>,
-    run: &mut Vec<Bytes>,
-    unrouted: &mut Vec<(SocketAddr, Bytes)>,
-) {
-    match route {
-        Some(conn) => {
-            // One lock for the whole run. Handing the datagrams over one at a
-            // time -- through a channel, say -- charges an atomic and a
-            // possible wakeup per packet, and with receive offload a run is up
-            // to 64 of them.
-            let wake = {
-                let mut state = lock(&conn.state);
-                state.deliver(run.drain(..))
-            };
-            run.clear();
-            if wake {
-                conn.shared.driver.notify_one();
-            }
-        }
-        None => {
-            // Unknown source: only a handshake can be legitimate. The rest of
-            // the run waits for the peer to retransmit, which is what an
-            // opening connection does anyway.
-            if let Some(datagram) = run.first().cloned() {
-                unrouted.push((peer, datagram));
-            }
-            run.clear();
         }
     }
 }
@@ -528,9 +526,8 @@ async fn handle_handshake(ep: &Arc<EndpointInner>, from: SocketAddr, datagram: B
                 };
                 let Some(accept_tx) = accept_tx else { return };
 
-                let inner = ConnectionInner::new(*conn);
-                spawn_shared(ep, &inner, from);
-                let socket = Socket { inner, peer_addr: from, local_addr: ep.local_addr };
+                // Already established, so the handshake signal is not needed.
+                let (socket, _connected) = spawn_shared(ep, *conn, from);
 
                 // Never wait for the application to accept. This task serves
                 // every connection on the port, so blocking here would let a
