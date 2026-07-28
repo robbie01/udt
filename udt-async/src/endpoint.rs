@@ -310,8 +310,10 @@ impl Endpoint {
 
     /// Accepts incoming connections on this endpoint's address.
     ///
-    /// `backlog` bounds how many completed connections wait to be picked up by
-    /// [`Listener::accept`] before further handshakes are refused.
+    /// `backlog` bounds how many completed connections wait to be picked up
+    /// by [`Listener::accept`]. Connections completing while the backlog is
+    /// full are refused rather than queued, so an application that stops
+    /// accepting cannot hold up the traffic of connections already open.
     ///
     /// An endpoint can listen and make outgoing connections at the same time.
     /// Calling this again replaces the previous listener.
@@ -509,19 +511,30 @@ async fn handle_handshake(ep: &Arc<EndpointInner>, from: SocketAddr, datagram: B
                 let _ = ep.socket.send_to(&data, from).await;
             }
             ListenerEvent::Accept(conn, _) => {
-                let inner = ConnectionInner::new(*conn);
-                spawn_shared(ep, &inner, from);
-
-                let socket = Socket { inner, peer_addr: from, local_addr: ep.local_addr };
                 let accept_tx = {
                     let guard = lock(&ep.listener);
                     guard.as_ref().map(|slot| slot.accept_tx.clone())
                 };
                 let Some(accept_tx) = accept_tx else { return };
-                if accept_tx.send_async(socket).await.is_err() {
-                    *lock(&ep.listener) = None;
-                    ep.wind_down.notify_waiters();
-                    return;
+
+                let inner = ConnectionInner::new(*conn);
+                spawn_shared(ep, &inner, from);
+                let socket = Socket { inner, peer_addr: from, local_addr: ep.local_addr };
+
+                // Never wait for the application to accept. This task serves
+                // every connection on the port, so blocking here would let a
+                // caller that has stopped calling `accept` -- or an attacker
+                // filling the backlog -- stall every established connection
+                // too. Over the backlog the connection is refused, which is
+                // what a backlog is; dropping the socket closes it.
+                match accept_tx.try_send(socket) {
+                    Ok(()) => {}
+                    Err(flume::TrySendError::Full(_)) => {}
+                    Err(flume::TrySendError::Disconnected(_)) => {
+                        *lock(&ep.listener) = None;
+                        ep.wind_down.notify_waiters();
+                        return;
+                    }
                 }
             }
         }
