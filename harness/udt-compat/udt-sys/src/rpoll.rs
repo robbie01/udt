@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use bitflags::bitflags;
-use tokio::sync::{futures::OwnedNotified, Notify};
+use tokio::sync::{Notify, futures::OwnedNotified};
 
 bitflags! {
     #[repr(transparent)]
@@ -15,12 +15,12 @@ bitflags! {
 #[derive(Debug, Default)]
 pub struct SocketData {
     readable: Arc<Notify>,
-    writable: Arc<Notify>
+    writable: Arc<Notify>,
 }
 
 #[derive(Debug, Default)]
 pub struct RPoll {
-    evts: scc::HashMap<super::Socket, SocketData>
+    evts: scc::HashMap<super::Socket, SocketData>,
 }
 
 impl RPoll {
@@ -45,10 +45,12 @@ impl RPoll {
     }
 
     pub fn readable(&self, socket: super::Socket) -> Option<OwnedNotified> {
-        self.evts.read_sync(&socket, |_, ent| ent.readable.clone().notified_owned())
+        self.evts
+            .read_sync(&socket, |_, ent| ent.readable.clone().notified_owned())
     }
 
     pub fn writable(&self, socket: super::Socket) -> Option<OwnedNotified> {
-        self.evts.read_sync(&socket, |_, ent| ent.writable.clone().notified_owned())
+        self.evts
+            .read_sync(&socket, |_, ent| ent.writable.clone().notified_owned())
     }
 }

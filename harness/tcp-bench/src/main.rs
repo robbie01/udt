@@ -67,7 +67,10 @@ fn set_mss<F: AsRawFd>(sock: &F, mss: u32) {
         )
     };
     if rc != 0 {
-        eprintln!("warning: could not set TCP_MAXSEG={mss}: {}", std::io::Error::last_os_error());
+        eprintln!(
+            "warning: could not set TCP_MAXSEG={mss}: {}",
+            std::io::Error::last_os_error()
+        );
     }
 }
 
@@ -184,7 +187,10 @@ fn bench_tokio_two_runtimes(total: usize, buf: usize, pinned: bool) -> (usize, f
 
     let reader = std::thread::spawn(move || {
         pin(0, pinned);
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async move {
             use tokio::io::AsyncReadExt;
             let l = tokio::net::TcpListener::from_std(listener).unwrap();
@@ -205,7 +211,10 @@ fn bench_tokio_two_runtimes(total: usize, buf: usize, pinned: bool) -> (usize, f
 
     let writer = std::thread::spawn(move || {
         pin(2, pinned);
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async move {
             use tokio::io::AsyncWriteExt;
             let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -235,44 +244,48 @@ fn bench_compio(total: usize, buf: usize, pinned: bool) -> (usize, f64) {
 
     let reader = std::thread::spawn(move || {
         pin(0, pinned);
-        compio::runtime::Runtime::new().unwrap().block_on(async move {
-            use compio::io::AsyncRead;
-            let l = compio::net::TcpListener::from_std(listener).unwrap();
-            let (mut s, _) = l.accept().await.unwrap();
-            let mut b = vec![0u8; buf];
-            let mut got = 0usize;
-            while got < total {
-                // compio takes ownership of the buffer and hands it back, so
-                // there is no borrow to keep alive across the completion.
-                let (res, ret) = s.read(b).await.into();
-                b = ret;
-                match res {
-                    Ok(0) => break,
-                    Ok(n) => got += n,
-                    Err(e) => panic!("read: {e}"),
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                use compio::io::AsyncRead;
+                let l = compio::net::TcpListener::from_std(listener).unwrap();
+                let (mut s, _) = l.accept().await.unwrap();
+                let mut b = vec![0u8; buf];
+                let mut got = 0usize;
+                while got < total {
+                    // compio takes ownership of the buffer and hands it back, so
+                    // there is no borrow to keep alive across the completion.
+                    let (res, ret) = s.read(b).await.into();
+                    b = ret;
+                    match res {
+                        Ok(0) => break,
+                        Ok(n) => got += n,
+                        Err(e) => panic!("read: {e}"),
+                    }
                 }
-            }
-            got
-        })
+                got
+            })
     });
 
     let writer = std::thread::spawn(move || {
         pin(2, pinned);
-        compio::runtime::Runtime::new().unwrap().block_on(async move {
-            use compio::io::{AsyncWrite, AsyncWriteExt};
-            let mut s = compio::net::TcpStream::connect(addr).await.unwrap();
-            let mut b = vec![0x5Au8; buf];
-            let mut sent = 0usize;
-            let start = Instant::now();
-            while sent < total {
-                let (res, ret) = s.write_all(b).await.into();
-                b = ret;
-                res.unwrap();
-                sent += buf;
-            }
-            s.flush().await.unwrap();
-            start.elapsed()
-        })
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                use compio::io::{AsyncWrite, AsyncWriteExt};
+                let mut s = compio::net::TcpStream::connect(addr).await.unwrap();
+                let mut b = vec![0x5Au8; buf];
+                let mut sent = 0usize;
+                let start = Instant::now();
+                while sent < total {
+                    let (res, ret) = s.write_all(b).await.into();
+                    b = ret;
+                    res.unwrap();
+                    sent += buf;
+                }
+                s.flush().await.unwrap();
+                start.elapsed()
+            })
     });
 
     let elapsed = writer.join().unwrap();
@@ -286,8 +299,14 @@ fn main() {
     let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
 
     let mode = pos.first().map(|s| s.as_str()).unwrap_or("all");
-    let buf_kib: usize = pos.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_BUF_KIB);
-    let total_mib: usize = pos.get(2).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_TOTAL_MIB);
+    let buf_kib: usize = pos
+        .get(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_BUF_KIB);
+    let total_mib: usize = pos
+        .get(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_TOTAL_MIB);
     let total = total_mib * 1024 * 1024;
 
     let run = |m: &str, buf_kib: usize| {
@@ -300,7 +319,11 @@ fn main() {
             "compio" => bench_compio(total, buf, pinned),
             other => panic!("unknown mode {other}"),
         };
-        let label = if pinned { format!("{m}+pin") } else { m.to_string() };
+        let label = if pinned {
+            format!("{m}+pin")
+        } else {
+            m.to_string()
+        };
         report(&label, buf_kib, bytes, secs);
     };
 

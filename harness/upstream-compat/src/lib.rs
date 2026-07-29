@@ -28,10 +28,7 @@ mod tests {
         (i % 251) as u8
     }
 
-    async fn join<T2: Send + 'static>(
-        h: tokio::task::JoinHandle<T2>,
-        what: &str,
-    ) -> T2 {
+    async fn join<T2: Send + 'static>(h: tokio::task::JoinHandle<T2>, what: &str) -> T2 {
         tokio::time::timeout(T, h)
             .await
             .unwrap_or_else(|_| panic!("{what} timed out"))
@@ -60,13 +57,19 @@ mod tests {
         let client_ep = udt_orig::Endpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let accept = std::thread::spawn(move || (listener.accept(), listener));
 
-        let client = client_ep.connect(server_addr, false).expect("upstream connect failed");
+        let client = client_ep
+            .connect(server_addr, false)
+            .expect("upstream connect failed");
         let (server, listener) = accept.join().expect("accept thread panicked");
         let server = server.expect("upstream accept failed");
         (
             server,
             client,
-            Keepalive(vec![Box::new(server_ep), Box::new(client_ep), Box::new(listener)]),
+            Keepalive(vec![
+                Box::new(server_ep),
+                Box::new(client_ep),
+                Box::new(listener),
+            ]),
         )
     }
 
@@ -89,7 +92,11 @@ mod tests {
         (
             Arc::new(server),
             client,
-            Keepalive(vec![Box::new(server_ep), Box::new(rust_ep), Box::new(listener)]),
+            Keepalive(vec![
+                Box::new(server_ep),
+                Box::new(rust_ep),
+                Box::new(listener),
+            ]),
         )
     }
 
@@ -131,10 +138,18 @@ mod tests {
             server.recv(&mut buf).map(|n| (n, buf))
         });
 
-        let (sent, _client) = join(send, "upstream send").await.expect("upstream send failed");
-        let (n, buf) = join(recv, "upstream recv").await.expect("upstream recv failed");
+        let (sent, _client) = join(send, "upstream send")
+            .await
+            .expect("upstream send failed");
+        let (n, buf) = join(recv, "upstream recv")
+            .await
+            .expect("upstream recv failed");
         assert_eq!(sent, payload.len());
-        assert_eq!(&buf[..n], &payload[..], "upstream↔upstream corrupted its own payload");
+        assert_eq!(
+            &buf[..n],
+            &payload[..],
+            "upstream↔upstream corrupted its own payload"
+        );
     }
 
     // ── Handshake + echo, both directions ────────────────────────────────────
@@ -151,8 +166,14 @@ mod tests {
             let mut buf = vec![0u8; 8192];
             s.recv(&mut buf).map(|n| (n, buf))
         });
-        let (n, buf) = join(recv, "upstream recv").await.expect("upstream recv failed");
-        assert_eq!(&buf[..n], &payload[..], "upstream received wrong data from Rust");
+        let (n, buf) = join(recv, "upstream recv")
+            .await
+            .expect("upstream recv failed");
+        assert_eq!(
+            &buf[..n],
+            &payload[..],
+            "upstream received wrong data from Rust"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -163,14 +184,20 @@ mod tests {
         let p = payload.clone();
         let c = Arc::clone(&client);
         let send = tokio::task::spawn_blocking(move || c.send(&p));
-        join(send, "upstream send").await.expect("upstream send failed");
+        join(send, "upstream send")
+            .await
+            .expect("upstream send failed");
 
         let mut buf = vec![0u8; 8192];
         let n = tokio::time::timeout(T, server.recv(&mut buf))
             .await
             .expect("rust recv timed out")
             .expect("rust recv failed");
-        assert_eq!(&buf[..n], &payload[..], "Rust received wrong data from upstream");
+        assert_eq!(
+            &buf[..n],
+            &payload[..],
+            "Rust received wrong data from upstream"
+        );
     }
 
     // ── Bulk transfer, every byte verified ───────────────────────────────────
@@ -211,7 +238,10 @@ mod tests {
                     .recv(&mut buf)
                     .unwrap_or_else(|e| panic!("upstream recv failed on message {i}: {e}"));
                 assert_eq!(n, BULK_CHUNK, "message {i} wrong length");
-                assert!(buf[..n].iter().all(|&b| b == pattern(i)), "message {i} corrupted");
+                assert!(
+                    buf[..n].iter().all(|&b| b == pattern(i)),
+                    "message {i} corrupted"
+                );
             }
         });
 
@@ -239,7 +269,10 @@ mod tests {
                 let n = server
                     .recv(&mut buf)
                     .unwrap_or_else(|e| panic!("upstream recv failed on message {i}: {e}"));
-                assert_eq!(n, BULK_CHUNK, "message {i} arrived upstream with wrong length");
+                assert_eq!(
+                    n, BULK_CHUNK,
+                    "message {i} arrived upstream with wrong length"
+                );
                 assert!(
                     buf[..n].iter().all(|&b| b == pattern(i)),
                     "message {i} corrupted in transit to upstream",
@@ -272,7 +305,10 @@ mod tests {
                 .await
                 .unwrap_or_else(|_| panic!("rust recv timed out on message {i} of {BULK_MSGS}"))
                 .expect("rust recv failed");
-            assert_eq!(n, BULK_CHUNK, "message {i} arrived at Rust with wrong length");
+            assert_eq!(
+                n, BULK_CHUNK,
+                "message {i} arrived at Rust with wrong length"
+            );
             assert!(
                 buf[..n].iter().all(|&b| b == pattern(i)),
                 "message {i} corrupted in transit from upstream",
@@ -308,7 +344,9 @@ mod tests {
         let w = Arc::clone(&write);
         let sender = tokio::spawn(async move {
             for (i, &size) in BOUNDARY_SIZES.iter().enumerate() {
-                w.send(&boundary_msg(i, size)).await.expect("rust send failed");
+                w.send(&boundary_msg(i, size))
+                    .await
+                    .expect("rust send failed");
             }
         });
 
@@ -318,8 +356,15 @@ mod tests {
                 let n = server
                     .recv(&mut buf)
                     .unwrap_or_else(|e| panic!("upstream recv failed on {size}-byte message: {e}"));
-                assert_eq!(n, size, "upstream saw a different message length (message {i})");
-                assert_eq!(&buf[..n], &boundary_msg(i, size)[..], "{size}-byte message corrupted");
+                assert_eq!(
+                    n, size,
+                    "upstream saw a different message length (message {i})"
+                );
+                assert_eq!(
+                    &buf[..n],
+                    &boundary_msg(i, size)[..],
+                    "{size}-byte message corrupted"
+                );
             }
         });
 
@@ -348,7 +393,11 @@ mod tests {
                 .unwrap_or_else(|_| panic!("rust recv timed out on {size}-byte message"))
                 .expect("rust recv failed");
             assert_eq!(n, size, "Rust saw a different message length (message {i})");
-            assert_eq!(&buf[..n], &boundary_msg(i, size)[..], "{size}-byte message corrupted");
+            assert_eq!(
+                &buf[..n],
+                &boundary_msg(i, size)[..],
+                "{size}-byte message corrupted"
+            );
         }
         let _held = join(sender, "upstream boundary send").await;
     }

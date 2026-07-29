@@ -113,7 +113,13 @@ mod sys {
             optval: *const c_void,
             optlen: i32,
         ) -> i32;
-        unsafe fn sendmsg(u: Socket, buf: *const c_char, len: i32, ttl_ms: i32, inorder: bool) -> i32;
+        unsafe fn sendmsg(
+            u: Socket,
+            buf: *const c_char,
+            len: i32,
+            ttl_ms: i32,
+            inorder: bool,
+        ) -> i32;
         unsafe fn recvmsg(u: Socket, buf: *mut c_char, len: i32) -> i32;
         unsafe fn getlasterror_code() -> i32;
     }

@@ -42,8 +42,7 @@ mod tests {
     fn configs() -> (ServerConfig, ClientConfig) {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
-        let key_der =
-            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
 
         // Windows large enough that flow control is never the limiter; we are
         // measuring the transport, not a default window.
@@ -94,7 +93,11 @@ mod tests {
 
         let mut client = Endpoint::client(addr).unwrap();
         client.set_default_client_config(client_cfg);
-        let conn = client.connect(server_addr, "localhost").unwrap().await.unwrap();
+        let conn = client
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
 
         let start = std::time::Instant::now();
         let mut send = conn.open_uni().await.unwrap();
@@ -150,8 +153,11 @@ mod tests {
 
                     let mut client = Endpoint::client(addr).unwrap();
                     client.set_default_client_config(client_cfg);
-                    let conn =
-                        client.connect(server_addr, "localhost").unwrap().await.unwrap();
+                    let conn = client
+                        .connect(server_addr, "localhost")
+                        .unwrap()
+                        .await
+                        .unwrap();
                     let mut send = conn.open_uni().await.unwrap();
                     let sender = tokio::spawn(async move {
                         let chunk = vec![0x5Au8; CHUNK];

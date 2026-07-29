@@ -17,8 +17,8 @@
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     use tokio::net::UdpSocket;
@@ -38,7 +38,10 @@ mod tests {
     async fn spawn_relay(server: SocketAddr, loss_pct: u64) -> (SocketAddr, Arc<Relay>) {
         let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let addr = sock.local_addr().unwrap();
-        let relay = Arc::new(Relay { dropped: AtomicU64::new(0), forwarded: AtomicU64::new(0) });
+        let relay = Arc::new(Relay {
+            dropped: AtomicU64::new(0),
+            forwarded: AtomicU64::new(0),
+        });
 
         let task_sock = Arc::clone(&sock);
         let task_relay = Arc::clone(&relay);
@@ -47,7 +50,9 @@ mod tests {
             let mut client: Option<SocketAddr> = None;
             let mut buf = vec![0u8; 64 * 1024];
             loop {
-                let Ok((n, from)) = task_sock.recv_from(&mut buf).await else { return };
+                let Ok((n, from)) = task_sock.recv_from(&mut buf).await else {
+                    return;
+                };
                 let to = if from == server {
                     match client {
                         Some(c) => c,
@@ -95,9 +100,99 @@ mod tests {
                 self.elapsed.as_secs_f64(),
                 self.relay_forwarded,
                 self.relay_dropped,
-                if self.finished { "completed" } else { "DID NOT COMPLETE" },
+                if self.finished {
+                    "completed"
+                } else {
+                    "DID NOT COMPLETE"
+                },
             );
         }
+    }
+
+    /// Ordered transfer of `msgs` chunks over a clean link, no relay.
+    /// Returns seconds elapsed and messages delivered.
+    async fn rust_transfer(msgs: usize) -> (f64, usize) {
+        let server_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+        let listener = server_ep.listen(4).unwrap();
+        let addr = server_ep.local_addr();
+        let client_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+        let (server, client) =
+            tokio::join!(async { listener.accept().await.expect("accept") }, async {
+                client_ep.connect(addr).await.expect("connect")
+            });
+
+        let start = Instant::now();
+        let sender = tokio::spawn(async move {
+            let chunk = vec![0xA5u8; CHUNK];
+            for _ in 0..msgs {
+                if client.send(&chunk).await.is_err() {
+                    break;
+                }
+            }
+            client
+        });
+        let mut got = 0;
+        let mut buf = vec![0u8; CHUNK * 2];
+        let mut marks = Vec::new();
+        while got < msgs {
+            match tokio::time::timeout(Duration::from_secs(30), server.recv(&mut buf)).await {
+                Ok(Ok(_)) => {
+                    got += 1;
+                    if got <= 4 || got == 8 || got == 16 || got == 32 || got == 50 {
+                        marks.push((got, start.elapsed().as_secs_f64() * 1e3));
+                    }
+                }
+                _ => break,
+            }
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let _ = sender.await;
+        if std::env::var_os("UDT_TIMELINE").is_some() {
+            let t: Vec<String> = marks
+                .iter()
+                .map(|(n, ms)| format!("#{n}@{ms:.1}ms"))
+                .collect();
+            println!("    rust arrivals: {}", t.join("  "));
+        }
+        (elapsed, got)
+    }
+
+    async fn cpp_transfer(msgs: usize) -> (f64, usize) {
+        use udt_compat::Endpoint as CppEndpoint;
+        let server_ep = Arc::new(CppEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap());
+        let listener = server_ep.listen(4).unwrap();
+        let addr = server_ep.local_addr().unwrap();
+        let client_ep = Arc::new(CppEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap());
+        let (server, client) = tokio::join!(
+            async { listener.accept().await.expect("cpp accept") },
+            async { client_ep.connect(addr, false).await.expect("cpp connect") }
+        );
+        let server = Arc::new(server);
+        let client = Arc::new(client);
+
+        let start = Instant::now();
+        let sender = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                let chunk = vec![0xA5u8; CHUNK];
+                for _ in 0..msgs {
+                    if client.send(&chunk).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+        let mut got = 0;
+        let mut buf = vec![0u8; CHUNK * 2];
+        while got < msgs {
+            match tokio::time::timeout(Duration::from_secs(30), server.recv(&mut buf)).await {
+                Ok(Ok(_)) => got += 1,
+                _ => break,
+            }
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        sender.abort();
+        (elapsed, got)
     }
 
     async fn rust_unordered_through_loss(loss_pct: u64) -> Outcome {
@@ -106,16 +201,20 @@ mod tests {
         let (relay_addr, relay) = spawn_relay(server_ep.local_addr(), loss_pct).await;
         let client_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
 
-        let (server, client) = tokio::join!(
-            async { listener.accept().await.expect("accept") },
-            async { client_ep.connect(relay_addr).await.expect("connect") }
-        );
+        let (server, client) =
+            tokio::join!(async { listener.accept().await.expect("accept") }, async {
+                client_ep.connect(relay_addr).await.expect("connect")
+            });
 
         let start = Instant::now();
         let sender = tokio::spawn(async move {
             let chunk = vec![0xA5u8; CHUNK];
             for _ in 0..MSGS {
-                if client.send_with(&chunk, SendOptions::new().unordered()).await.is_err() {
+                if client
+                    .send_with(&chunk, SendOptions::new().unordered())
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -152,7 +251,12 @@ mod tests {
 
         let (server, client) = tokio::join!(
             async { listener.accept().await.expect("cpp accept") },
-            async { client_ep.connect(relay_addr, false).await.expect("cpp connect") }
+            async {
+                client_ep
+                    .connect(relay_addr, false)
+                    .await
+                    .expect("cpp connect")
+            }
         );
         let server = Arc::new(server);
         let client = Arc::new(client);
@@ -190,14 +294,42 @@ mod tests {
         }
     }
 
+    /// Where the crossover is between the two implementations on a clean link.
+    ///
+    /// C++ wins on a short transfer and loses badly on a long one, so the gap
+    /// is a fixed startup cost rather than throughput. This measures the shape:
+    /// a straight line through these points gives each implementation's fixed
+    /// cost as the intercept and its rate as the slope.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "diagnostic: characterises behaviour, does not assert"]
+    async fn transfer_size_sweep() {
+        for msgs in [50usize, 100, 200, 400, 800, 1600, 3200] {
+            let r = rust_transfer(msgs).await;
+            let c = cpp_transfer(msgs).await;
+            let mb = (msgs * CHUNK) as f64 / 1e6;
+            println!(
+                "[{msgs:>5} msgs {mb:>6.1} MB] rust {:>7.1} ms {:>7.1} MB/s   \
+                 cpp {:>7.1} ms {:>7.1} MB/s",
+                r.0 * 1e3,
+                mb / r.0,
+                c.0 * 1e3,
+                mb / c.0,
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "diagnostic: characterises behaviour, does not assert"]
     async fn compare_unordered_under_loss() {
         for loss in [0u64, 2, 5] {
-            rust_unordered_through_loss(loss).await.report(&format!("rust unordered {loss}% loss"));
+            rust_unordered_through_loss(loss)
+                .await
+                .report(&format!("rust unordered {loss}% loss"));
         }
         for loss in [0u64, 2, 5] {
-            cpp_unordered_through_loss(loss).await.report(&format!("cpp  unordered {loss}% loss"));
+            cpp_unordered_through_loss(loss)
+                .await
+                .report(&format!("cpp  unordered {loss}% loss"));
         }
     }
 

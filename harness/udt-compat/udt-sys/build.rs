@@ -1,22 +1,19 @@
 fn main() {
     let mut build = cxx_build::bridge("src/lib.rs");
 
-    build
-        .std("c++17")
-        .includes(["udt", "bridge"])
-        .files([
-            "udt/api.cpp",
-            "udt/buffer.cpp",
-            "udt/cache.cpp",
-            "udt/ccc.cpp",
-            "udt/channel.cpp",
-            "udt/core.cpp",
-            "udt/list.cpp",
-            "udt/packet.cpp",
-            "udt/queue.cpp",
-            "udt/udtCommon.cpp",
-            "udt/window.cpp"
-        ]);
+    build.std("c++17").includes(["udt", "bridge"]).files([
+        "udt/api.cpp",
+        "udt/buffer.cpp",
+        "udt/cache.cpp",
+        "udt/ccc.cpp",
+        "udt/channel.cpp",
+        "udt/core.cpp",
+        "udt/list.cpp",
+        "udt/packet.cpp",
+        "udt/queue.cpp",
+        "udt/udtCommon.cpp",
+        "udt/window.cpp",
+    ]);
 
     build.flag_if_supported("-pthread");
 

@@ -244,7 +244,9 @@ impl Listener {
         if raw == ffi::INVALID_SOCK {
             return Err(last_error());
         }
-        Ok(Connection { u: Sock { _inst: inst, raw } })
+        Ok(Connection {
+            u: Sock { _inst: inst, raw },
+        })
     }
 }
 
@@ -264,7 +266,12 @@ impl Connection {
     /// retransmitted. Both are exposed so the out-of-order and TTL paths can be
     /// exercised against upstream.
     #[allow(unsafe_code)] // FFI into the C++ implementation
-    pub fn send_with(&self, buf: &[u8], ttl: Option<Duration>, in_order: bool) -> io::Result<usize> {
+    pub fn send_with(
+        &self,
+        buf: &[u8],
+        ttl: Option<Duration>,
+        in_order: bool,
+    ) -> io::Result<usize> {
         let res = unsafe {
             ffi::sendmsg(
                 self.u.raw,
