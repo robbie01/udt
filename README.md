@@ -100,8 +100,9 @@ of what a transport is for. Two harnesses cover the rest:
   clock — is tested under the same conditions.
 
 Between them they have caught a permanently stranded receiver, a connection that
-hung forever behind a path-MTU black hole, and a tail loss that cost a third of a
-second to recover.
+hung forever behind a path-MTU black hole, a tail loss that cost a third of a
+second to recover, and a message-numbering collision that made a recovered
+connection discard the data it had just re-sent.
 
 ### Benchmarking
 
@@ -167,8 +168,7 @@ saturated connection does not allocate per packet.
 
 ## Not done yet
 
-Windows. Path-MTU probing — black holes are detected and reported, never probed
-around.
+Windows.
 
 Connections are tied to the address pair and stay that way; a NAT rebind ends
 them, by choice.

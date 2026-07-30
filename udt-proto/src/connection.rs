@@ -690,6 +690,15 @@ impl Connection {
                 && !self.data_ever_acked
                 && !self.snd_buf_is_empty()
             {
+                // The path answers but carries nothing we send, so the packets
+                // are too big for it. Try a smaller one before giving up.
+                if self.shrink_path(now_us, tx) {
+                    self.exp_count = 1;
+                    self.exp_without_progress = 0;
+                    self.no_progress_since_us = None;
+                    self.last_rsp_us = now_us;
+                    return;
+                }
                 self.state = ConnState::Closed;
                 out.push(Event::Disconnected(DisconnectReason::PathMtu));
                 return;
@@ -918,6 +927,80 @@ impl Connection {
             "sender loss list is not sorted and disjoint: {:?}",
             self.snd_loss.ranges_snapshot()
         );
+    }
+
+    /// Halve the packet size and start the queued data again, for a path that
+    /// answers control packets but swallows full-size ones.
+    ///
+    /// Returns whether it was worth trying. `false` means give up: either there
+    /// is no room left to shrink into, or the data no longer fits.
+    ///
+    /// Only reachable while `data_ever_acked` is false — nothing this side sent
+    /// has ever arrived — which is what makes restarting safe. Nothing the peer
+    /// has delivered to its application can be disturbed, because it has
+    /// delivered nothing.
+    ///
+    /// The sequence numbers already spent are the problem, not the data. Blocks
+    /// are chunked at [`SendBuffer::add`] time and one block is one sequence
+    /// number, so a smaller packet size means different blocks and different
+    /// numbering. The peer is therefore told to skip everything already
+    /// numbered, with the `MsgDrop` it already understands — otherwise the first
+    /// small packet to arrive would open a gap below it that is NAKed forever.
+    fn shrink_path(&mut self, now_us: u64, tx: &mut TransmitBuf) -> bool {
+        let reduced = (self.mss / 2).max(MIN_MSS);
+        if reduced >= self.mss {
+            return false; // already as small as this will go
+        }
+        let payload_size = reduced.saturating_sub(IP_AND_UDP_OVERHEAD + UDT_HEADER_SIZE as u32);
+        if payload_size == 0 {
+            return false;
+        }
+
+        let Some(buf) = self.snd_buf.as_mut() else { return false };
+        // Both numbers have to survive the rebuild. Sequence numbering continues
+        // past what the peer is told to skip, and *message* numbering continues
+        // too: `SendBuffer::new` would restart it at zero, handing a number the
+        // peer has just been told to drop straight back to a live message, which
+        // it would then discard as already retired.
+        let abandoned_msg = buf.read_at(0).map(|b| b.msg_no);
+        let resume_msg = buf.next_msg_no();
+        let messages = buf.drain_messages();
+
+        // Retire the range the peer must never wait for. Sent before the buffer
+        // is rebuilt, while the numbering it refers to is still the live one.
+        let (first, last) = (self.snd_last_ack, self.snd_curr_seq);
+        if last >= first {
+            // Names a message number that is genuinely being abandoned. The
+            // sequence range is what does the work -- `drop_range` at the peer
+            // covers every message in it -- but the number must not be one that
+            // is about to be reused.
+            let msg_no = abandoned_msg.unwrap_or(resume_msg);
+            tx.push(|dst| {
+                codec::encode_msg_drop(msg_no, first, last, self.ts(now_us), self.peer_id, dst)
+            });
+        }
+        self.snd_loss.remove_range(first, last);
+        self.snd_sacked.remove_up_to(last);
+
+        self.mss = reduced;
+        self.payload_size = payload_size;
+        let mut rebuilt = SendBuffer::new(DEFAULT_SND_BUF, payload_size as usize);
+        rebuilt.resume_msg_no_at(resume_msg);
+        for (payload, ttl_ms, in_order) in messages {
+            if rebuilt.add(payload, ttl_ms, in_order, now_us).is_err() {
+                // The same bytes need more blocks at a smaller size, and no
+                // longer fit. Failing here is honest; silently dropping a
+                // message the application handed us is not.
+                return false;
+            }
+        }
+        self.snd_buf = Some(rebuilt);
+
+        // Numbering continues forward from what the peer was told to skip.
+        self.snd_last_ack = last.next();
+        self.snd_curr_seq = last;
+        self.next_snd_us = now_us;
+        true
     }
 
     /// Report that a datagram arrived marked as having passed through
@@ -2050,6 +2133,65 @@ mod tests {
 
         c.snd_sacked.remove_up_to(SeqNo::new(160));
         assert_eq!(c.snd_sacked.len(), 0);
+    }
+
+    #[test]
+    fn shrinking_the_path_requeues_the_data_and_renumbers_it() {
+        let mut c = connected(1_000_000);
+        let mut tx = TransmitBuf::new();
+        assert_eq!(
+            c.send_msg(Bytes::from(vec![7u8; 8192]), None, true, 1_000_000, &mut tx),
+            SendOutcome::Queued
+        );
+        // Send some, so sequences have been spent.
+        let burst = 1_000_000 + SYN_US as u64;
+        while c.pack_data(1_000_000, burst, &mut tx) {}
+        let spent = c.snd_curr_seq;
+        assert!(spent.offset_from(c.snd_last_ack) >= 0, "nothing was sent");
+        tx.clear();
+
+        let before_mss = c.mss;
+        assert!(c.shrink_path(1_100_000, &mut tx), "should have room to shrink");
+        assert!(c.mss < before_mss, "mss did not come down");
+
+        eprintln!(
+            "mss {} -> {}, payload {}, snd_last_ack {} snd_curr_seq {} spent {}",
+            before_mss,
+            c.mss,
+            c.payload_size,
+            c.snd_last_ack.raw(),
+            c.snd_curr_seq.raw(),
+            spent.raw()
+        );
+
+        // The peer is told to skip the old numbering.
+        assert!(
+            decode_all(&tx)
+                .iter()
+                .any(|p| matches!(p, Packet::Control { body: ControlBody::MsgDrop { .. }, .. })),
+            "no MsgDrop retired the abandoned range"
+        );
+        tx.clear();
+
+        // And the data goes back out, smaller, above the abandoned range.
+        while c.pack_data(1_100_000, 1_100_000 + SYN_US as u64, &mut tx) {}
+        let sent: Vec<_> = tx.datagrams().collect();
+        assert!(!sent.is_empty(), "nothing was re-sent after shrinking");
+        let biggest = sent.iter().map(|d| d.len()).max().unwrap();
+        eprintln!("re-sent {} datagrams, largest {} bytes", sent.len(), biggest);
+        assert!(
+            biggest <= c.mss as usize - IP_AND_UDP_OVERHEAD as usize,
+            "a packet larger than the reduced path went out: {biggest} bytes"
+        );
+        for p in decode_all(&tx) {
+            if let Packet::Data { header, .. } = p {
+                assert!(
+                    header.seq_no.offset_from(spent) > 0,
+                    "re-sent under an abandoned sequence {}",
+                    header.seq_no.raw()
+                );
+            }
+        }
     }
 
     /// A CE-marked arrival must tell the *peer* to slow down, using the control

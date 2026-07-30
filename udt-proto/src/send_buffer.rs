@@ -1,6 +1,6 @@
 use crate::packet::MsgBoundary;
 use crate::seq::MsgNo;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 /// A single block in the send buffer.
 pub struct Block {
@@ -227,6 +227,70 @@ impl SendBuffer {
         self.head = (self.head + count) % self.capacity;
         self.len -= count;
         self.sent -= count;
+    }
+
+    /// The number the next queued message will carry.
+    ///
+    /// Needed when rebuilding the buffer: message numbers must go on from where
+    /// they left off. Restarting them lets a number the peer has been told to
+    /// drop be handed straight back to a live message, which the receiver then
+    /// discards as already retired.
+    pub fn next_msg_no(&self) -> MsgNo {
+        self.next_msg_no
+    }
+
+    /// Resume numbering from `n`. See [`next_msg_no`](Self::next_msg_no).
+    pub fn resume_msg_no_at(&mut self, n: MsgNo) {
+        self.next_msg_no = n;
+    }
+
+    /// Take every queued message back out, whole, and leave the buffer empty.
+    ///
+    /// Blocks are reassembled into the messages they were split from, using the
+    /// boundary flags. For rebuilding the buffer at a different payload size:
+    /// the split happens in [`add`](Self::add), so blocks already chunked cannot
+    /// be made smaller in place, and one packet is one block is one sequence
+    /// number.
+    ///
+    /// This copies, unlike `add`, which only slices. Reassembling adjacent
+    /// `Bytes` cheaply would need the original buffer, and the caller no longer
+    /// has it. That is acceptable because the only caller runs when a path has
+    /// turned out not to carry full-size packets at all — once per connection,
+    /// against a connection that would otherwise be closed.
+    ///
+    /// Returns `(payload, ttl_ms, in_order)` per message, in queue order.
+    /// Messages already retired by TTL are not returned: the peer has been told
+    /// to skip them.
+    pub fn drain_messages(&mut self) -> Vec<(Bytes, Option<u32>, bool)> {
+        let mut out: Vec<(Bytes, Option<u32>, bool)> = Vec::new();
+        let mut current: Option<(BytesMut, Option<u32>, bool)> = None;
+
+        for off in 0..self.len {
+            let idx = (self.head + off) % self.capacity;
+            let Some(block) = self.slots[idx].take() else { continue };
+            if block.dropped {
+                current = None;
+                continue;
+            }
+            if block.boundary.is_first() {
+                current = Some((BytesMut::new(), block.ttl_ms, block.in_order));
+            }
+            let Some((buf, _, _)) = current.as_mut() else {
+                // A tail whose head was already dropped or acknowledged: there
+                // is no whole message here to re-queue.
+                continue;
+            };
+            buf.extend_from_slice(&block.data);
+            if block.boundary.is_last() {
+                let (buf, ttl, in_order) = current.take().expect("just checked");
+                out.push((buf.freeze(), ttl, in_order));
+            }
+        }
+
+        self.head = 0;
+        self.len = 0;
+        self.sent = 0;
+        out
     }
 
     /// Largest message, in bytes, that could ever fit in an empty buffer.

@@ -676,36 +676,74 @@ fn loss_cost_table() {
 }
 
 /// A path that carries small packets and silently discards large ones used to
-/// hang the connection forever rather than failing it. The handshake is small,
-/// so it completes; every data packet then vanishes; and the peer's keep-alives
-/// keep resetting the expiry counter, so the hard timeout is never reached and
-/// the sender retransmits into the void indefinitely.
+/// hang the connection forever, then later to fail it outright. Neither is
+/// necessary: the packets are simply too big, and a smaller one fits.
+///
+/// The handshake is small, so it completes and negotiates an MSS the path cannot
+/// actually carry. Every data packet then vanishes while the peer's keep-alives
+/// keep arriving, so nothing acknowledges and nothing times the connection out.
+/// Detection is `exp_without_progress` with no data ever acknowledged; recovery
+/// is halving the packet size and starting the queued data again under fresh
+/// sequence numbers, with a `MsgDrop` retiring the numbering the peer must not
+/// wait for.
 #[test]
-fn a_path_that_cannot_carry_full_size_packets_is_reported() {
+fn a_path_that_cannot_carry_full_size_packets_is_worked_around() {
     // Comfortably above a handshake, well below a full data packet.
     let mut sim = Sim::new(LinkConfig::mtu_limited(200), 4);
     sim.connect();
+    let negotiated = sim.a.stats().connected;
+    assert!(negotiated, "the handshake itself should get through");
 
     let payload = bytes::Bytes::from(message(0, 8192));
     assert_eq!(sim.a.send_msg(payload, None, true, sim.now, &mut sim.a_tx), SendOutcome::Queued);
     sim.drain(Side::A);
 
     for _ in 0..MAX_STEPS {
-        if sim.a.stats().connected {
-            if !sim.step() {
-                break;
-            }
-        } else {
+        if !sim.b_got.is_empty() || !sim.a.stats().connected || !sim.step() {
             break;
         }
     }
 
     assert!(
-        !sim.a.stats().connected,
-        "the connection is still up after {}us with nothing delivered",
+        sim.a.stats().connected,
+        "the connection was failed at {}us over a path that can carry a smaller packet",
         sim.now
     );
-    assert_eq!(sim.b_got.len(), 0, "something got through a link that drops everything large");
+    assert_eq!(sim.b_got.len(), 1, "the message never arrived after {}us", sim.now);
+    assert_eq!(sim.b_got[0], message(0, 8192), "the message arrived corrupted");
+}
+
+/// The same machinery has to know when to stop. A path that will not carry even
+/// the smallest packet this can build cannot be worked around, and saying so is
+/// better than halving forever.
+#[test]
+fn a_path_that_carries_nothing_at_all_is_reported() {
+    // Passes a 64-byte handshake, drops the 80-byte packet a floor-MSS
+    // connection would send.
+    let mut sim = Sim::new(LinkConfig::mtu_limited(70), 9);
+    sim.connect();
+
+    let payload = bytes::Bytes::from(message(0, 8192));
+    assert_eq!(sim.a.send_msg(payload, None, true, sim.now, &mut sim.a_tx), SendOutcome::Queued);
+    sim.drain(Side::A);
+
+    let mut reason = None;
+    for _ in 0..MAX_STEPS {
+        if !sim.step() {
+            break;
+        }
+        for event in sim.events.drain(..) {
+            if let Event::Disconnected(r) = event {
+                reason = Some(r);
+            }
+        }
+        if reason.is_some() {
+            break;
+        }
+    }
+
+    assert!(!sim.a.stats().connected, "a path carrying nothing stayed up for {}us", sim.now);
+    assert_eq!(sim.b_got.len(), 0, "something got through a link that drops everything");
 }
 
 /// The same detection must not fire on a link that is merely slow and lossy,
