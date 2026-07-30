@@ -72,22 +72,21 @@ const EXP_MAX: u32 = 16;
 /// is 10 ms, so a single one is far too little to conclude that.
 const PROBE_EXPIRIES: u32 = 3;
 
-/// Floor on the recovery timers, in microseconds.
+/// Floor on the repeat-NAK interval, in microseconds.
 ///
-/// A floor exists so a noisy round-trip estimate cannot drive a timer down to
+/// A floor exists so a noisy round-trip estimate cannot drive the timer down to
 /// nothing, and so it cannot ask for a wakeup finer than the driver can
 /// deliver. One millisecond is roughly tokio's timer granularity, so below this
 /// the number would be a fiction.
 ///
-/// It is deliberately **not** [`SYN_US`]. That is UDT's control cadence — how
-/// often to acknowledge — and has no business deciding how fast a lost packet
-/// is noticed. Using it for both put both recovery timers at ~50x the round
-/// trip on a fast path, and one firing then cost more than an entire clean
-/// transfer: the loss sweep showed a repeated 13.86x quantum that was exactly
-/// this, and seeds split into "lost no NAK" at 1.00x and "lost one" at 13.86x.
+/// Deliberately **not** [`SYN_US`], which had been serving as the floor: that is
+/// how often UDT *acknowledges*, and re-asking about a gap is not an
+/// acknowledgement. A lost NAK cost 10 ms to re-ask on a path whose round trip
+/// was 200 µs — fifty round trips for a question answered in one.
 ///
-/// The reference is worse still — a flat 300 ms, which dominates the RTT term
-/// on anything under a 290 ms round trip, i.e. very nearly every path.
+/// This applies to the NAK timer only. The retransmission timeout has to respect
+/// how long a peer may take to acknowledge, and shortening it broke a real peer:
+/// see [`Connection::exp_int_us`].
 const MIN_RECOVERY_US: u64 = 1_000;
 /// Largest round-trip time a peer may report, in microseconds.
 ///
@@ -1919,28 +1918,36 @@ impl Connection {
 
     /// Interval until the next EXP firing.
     ///
-    /// Uses the CC's RTO if it supplies one, else the C++ formula with the
-    /// granularity term and the floor both taken from [`MIN_RECOVERY_US`]:
-    /// `max(count × (RTT + 4·RTTVar) + floor, count × floor)`.
+    /// Uses the CC's RTO if it supplies one, else the reference's formula:
+    /// `max(count × (RTT + 4·RTTVar) + SYN, count × SYN)`.
     ///
-    /// The floor depends on what the timer is *for*, because this one wears two
-    /// hats. With data outstanding it is the retransmission timeout and belongs
-    /// near the round trip. With nothing outstanding it only paces the
-    /// keep-alive in `on_timeout`'s `else` branch, which belongs at the control
-    /// interval — a millisecond keep-alive on an idle connection is a thousand
-    /// packets a second saying nothing.
+    /// **[`SYN_US`] here is not a granularity term, and not a floor for its own
+    /// sake — it is how long a peer is allowed to take to acknowledge.** UDT
+    /// receivers acknowledge on a `SYN` timer, so a retransmission timeout
+    /// shorter than that fires before the first ACK could possibly arrive, every
+    /// time, on any transfer that lets the window drain. What follows is
+    /// spurious: `on_timeout` probes, and once `exp_count` passes
+    /// [`PROBE_EXPIRIES`] it re-sends the entire window into a peer that already
+    /// has it.
     ///
-    /// The reference uses its 10 ms `SYN` interval as the granularity term, and
-    /// that addend alone — not the floor beside it — is what pinned this at
-    /// ~10 ms however short the path.
+    /// This was tried at 1 ms, on the reasoning that fifty round trips is a
+    /// silly price for noticing a loss. The simulator liked it — under 4% either
+    /// way — because a Rust receiver nudges its ACK forward on the odd-sized
+    /// packet that ends a message and so answers almost at once. The C++
+    /// reference does not, and `interop_message_boundaries_rust_to_cpp` began
+    /// timing out after twenty seconds roughly one run in seven, its peer buried
+    /// in duplicates. Nought in ten once this went back.
+    ///
+    /// The NAK interval is a different question and keeps its short floor: see
+    /// [`nak_int_us`](Self::nak_int_us).
     fn exp_int_us(&self) -> u64 {
         if let Some(rto) = self.cc_rto_us {
             return self.exp_count as u64 * rto;
         }
-        let floor = if self.snd_buf_is_empty() { SYN_US as u64 } else { MIN_RECOVERY_US };
-        let rtt_based =
-            self.exp_count as u64 * (self.rtt_us as u64 + 4 * self.rtt_var_us as u64) + floor;
-        let min_based = self.exp_count as u64 * floor;
+        let ack_allowance = SYN_US as u64;
+        let rtt_based = self.exp_count as u64 * (self.rtt_us as u64 + 4 * self.rtt_var_us as u64)
+            + ack_allowance;
+        let min_based = self.exp_count as u64 * ack_allowance;
         rtt_based.max(min_based)
     }
 
@@ -2375,37 +2382,43 @@ mod tests {
         assert!(first >= MIN_RECOVERY_US, "the interval should respect its floor");
     }
 
-    /// The floor depends on whether the timer is retransmitting or only
-    /// keeping alive, and getting that backwards is a thousand keep-alives a
-    /// second on an idle connection.
+    /// The retransmission timeout must never come in under the time a peer is
+    /// allowed to take to acknowledge, however fast the path.
+    ///
+    /// UDT receivers acknowledge on a `SYN` timer, so an RTO below that fires
+    /// before the first ACK could arrive — every time, on any transfer that lets
+    /// the window drain — and once `exp_count` passes `PROBE_EXPIRIES` the whole
+    /// window is re-sent to a peer that already has it. Tried at 1 ms; the
+    /// simulator saw nothing wrong because a Rust receiver answers almost at
+    /// once, and the C++ reference then timed out after twenty seconds about one
+    /// interop run in seven.
     #[test]
-    fn an_idle_connection_keeps_alive_at_the_control_interval() {
+    fn the_retransmission_timeout_allows_for_a_peer_acknowledging_on_its_timer() {
         let mut c = connected(1_000_000);
-        c.rtt_us = 100;
-        c.rtt_var_us = 10;
-        c.exp_count = 1;
-
-        assert!(c.snd_buf_is_empty());
-        assert!(
-            c.exp_int_us() >= SYN_US as u64,
-            "an idle connection should not wake at the recovery floor: {}us",
-            c.exp_int_us()
-        );
-
-        // With something outstanding it becomes a retransmission timeout, and
-        // on a fast path that must be nowhere near the control interval.
         let mut tx = TransmitBuf::new();
         assert_eq!(
             c.send_msg(Bytes::from(vec![0u8; 64]), None, true, 1_000_000, &mut tx),
             SendOutcome::Queued
         );
-        assert!(!c.snd_buf_is_empty());
-        assert!(
-            c.exp_int_us() < SYN_US as u64,
-            "a retransmission timeout should track the path, not the control \
-             interval: {}us",
-            c.exp_int_us()
-        );
+
+        // Even on an implausibly fast path with a rock-steady estimate.
+        for (rtt, var) in [(0, 0), (1, 0), (100, 10), (5_000, 500)] {
+            c.rtt_us = rtt;
+            c.rtt_var_us = var;
+            c.exp_count = 1;
+            assert!(
+                c.exp_int_us() >= SYN_US as u64,
+                "rtt={rtt} var={var} gave an RTO of {}us, under the {}us a peer \
+                 may take to acknowledge",
+                c.exp_int_us(),
+                SYN_US
+            );
+        }
+
+        // The NAK timer is the one that gets to be quick: re-asking about a gap
+        // is not waiting for an acknowledgement.
+        c.rtt_us = 100;
+        assert!(c.nak_int_us() < SYN_US as u64, "the NAK interval lost its short floor");
     }
 
     #[test]
