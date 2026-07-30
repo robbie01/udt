@@ -21,8 +21,26 @@ const UDP_SND_BUF: usize = 2 * 1024 * 1024;
 /// Kernel UDP receive buffer, in packets.
 const UDP_RCV_BUF_PKTS: usize = 8192;
 
-static SOCKET_ID: AtomicU32 = AtomicU32::new(1);
+/// Counter behind [`next_socket_id`], started somewhere unpredictable.
+///
+/// Randomising the origin rather than the whole value keeps identifiers unique
+/// within a process — two connections must never share one — while making the
+/// first identifier unguessable. Incrementing from a random start leaks the
+/// count of connections opened, which is not worth defending.
+static SOCKET_ID: LazyLock<AtomicU32> = LazyLock::new(|| AtomicU32::new(rand::random()));
 
+/// A fresh socket identifier.
+///
+/// This is the only thing standing between an off-path attacker and a
+/// connection. UDT has no authentication at all, so every control packet is
+/// accepted on the strength of its destination identifier matching, and several
+/// of them are fatal. Encrypting the payload does not help: control packets sit
+/// beneath it.
+///
+/// It used to count up from 1, which made the first connection in a process
+/// socket 1 and every later one easy to guess. Starting from a random value
+/// makes it a 32-bit cookie, which is roughly what TCP gets from requiring an
+/// injected `RST` to land inside the receive window.
 pub(crate) fn next_socket_id() -> u32 {
     SOCKET_ID.fetch_add(1, Ordering::Relaxed)
 }

@@ -687,6 +687,41 @@ fn loss_cost_table() {
     println!();
 }
 
+/// An idle connection must be nearly silent.
+///
+/// The keep-alive exists to stop a NAT or stateful firewall forgetting the
+/// mapping, and those hold UDP for tens of seconds. It used to ride the
+/// retransmission timer instead of having a schedule of its own, so an idle pair
+/// exchanged 96 packets a second in each direction — EXP fired at its floor, the
+/// keep-alive it sent reset the peer's `exp_count`, and both ends stayed pinned
+/// there. A peer-to-peer process holding many idle connections pays that per
+/// connection.
+#[test]
+fn an_idle_connection_is_nearly_silent() {
+    let mut sim = Sim::new(LinkConfig::perfect(), 3);
+    sim.connect();
+
+    let start = sim.now;
+    let (a0, b0) = (sim.a_to_b.sent, sim.b_to_a.sent);
+    while sim.now - start < 60_000_000 {
+        if !sim.step() {
+            break;
+        }
+    }
+
+    let secs = (sim.now - start) as f64 / 1e6;
+    let (a, b) = (sim.a_to_b.sent - a0, sim.b_to_a.sent - b0);
+    let rate = (a.max(b)) as f64 / secs;
+    println!("[idle] {a} and {b} packets over {secs:.0}s — {rate:.2}/s");
+
+    // A keep-alive every 15s is one packet per direction per 15s, so a shade
+    // under 0.07/s. One in three is generous room for the acknowledgement
+    // machinery without being anywhere near the old behaviour.
+    assert!(rate < 0.34, "an idle connection sent {rate:.2} packets a second");
+    assert!(a > 0 && b > 0, "an idle connection went completely silent, so NAT will forget it");
+    assert!(sim.a.stats().connected && sim.b.stats().connected, "an idle connection timed out");
+}
+
 /// The round-trip estimate has to reflect the path, not the opening guess.
 ///
 /// Every recovery timer is derived from it — the repeat-NAK interval is four

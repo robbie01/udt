@@ -58,6 +58,21 @@ const LOSS_LIST_RESERVE: usize = 128;
 /// whatever is dropped is reported by a later ACK.
 const MAX_SACK_RANGES: usize = 32;
 
+/// How often an otherwise idle connection sends a keep-alive.
+///
+/// Its job is to stop a NAT or stateful firewall forgetting the mapping, and
+/// those hold UDP for tens of seconds — 30 s is the usual conservative figure.
+/// Five seconds sits well inside that, and four missed in a row is what
+/// [`EXP_HARD_TIMEOUT_US`] then treats as a dead peer.
+///
+/// It used to ride the retransmission timer, which meant an idle connection
+/// exchanged **96 packets a second in each direction**: EXP fired at its floor,
+/// sent a keep-alive, and the keep-alive reset the peer's `exp_count`, pinning
+/// both ends at the floor forever. That is about a thousand times more than the
+/// job needs, and a peer-to-peer process holding many idle connections pays it
+/// per connection.
+const KEEPALIVE_US: u64 = 5_000_000;
+
 const DEFAULT_SND_BUF: usize = 8192;
 const DEFAULT_RCV_BUF: usize = 8192;
 const SYN_US: u32 = 10_000;
@@ -109,8 +124,14 @@ const BLACK_HOLE_EXP_COUNT: u32 = 8;
 const BLACK_HOLE_MIN_US: u64 = 500_000;
 
 /// After EXP_MAX expirations the connection is only torn down once it has been
-/// silent for this long in total (matches C++ `5 000 000 µs` guard).
-const EXP_HARD_TIMEOUT_US: u64 = 5_000_000;
+/// silent for this long in total.
+///
+/// Four [`KEEPALIVE_US`] intervals. The two have to be chosen together: an idle
+/// peer is only heard from once per keep-alive, so a timeout shorter than that
+/// tears down connections that are working perfectly well. The reference uses
+/// 5 s here and keeps alive far more often, which is the same relationship at a
+/// much higher cost.
+const EXP_HARD_TIMEOUT_US: u64 = 4 * KEEPALIVE_US;
 /// Handshake retransmit backoff, in µs, then `HS_RESEND_US` thereafter.
 ///
 /// A flat 250 ms — which is what the C++ reference uses — costs a full quarter
@@ -305,6 +326,8 @@ pub struct Connection {
 
     next_ack_us: u64,
     next_nak_us: u64,
+    /// When an idle connection should next remind the path it exists.
+    next_keepalive_us: u64,
     next_snd_us: u64,
     last_rsp_us: u64,
     /// Expiry firings since the last time an acknowledgement moved forward.
@@ -485,6 +508,7 @@ impl Connection {
             ready_msgs: VecDeque::new(),
             next_ack_us: now_us + SYN_US as u64,
             next_nak_us: now_us + SYN_US as u64 * 4,
+            next_keepalive_us: now_us + KEEPALIVE_US,
             next_snd_us: now_us,
             last_rsp_us: now_us,
             exp_without_progress: 0,
@@ -546,6 +570,7 @@ impl Connection {
         self.snd_last_ack2_us = now_us;
         self.next_ack_us = now_us + SYN_US as u64;
         self.next_nak_us = now_us + self.nak_int_us();
+        self.next_keepalive_us = now_us + KEEPALIVE_US;
         self.next_snd_us = now_us;
     }
 
@@ -634,6 +659,24 @@ impl Connection {
         if self.snd_half_closed && self.snd_buf_is_empty() {
             self.shutdown(now_us, tx, out);
             return;
+        }
+
+        // Keep-alive, on its own schedule rather than the retransmission timer's.
+        //
+        // Its only job is to stop a NAT or stateful firewall forgetting the
+        // mapping, which wants seconds. Riding EXP meant an idle pair exchanged
+        // 96 packets a second in each direction, because each keep-alive reset
+        // the peer's `exp_count` and pinned both ends at the timer's floor.
+        //
+        // Serviced here rather than inside the expiry branch: this deadline is
+        // reported by `next_deadline_us`, so a caller wakes for it, and leaving
+        // it unserviced when the expiry timer is not also due means it is never
+        // re-armed — which stalls a virtual clock outright and spins a real one.
+        if now_us >= self.next_keepalive_us {
+            self.next_keepalive_us = now_us + KEEPALIVE_US;
+            if self.snd_buf_is_empty() {
+                tx.push(|dst| codec::encode_keepalive(self.ts(now_us), self.peer_id, dst));
+            }
         }
 
         // ACK — full ACK on the SYN timer, cheap light ACKs in between when the
@@ -771,9 +814,6 @@ impl Connection {
                 }
                 // Restart transmission immediately rather than waiting a tick.
                 self.next_snd_us = self.next_snd_us.min(now_us);
-            } else {
-                // Receiver side: keep-alive so the peer's EXP does not fire.
-                tx.push(|dst| codec::encode_keepalive(self.ts(now_us), self.peer_id, dst));
             }
 
             self.exp_count += 1;
@@ -862,7 +902,8 @@ impl Connection {
                 if !self.rcv_loss.is_empty() {
                     t = t.min(self.next_nak_us);
                 }
-                Some(t.min(self.last_rsp_us + self.exp_int_us()))
+                t = t.min(self.last_rsp_us + self.exp_int_us());
+                Some(t.min(self.next_keepalive_us))
             }
         }
     }
@@ -1199,7 +1240,7 @@ impl Connection {
                 self.last_rsp_us = now_us;
                 self.exp_count = 1;
             }
-            ControlBody::Ack(asn, payload) => self.recv_ack(asn, payload, now_us, tx, out),
+            ControlBody::Ack(asn, payload) => self.recv_ack(asn, payload, now_us, tx),
             ControlBody::Nak(nak) => self.recv_nak(nak, now_us),
             ControlBody::Ack2(asn) => self.recv_ack2(asn, now_us),
             ControlBody::Shutdown => {
@@ -1248,8 +1289,13 @@ impl Connection {
                 }
             }
             ControlBody::ErrorSignal { .. } => {
-                self.state = ConnState::Closed;
-                out.push(Event::Disconnected(DisconnectReason::PeerError));
+                // Ignored for the same reason as an out-of-range ACK: it is
+                // unauthenticated and fatal, which is a one-packet kill for
+                // anyone who can guess the socket identifier. The reference
+                // never sends it, and a peer that genuinely cannot continue has
+                // `Shutdown` and, failing that, our expiry timer.
+                self.last_rsp_us = now_us;
+                self.exp_count = 1;
             }
             ControlBody::CongestionWarning => {
                 self.last_rsp_us = now_us;
@@ -1415,18 +1461,26 @@ impl Connection {
         payload: crate::packet::AckPayload,
         now_us: u64,
         tx: &mut TransmitBuf,
-        out: &mut Vec<Event>,
     ) {
         self.last_rsp_us = now_us;
         self.exp_count = 1;
 
         let ack_seq = payload.data_ack_seq;
 
-        // Reject an ACK for data we never sent — a corrupt or hostile peer must
-        // not be able to advance our send buffer past the write cursor.
+        // An ACK for data we never sent is ignored, not fatal.
+        //
+        // Not advancing the send buffer past the write cursor is the point, and
+        // returning achieves it. Closing as well handed an off-path attacker a
+        // one-packet kill: UDT authenticates nothing, so anyone who can guess
+        // the address pair and the socket identifier can forge this, and
+        // *most* of the sequence space is out of range — no valid guess needed,
+        // which inverts the usual difficulty of blind injection. TCP requires an
+        // injected `RST` to land inside the receive window, and RFC 5961
+        // hardened even that.
+        //
+        // A real peer does not send these, so dropping them costs a well-behaved
+        // connection nothing.
         if ack_seq > self.snd_curr_seq.next() {
-            self.state = ConnState::Closed;
-            out.push(Event::Disconnected(DisconnectReason::PeerError));
             return;
         }
 
@@ -2412,13 +2466,20 @@ mod tests {
         assert!(ack.full.is_none(), "a light ACK should carry only the sequence number");
     }
 
+    /// An impossible acknowledgement is dropped and the connection carries on.
+    ///
+    /// Both halves matter. The send buffer must not advance past the write
+    /// cursor, and the connection must not die, because nothing authenticates
+    /// this packet: anyone who can guess the address pair and socket identifier
+    /// can forge one, and most of the sequence space is out of range, so no
+    /// valid guess is needed. Closing here was a one-packet kill from off path.
     #[test]
-    fn an_acknowledgement_for_data_never_sent_is_treated_as_hostile() {
+    fn an_acknowledgement_for_data_never_sent_is_ignored() {
         let mut c = connected(1_000_000);
         let mut tx = TransmitBuf::new();
         let mut out = Vec::new();
-        // Nothing has been sent, so anything above the initial sequence number
-        // is an acknowledgement of data that does not exist.
+        let before = c.stats();
+
         c.recv_ctrl(
             ControlBody::Ack(
                 AckSeqNo::new(1),
@@ -2432,10 +2493,31 @@ mod tests {
             &mut tx,
             &mut out,
         );
+
+        assert!(c.is_connected(), "a forged acknowledgement closed the connection");
         assert!(
-            out.iter().any(|e| matches!(e, Event::Disconnected(DisconnectReason::PeerError))),
-            "an impossible acknowledgement should fail the connection, not advance the buffer"
+            !out.iter().any(|e| matches!(e, Event::Disconnected(_))),
+            "a forged acknowledgement reported a disconnect"
         );
+        assert_eq!(
+            c.stats().snd_last_ack,
+            before.snd_last_ack,
+            "the send buffer advanced on data that was never sent"
+        );
+    }
+
+    /// Same reasoning for the error signal: unauthenticated and fatal is a
+    /// one-packet kill. The reference never sends it.
+    #[test]
+    fn an_error_signal_does_not_close_the_connection() {
+        let mut c = connected(1_000_000);
+        let mut tx = TransmitBuf::new();
+        let mut out = Vec::new();
+
+        c.recv_ctrl(ControlBody::ErrorSignal { error_code: 1002 }, 1_000_000, &mut tx, &mut out);
+
+        assert!(c.is_connected(), "a forged error signal closed the connection");
+        assert!(!out.iter().any(|e| matches!(e, Event::Disconnected(_))));
     }
 
     #[test]
