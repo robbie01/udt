@@ -167,9 +167,17 @@ saturated connection does not allocate per packet.
 
 ## Not done yet
 
-Windows. Selective acknowledgement, which is the largest structural gap — a
-single loss stalls the window, and it is why 5% loss costs so much more than 2%.
-[`docs/selective-ack.md`](docs/selective-ack.md) works out why and what the fix
-looks like. ECN, which the UDP layer already plumbs and this discards.
-Connection IDs, so a NAT rebind does not kill the connection. Path-MTU probing —
-black holes are detected and reported, never probed around.
+Windows. ECN, which the UDP layer already plumbs and this discards. Connection
+IDs, so a NAT rebind does not kill the connection. Path-MTU probing — black
+holes are detected and reported, never probed around.
+
+Selective acknowledgement is implemented but only half-proven. A peer that does
+not understand it reads our ACKs exactly as before — the ranges go after the
+documented body, and that is asserted — but this has not yet been run against
+the C++ reference, so the compatibility claim rests on reading its source rather
+than on watching it work. Loss recovery is worth 30.6x → 24.2x the clean
+transfer time at 5% loss, measured across five simulator seeds. Real, and
+smaller than expected: most of what loss costs here turns out to be
+retransmission latency rather than the stalled window, so the remaining headroom
+is in how fast a hole is noticed and refilled, not in the window arithmetic.
+[`docs/selective-ack.md`](docs/selective-ack.md) has the details.

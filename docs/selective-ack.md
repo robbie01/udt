@@ -1,8 +1,17 @@
 # Selective acknowledgement
 
-Design note. Not implemented yet — this records the problem, the shape of the
-fix, and the one compatibility question that has to be answered empirically
-before any of it is worth writing.
+**Status: implemented, compatibility unconfirmed.** The design below is what
+was built. Two things to know before reading it as a plan:
+
+- **It helped less than expected.** 5% loss cost 30.6x the clean transfer time
+  before and 24.2x after, meaned over five simulator seeds. The stalled window
+  was a real cost but not the dominant one — most of what loss costs this
+  protocol is the latency of noticing a hole and refilling it, which this does
+  not touch. Anyone looking for the next big win on a lossy path should start
+  there rather than here.
+- **The interop test has not been run.** Everything below about C++ tolerating
+  a longer ACK comes from reading its source, which is a prior and not a
+  result. See "Wire format".
 
 ## The problem
 
@@ -174,14 +183,23 @@ over-long ACKs are ignored rather than rejected — the same question again.
 Failing that, it becomes a genuine wire break and should wait for whatever else
 wants one (connection IDs, ECN, a defined timestamp epoch).
 
-## Expected gain
+## What it was worth
 
-The stalled window is most of the cost of loss on this implementation, so the
-target is the 5%-loss case: roughly 25x the clean transfer time today. There is
-no basis yet for predicting where that lands — measure it on the simulator,
-which is deterministic and seeded, and report the mean over several seeds rather
-than one. A single seed on that test ranges from 7x to 35x on nothing but which
-packets get dropped.
+**30.6x → 24.2x** the clean transfer time at 5% loss, meaned over five seeds of
+the deterministic simulator (`loss_recovery_is_not_catastrophic`, which now
+prints the figure under `--nocapture`). No measurable effect on a clean path,
+where there are no gaps and the range list is empty.
+
+That is about a fifth of the recovery cost, against a prediction — written in
+this document before it was built — that the stalled window was *most* of it.
+It was not. The remaining ~24x is dominated by how long a hole takes to be
+noticed and refilled: NAK timing, the retransmission path, and the expiry timer.
+That is where the next attempt should go.
+
+Worth stating plainly because the number is easy to over-read in either
+direction: measure with the mean over seeds, never one. A single seed on that
+test ranges from 7x to 35x on nothing but which packets get dropped, so any
+single-seed comparison of this change would have been meaningless.
 
 ## Interaction with what is already there
 
