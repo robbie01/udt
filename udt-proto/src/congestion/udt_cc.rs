@@ -41,6 +41,11 @@ pub struct UdtCc {
     // Current state
     pkt_snd_period_us: f64,
     cwnd: f64,
+    /// Smallest round trip seen, µs, or `None` before the first sample.
+    ///
+    /// The window is sized from this rather than from the current round trip.
+    /// See [`UdtCc::window_for`].
+    min_rtt_us: Option<f64>,
 }
 
 impl UdtCc {
@@ -60,6 +65,34 @@ impl UdtCc {
             dec_count: 0,
             pkt_snd_period_us: 1.0,
             cwnd: INIT_CWND,
+            min_rtt_us: None,
+        }
+    }
+
+    /// Window for a flow receiving `rcv_rate_pps`, in packets.
+    ///
+    /// Sized from the *smallest* round trip seen, not the current one.
+    ///
+    /// The reference uses the current one, and that does not converge. A flow
+    /// delivering `R` over a round trip `T` already has `R × T` in flight, so
+    /// asking for `R × (T + SYN)` is a standing request for 10 ms of data more
+    /// than the path holds. The excess becomes queue, the queue raises `T`, and
+    /// the larger `T` asks for more still — a positive feedback loop whose only
+    /// fixed point is a full buffer. Measured in the bottleneck model: 188 ms of
+    /// queuing delay on a 50 ms link, overflowing in 3997 rounds out of 4000.
+    ///
+    /// The minimum is the path without a queue, so the same formula against it
+    /// asks for a bounded amount and the loop is broken. Delay-based
+    /// controllers all do some version of this; it is the one line that stops
+    /// this one filling whatever buffer it meets.
+    fn window_for(&self, rcv_rate_pps: f64, rtt_us: f64) -> f64 {
+        let base = self.min_rtt_us.unwrap_or(rtt_us);
+        rcv_rate_pps / 1_000_000.0 * (base + self.rc_interval_us as f64) + 16.0
+    }
+
+    fn observe_rtt(&mut self, rtt_us: f64) {
+        if rtt_us > 0.0 {
+            self.min_rtt_us = Some(self.min_rtt_us.map_or(rtt_us, |m| m.min(rtt_us)));
         }
     }
 
@@ -94,6 +127,7 @@ impl CongestionControl for UdtCc {
         self.dec_random = 1;
         self.cwnd = INIT_CWND;
         self.pkt_snd_period_us = 1.0;
+        self.min_rtt_us = None;
         CcOutput {
             pkt_snd_period_us: self.pkt_snd_period_us,
             cwnd: self.cwnd,
@@ -106,6 +140,7 @@ impl CongestionControl for UdtCc {
     fn on_ack(&mut self, ack: SeqNo, ctx: CcContext) -> CcOutput {
         const MIN_INC: f64 = 0.01;
 
+        self.observe_rtt(ctx.rtt_us as f64);
         if ctx.now_us.wrapping_sub(self.last_rc_time_us) < self.rc_interval_us {
             return self.output();
         }
@@ -129,9 +164,7 @@ impl CongestionControl for UdtCc {
             // The caller feeds us a smoothed delivery rate that is seeded at
             // 16 pkt/s and only updated from positive samples, so this cannot
             // collapse the window on a zero-rate report.
-            self.cwnd = ctx.rcv_rate_pps as f64 / 1_000_000.0
-                * (ctx.rtt_us as f64 + self.rc_interval_us as f64)
-                + 16.0;
+            self.cwnd = self.window_for(ctx.rcv_rate_pps as f64, ctx.rtt_us as f64);
         }
 
         if self.slow_start {
