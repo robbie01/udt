@@ -122,6 +122,12 @@ pub struct NakList(pub Vec<(SeqNo, SeqNo)>); // (start, end) inclusive ranges
 pub struct AckPayload {
     pub data_ack_seq: SeqNo,
     pub full: Option<AckFull>,
+    /// Ranges above `data_ack_seq` the peer says arrived, if it sends them.
+    ///
+    /// An extension: UDT has no selective acknowledgement, and a peer that
+    /// does not implement it leaves this empty — which is every C++ peer. See
+    /// `docs/selective-ack.md` for why appending them is compatible.
+    pub sack: Vec<(SeqNo, SeqNo)>,
 }
 
 #[derive(Debug, Clone, Copy)]

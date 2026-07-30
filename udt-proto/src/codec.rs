@@ -99,9 +99,19 @@ fn decode_ctrl_body(hdr: &ControlHeader, payload: Bytes) -> Option<ControlBody> 
             } else {
                 None
             };
+            // Selective acknowledgement, from a peer that sends it: bit31-tagged
+            // ranges appended after the 24-byte full body, encoded as a NAK list
+            // is. A malformed tail is dropped rather than failing the packet —
+            // the acknowledgement point in front of it is still good, and some
+            // later extension may put something here that is not ranges.
+            let sack = if payload.len() > 24 {
+                decode_seq_ranges(&payload[24..]).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             Some(ControlBody::Ack(
                 AckSeqNo::new(hdr.additional_info),
-                AckPayload { data_ack_seq: data_ack, full },
+                AckPayload { data_ack_seq: data_ack, full, sack },
             ))
         }
         ControlType::Nak => {
@@ -127,6 +137,15 @@ fn decode_ctrl_body(hdr: &ControlHeader, payload: Bytes) -> Option<ControlBody> 
 }
 
 fn decode_nak_list(payload: &[u8]) -> Option<NakList> {
+    decode_seq_ranges(payload).map(NakList)
+}
+
+/// Decode bit31-tagged sequence ranges: a word with bit 31 set opens a range
+/// whose end is the following word, and a bare word is a single sequence.
+///
+/// Shared by NAK bodies and the selective-acknowledgement tail of an ACK,
+/// which use the same encoding.
+fn decode_seq_ranges(payload: &[u8]) -> Option<Vec<(SeqNo, SeqNo)>> {
     if !payload.len().is_multiple_of(4) {
         return None;
     }
@@ -150,7 +169,20 @@ fn decode_nak_list(payload: &[u8]) -> Option<NakList> {
             ranges.push((s, s));
         }
     }
-    Some(NakList(ranges))
+    Some(ranges)
+}
+
+/// Append bit31-tagged sequence ranges, the encoding NAK bodies and the ACK
+/// selective-acknowledgement tail share.
+fn put_seq_ranges(ranges: &[(SeqNo, SeqNo)], body: &mut BytesMut) {
+    for &(start, end) in ranges {
+        if start == end {
+            body.put_u32(start.raw()); // single, bit31 clear
+        } else {
+            body.put_u32(start.raw() | 0x8000_0000); // range start, bit31 set
+            body.put_u32(end.raw()); // range end, bit31 clear
+        }
+    }
 }
 
 // ── Encoder ─────────────────────────────────────────────────────────────────
@@ -229,15 +261,23 @@ pub fn encode_handshake(hs: &Handshake, timestamp_us: u32, dst_socket_id: u32, d
 }
 
 /// Encode an ACK packet into `dst`. `full` is optional; if None a light ACK is sent.
+///
+/// `sack` appends selectively acknowledged ranges after the full body, and is
+/// **ignored unless `full` is `Some`**. That is enforced here rather than left
+/// to callers because getting it wrong is silent and remote: the C++ reference
+/// reads its rate fields whenever the body runs past 16 bytes, so ranges hung
+/// off a short ACK arrive as a delivery rate and a bandwidth estimate and go
+/// straight into the peer's pacing. See `docs/selective-ack.md`.
 pub fn encode_ack(
     ack_sub_seq: AckSeqNo,
     data_ack_seq: SeqNo,
     full: Option<&AckFull>,
+    sack: &[(SeqNo, SeqNo)],
     timestamp_us: u32,
     dst_socket_id: u32,
     dst: &mut BytesMut,
 ) {
-    let mut body = BytesMut::with_capacity(if full.is_some() { 24 } else { 4 });
+    let mut body = BytesMut::with_capacity(if full.is_some() { 24 + sack.len() * 8 } else { 4 });
     body.put_i32(data_ack_seq.raw() as i32);
     if let Some(f) = full {
         body.put_i32(f.rtt_us);
@@ -245,6 +285,7 @@ pub fn encode_ack(
         body.put_i32(f.avail_buf_pkts);
         body.put_i32(f.rcv_rate_pps);
         body.put_i32(f.bandwidth_pps);
+        put_seq_ranges(sack, &mut body);
     }
     encode_control(ControlType::Ack, ack_sub_seq.raw(), timestamp_us, dst_socket_id, &body, dst);
 }
@@ -275,14 +316,7 @@ pub fn encode_nak(
     dst: &mut BytesMut,
 ) {
     let mut body = BytesMut::with_capacity(ranges.len() * 8);
-    for &(start, end) in ranges {
-        if start == end {
-            body.put_u32(start.raw()); // single, bit31 clear
-        } else {
-            body.put_u32(start.raw() | 0x8000_0000); // range start, bit31 set
-            body.put_u32(end.raw()); // range end, bit31 clear
-        }
-    }
+    put_seq_ranges(ranges, &mut body);
     encode_control(ControlType::Nak, 0, timestamp_us, dst_socket_id, &body, dst);
 }
 
@@ -355,6 +389,7 @@ mod tests {
                     *asn,
                     payload.data_ack_seq,
                     payload.full.as_ref(),
+                    &payload.sack,
                     h.timestamp_us,
                     h.dst_socket_id,
                     &mut buf,
@@ -471,7 +506,7 @@ mod tests {
             },
             body: ControlBody::Ack(
                 AckSeqNo::new(77),
-                AckPayload { data_ack_seq: SeqNo::new(500), full: None },
+                AckPayload { data_ack_seq: SeqNo::new(500), full: None, sack: Vec::new() },
             ),
         };
         let rt = round_trip(pkt);
@@ -502,7 +537,7 @@ mod tests {
             },
             body: ControlBody::Ack(
                 AckSeqNo::new(10),
-                AckPayload { data_ack_seq: SeqNo::new(99), full: Some(full) },
+                AckPayload { data_ack_seq: SeqNo::new(99), full: Some(full), sack: Vec::new() },
             ),
         };
         let rt = round_trip(pkt);
@@ -510,6 +545,117 @@ mod tests {
             let f = payload.full.unwrap();
             assert_eq!(f.rtt_us, 1000);
             assert_eq!(f.bandwidth_pps, 5000);
+        } else {
+            panic!("expected Ack");
+        }
+    }
+
+    fn ack_with_sack(sack: Vec<(SeqNo, SeqNo)>) -> Packet {
+        Packet::Control {
+            header: ControlHeader {
+                ctrl_type: ControlType::Ack,
+                additional_info: 10,
+                timestamp_us: 0,
+                dst_socket_id: 0,
+            },
+            body: ControlBody::Ack(
+                AckSeqNo::new(10),
+                AckPayload {
+                    data_ack_seq: SeqNo::new(99),
+                    full: Some(AckFull {
+                        rtt_us: 1000,
+                        rtt_var_us: 200,
+                        avail_buf_pkts: 8192,
+                        rcv_rate_pps: 1234,
+                        bandwidth_pps: 5000,
+                    }),
+                    sack,
+                },
+            ),
+        }
+    }
+
+    #[test]
+    fn ack_sack_roundtrip() {
+        let sack = vec![(SeqNo::new(105), SeqNo::new(140)), (SeqNo::new(150), SeqNo::new(150))];
+        let rt = round_trip(ack_with_sack(sack.clone()));
+        if let Packet::Control { body: ControlBody::Ack(_, payload), .. } = rt {
+            assert_eq!(payload.sack, sack);
+            // The fields in front of it must survive untouched.
+            assert_eq!(payload.data_ack_seq, SeqNo::new(99));
+            let f = payload.full.unwrap();
+            assert_eq!(f.rcv_rate_pps, 1234);
+            assert_eq!(f.bandwidth_pps, 5000);
+        } else {
+            panic!("expected Ack");
+        }
+    }
+
+    /// The property the extension rests on: a decoder that knows nothing about
+    /// selective acknowledgement must read the ACK in front of it exactly as it
+    /// would a plain 24-byte one. This is what a C++ peer does, and getting it
+    /// wrong corrupts its rate estimates rather than failing visibly.
+    #[test]
+    fn a_sack_tail_is_invisible_to_a_decoder_that_ignores_it() {
+        let mut with = BytesMut::new();
+        let mut without = BytesMut::new();
+        let full = AckFull {
+            rtt_us: 1000,
+            rtt_var_us: 200,
+            avail_buf_pkts: 8192,
+            rcv_rate_pps: 1234,
+            bandwidth_pps: 5000,
+        };
+        let sack = [(SeqNo::new(105), SeqNo::new(140))];
+        encode_ack(AckSeqNo::new(10), SeqNo::new(99), Some(&full), &sack, 0, 0, &mut with);
+        encode_ack(AckSeqNo::new(10), SeqNo::new(99), Some(&full), &[], 0, 0, &mut without);
+
+        // Identical up to the end of the documented body, longer after it.
+        assert_eq!(&with[..16 + 24], &without[..16 + 24]);
+        assert_eq!(without.len(), 16 + 24);
+        assert_eq!(with.len(), 16 + 24 + 8);
+    }
+
+    /// Ranges are dropped on a light ACK rather than written. A 4-byte body plus
+    /// ranges would read as a full ACK to the C++ peer, which takes the rate
+    /// fields from anything longer than 16 bytes — so the first two range words
+    /// would land in its delivery-rate and bandwidth estimators.
+    #[test]
+    fn a_light_ack_never_carries_sack_ranges() {
+        let mut buf = BytesMut::new();
+        let sack = [(SeqNo::new(105), SeqNo::new(140))];
+        encode_ack(AckSeqNo::new(0), SeqNo::new(99), None, &sack, 0, 0, &mut buf);
+        assert_eq!(buf.len(), 16 + 4, "light ACK body grew: {buf:?}");
+
+        let rt = decode(buf.freeze()).expect("decode");
+        if let Packet::Control { body: ControlBody::Ack(_, payload), .. } = rt {
+            assert!(payload.full.is_none());
+            assert!(payload.sack.is_empty());
+        } else {
+            panic!("expected Ack");
+        }
+    }
+
+    /// A tail that is not a whole number of words must not cost us the
+    /// acknowledgement point in front of it.
+    #[test]
+    fn a_malformed_sack_tail_does_not_discard_the_ack() {
+        let mut buf = BytesMut::new();
+        let full = AckFull {
+            rtt_us: 1000,
+            rtt_var_us: 200,
+            avail_buf_pkts: 8192,
+            rcv_rate_pps: 1234,
+            bandwidth_pps: 5000,
+        };
+        encode_ack(AckSeqNo::new(10), SeqNo::new(99), Some(&full), &[], 0, 0, &mut buf);
+        buf.put_slice(&[0xAB, 0xCD, 0xEF]); // three bytes: not a word
+
+        let rt = decode(buf.freeze()).expect("an odd tail must not fail the ACK");
+        if let Packet::Control { body: ControlBody::Ack(_, payload), .. } = rt {
+            assert_eq!(payload.data_ack_seq, SeqNo::new(99));
+            assert_eq!(payload.full.unwrap().rcv_rate_pps, 1234);
+            assert!(payload.sack.is_empty());
         } else {
             panic!("expected Ack");
         }

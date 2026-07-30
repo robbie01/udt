@@ -50,6 +50,14 @@ const MIN_MSS: u32 = IP_AND_UDP_OVERHEAD + UDT_HEADER_SIZE as u32 + 64;
 /// it is a starting size, not a limit.
 const LOSS_LIST_RESERVE: usize = 128;
 
+/// Received ranges reported in one ACK, at most.
+///
+/// The MTU bounds this too, but a cap keeps the cost of building and parsing an
+/// ACK flat when the path is badly fragmented. Truncation is safe: the ranges
+/// are advisory, the ones nearest the acknowledgement point are kept, and
+/// whatever is dropped is reported by a later ACK.
+const MAX_SACK_RANGES: usize = 32;
+
 const DEFAULT_SND_BUF: usize = 8192;
 const DEFAULT_RCV_BUF: usize = 8192;
 const SYN_US: u32 = 10_000;
@@ -257,6 +265,14 @@ pub struct Connection {
 
     snd_buf: Option<SendBuffer>,
     snd_loss: SndLossList,
+    /// Sequences above `snd_last_ack` the peer has reported receiving.
+    ///
+    /// Held so they can be discounted from the in-flight count: they are not on
+    /// the path any more, so letting them occupy the congestion window stalls
+    /// the sender behind a hole it has already worked around. Entries are
+    /// dropped as `snd_last_ack` advances past them. Empty against any peer that
+    /// does not send selective acknowledgements.
+    snd_sacked: SndLossList,
     snd_last_ack: SeqNo,
     snd_curr_seq: SeqNo,
     /// When true, the application has finished sending (send channel closed). We
@@ -431,6 +447,7 @@ impl Connection {
             state: ConnState::Closed,
             snd_buf: None,
             snd_loss: SndLossList::new(DEFAULT_FLIGHT_FLAG_SIZE as usize * 2),
+            snd_sacked: SndLossList::new(LOSS_LIST_RESERVE),
             snd_last_ack: SeqNo::new(0),
             snd_curr_seq: SeqNo::new(0),
             snd_half_closed: false,
@@ -493,6 +510,7 @@ impl Connection {
         // the flow window: these grow on demand, and reserving a window's worth
         // up front is what let a peer ask for a 64 GiB allocation.
         self.snd_loss = SndLossList::new(LOSS_LIST_RESERVE);
+        self.snd_sacked = SndLossList::new(LOSS_LIST_RESERVE);
         self.rcv_loss = RcvLossList::new(LOSS_LIST_RESERVE);
         let ctx = self.cc_ctx(now_us);
         let out = self.cc.init(ctx);
@@ -1236,9 +1254,20 @@ impl Connection {
         if adv > 0 {
             self.snd_last_ack = ack_seq;
             self.snd_loss.remove_up_to(ack_seq.prev());
+            self.snd_sacked.remove_up_to(ack_seq.prev());
             if let Some(buf) = self.snd_buf.as_mut() {
                 buf.ack(adv);
             }
+        }
+
+        // Ranges the peer reports receiving above the acknowledgement point.
+        //
+        // Applied whether or not the cumulative point moved, because a repeated
+        // ACK whose only new information is its selective ranges is exactly the
+        // case this exists to unblock.
+        let sacked = self.apply_sack(&payload.sack);
+
+        if adv > 0 || sacked {
             // Window just opened — immediately try to pack more data rather than
             // waiting for the next on_timer tick.
             self.next_snd_us = self.next_snd_us.min(now_us);
@@ -1250,6 +1279,33 @@ impl Connection {
                 }
             }
         }
+    }
+
+    /// Record the ranges a peer says arrived above the acknowledgement point,
+    /// returning whether any were new.
+    ///
+    /// Every range here is whatever the peer put on the wire, so each is bounded
+    /// to what this side actually has outstanding before it is believed. A range
+    /// above `snd_curr_seq` names data never sent; one at or below `snd_last_ack`
+    /// names data already retired, and crediting either would let a peer talk the
+    /// in-flight count down and the send rate up without bound.
+    ///
+    /// A bogus range is skipped rather than treated as an error. C++ tears the
+    /// connection down on the equivalent in a NAK, but these are advisory —
+    /// ignoring one costs a round trip of window, while disconnecting on a
+    /// malformed tail would hand a peer a way to kill the connection outright.
+    fn apply_sack(&mut self, sack: &[(SeqNo, SeqNo)]) -> bool {
+        let mut any = false;
+        for &(start, end) in sack {
+            if start > end || start <= self.snd_last_ack || end > self.snd_curr_seq {
+                continue;
+            }
+            self.snd_sacked.insert(start, end);
+            // Nothing that arrived needs retransmitting.
+            self.snd_loss.remove_range(start, end);
+            any = true;
+        }
+        any
     }
 
     fn recv_nak(&mut self, nak: crate::packet::NakList, now_us: u64) {
@@ -1299,7 +1355,7 @@ impl Connection {
         if light {
             // Light ACK: 4-byte body, no ACK sub-sequence tracking.
             let (ts, peer) = (self.ts(now_us), self.peer_id);
-            tx.push(|dst| codec::encode_ack(AckSeqNo::new(0), data_ack, None, ts, peer, dst));
+            tx.push(|dst| codec::encode_ack(AckSeqNo::new(0), data_ack, None, &[], ts, peer, dst));
             return;
         }
 
@@ -1340,12 +1396,25 @@ impl Connection {
             bandwidth_pps: self.rcv_tw.bandwidth() as i32,
         };
 
+        // Which ranges above the acknowledgement point arrived, so the sender
+        // can stop counting them against its window. Without this a single hole
+        // pins its whole window until the hole is repaired, however much data
+        // behind it got through — see docs/selective-ack.md.
+        //
+        // Bounded by what is left of the packet after the 24-byte body, and by
+        // MAX_SACK_RANGES. Empty when there are no holes, which is the common
+        // case and costs nothing: `data_ack` is then already past everything
+        // received, and `received_ranges` returns without allocating.
+        let room = (self.payload_size as usize).saturating_sub(24) / 8;
+        let sack =
+            self.rcv_loss.received_ranges(data_ack, self.rcv_curr_seq, room.min(MAX_SACK_RANGES));
+
         let asn = self.ack_seq;
         self.ack_win.store(asn, data_ack, now_us);
         self.ack_seq = self.ack_seq.next();
         self.last_ack_us = now_us;
         tx.push(|dst| {
-            codec::encode_ack(asn, data_ack, Some(&full), self.ts(now_us), self.peer_id, dst)
+            codec::encode_ack(asn, data_ack, Some(&full), &sack, self.ts(now_us), self.peer_id, dst)
         });
     }
 
@@ -1507,7 +1576,21 @@ impl Connection {
             Some(v) => v,
             None => {
                 // New data — this is what the congestion/flow window limits.
-                let in_flight = self.snd_buf.as_ref().map_or(0, |b| b.in_flight());
+                //
+                // Packets the peer has selectively acknowledged are off the path
+                // and must not hold window open against us. Without discounting
+                // them a single loss pins the in-flight count at the full window
+                // until that one packet is repaired, however much later data got
+                // through — which is most of what loss costs this protocol.
+                //
+                // Saturating because both terms trace back to numbers a peer
+                // chose: `apply_sack` bounds the ranges it accepts, and this is
+                // the second line of defence behind it.
+                let in_flight = self
+                    .snd_buf
+                    .as_ref()
+                    .map_or(0, |b| b.in_flight())
+                    .saturating_sub(self.snd_sacked.len());
                 let max_flight = (self.cwnd.min(self.flow_wnd as f64)) as usize;
                 if in_flight >= max_flight {
                     return false;
@@ -1714,6 +1797,61 @@ mod tests {
         );
     }
 
+    /// A peer's selective ranges are bounded to what this side actually has
+    /// outstanding. Crediting a range never sent, or one already retired, would
+    /// let a peer talk the in-flight count down and the send rate up at will.
+    #[test]
+    fn a_sack_range_outside_the_send_window_is_ignored() {
+        let mut c = connected(1_000_000);
+        c.snd_last_ack = SeqNo::new(100);
+        c.snd_curr_seq = SeqNo::new(200);
+
+        // Above anything sent, at or below the acknowledgement point, and
+        // running backwards.
+        assert!(!c.apply_sack(&[(SeqNo::new(201), SeqNo::new(300))]));
+        assert!(!c.apply_sack(&[(SeqNo::new(150), SeqNo::new(201))]));
+        assert!(!c.apply_sack(&[(SeqNo::new(50), SeqNo::new(99))]));
+        assert!(!c.apply_sack(&[(SeqNo::new(100), SeqNo::new(150))]));
+        assert!(!c.apply_sack(&[(SeqNo::new(150), SeqNo::new(120))]));
+        assert_eq!(c.snd_sacked.len(), 0, "a bogus range was credited");
+
+        // Wholly inside the window, so believed.
+        assert!(c.apply_sack(&[(SeqNo::new(120), SeqNo::new(150))]));
+        assert_eq!(c.snd_sacked.len(), 31);
+    }
+
+    /// The whole point: sequences known to have arrived stop occupying the
+    /// congestion window, and stop being retransmitted.
+    #[test]
+    fn a_sacked_range_leaves_the_window_and_the_loss_list() {
+        let mut c = connected(1_000_000);
+        c.snd_last_ack = SeqNo::new(100);
+        c.snd_curr_seq = SeqNo::new(200);
+        c.snd_loss.insert(SeqNo::new(110), SeqNo::new(160));
+        let before = c.snd_loss.len();
+
+        assert!(c.apply_sack(&[(SeqNo::new(120), SeqNo::new(150))]));
+        assert_eq!(c.snd_sacked.len(), 31, "arrived packets must be discounted");
+        assert_eq!(
+            c.snd_loss.len(),
+            before - 31,
+            "packets that arrived must not stay queued for retransmission"
+        );
+    }
+
+    /// The acknowledgement point moving past a range retires it, so the
+    /// discount is never counted twice.
+    #[test]
+    fn sacked_ranges_are_dropped_once_the_ack_point_passes_them() {
+        let mut c = connected(1_000_000);
+        c.snd_last_ack = SeqNo::new(100);
+        c.snd_curr_seq = SeqNo::new(200);
+        assert!(c.apply_sack(&[(SeqNo::new(120), SeqNo::new(150))]));
+
+        c.snd_sacked.remove_up_to(SeqNo::new(160));
+        assert_eq!(c.snd_sacked.len(), 0);
+    }
+
     #[test]
     fn a_full_ack_reports_the_receive_state() {
         let mut c = connected(1_000_000);
@@ -1767,7 +1905,11 @@ mod tests {
         c.recv_ctrl(
             ControlBody::Ack(
                 AckSeqNo::new(1),
-                crate::packet::AckPayload { data_ack_seq: SeqNo::new(9999), full: None },
+                crate::packet::AckPayload {
+                    data_ack_seq: SeqNo::new(9999),
+                    full: None,
+                    sack: Vec::new(),
+                },
             ),
             1_000_000,
             &mut tx,

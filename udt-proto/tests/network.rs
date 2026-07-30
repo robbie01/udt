@@ -590,6 +590,11 @@ fn loss_recovery_is_not_catastrophic() {
     }
 
     let mean = total / SEEDS.len() as f64;
+    // Printed because the bound is loose on purpose -- a single seed ranges from
+    // 7x to 35x on drop pattern alone, so the assert can only catch a collapse.
+    // The number itself is what tells you whether a change to loss recovery did
+    // anything, and `--nocapture` is how you see it.
+    println!("[loss 5%] {mean:.1}x the clean transfer time, mean of {} seeds", SEEDS.len());
     assert!(mean < 50.0, "5% loss cost {mean:.1}x on average -- recovery is not proportional");
 }
 

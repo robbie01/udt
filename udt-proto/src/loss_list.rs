@@ -190,6 +190,52 @@ impl RcvLossList {
         self.ranges.is_empty()
     }
 
+    /// Ranges in `[from, upto]` that *have* arrived — the complement of the gaps
+    /// held here, for reporting as a selective acknowledgement.
+    ///
+    /// `from` is the acknowledgement point, which is the first sequence the
+    /// cumulative ACK does not cover, and `upto` is the highest sequence
+    /// received. `limit` caps how many ranges come back.
+    ///
+    /// Ranges nearest `from` come first. They are the ones that let the sender's
+    /// window advance soonest, so a caller truncating to fit the MTU gives up
+    /// the least useful information.
+    ///
+    /// Like the rest of this type, ordering is `SeqNo`'s, so a window straddling
+    /// the sequence-space wrap is not handled here any more than it is in
+    /// `insert` or `remove_up_to`.
+    pub fn received_ranges(&self, from: SeqNo, upto: SeqNo, limit: usize) -> Vec<(SeqNo, SeqNo)> {
+        let mut out = Vec::new();
+        if limit == 0 || upto < from {
+            return out;
+        }
+        // Walk the gaps in order, emitting the spaces between them.
+        let mut cursor = from;
+        for &(gap_start, gap_end) in &self.ranges {
+            if out.len() >= limit {
+                return out;
+            }
+            if gap_end < cursor {
+                continue; // wholly behind the cursor
+            }
+            if gap_start > upto {
+                break; // beyond anything we hold
+            }
+            if gap_start > cursor {
+                out.push((cursor, gap_start.prev()));
+            }
+            cursor = gap_end.next();
+            if cursor > upto {
+                return out;
+            }
+        }
+        // Everything above the last gap arrived.
+        if out.len() < limit && cursor <= upto {
+            out.push((cursor, upto));
+        }
+        out
+    }
+
     /// Encode as NAK loss list payload (LE u32 words).
     /// `limit` is the max number of u32 words to emit.
     pub fn to_nak_payload(&self, limit: usize) -> Vec<u32> {
@@ -271,6 +317,60 @@ mod tests {
         assert_eq!(nak[0], 10 | 0x8000_0000);
         assert_eq!(nak[1], 20);
         assert_eq!(nak[2], 30);
+    }
+
+    #[test]
+    fn received_ranges_is_the_complement_of_the_gaps() {
+        let mut list = RcvLossList::new(16);
+        // Received 10..=100 except for the holes 10..=12 and 40..=41.
+        list.insert(s(10), s(12));
+        list.insert(s(40), s(41));
+        // The acknowledgement point is the first hole.
+        let got = list.received_ranges(s(10), s(100), 8);
+        assert_eq!(got, vec![(s(13), s(39)), (s(42), s(100))]);
+    }
+
+    #[test]
+    fn received_ranges_reports_nothing_when_there_are_no_holes() {
+        let list = RcvLossList::new(16);
+        // With no gaps the ACK point is already past everything received, so
+        // there is nothing above it to selectively acknowledge.
+        assert!(list.received_ranges(s(51), s(50), 8).is_empty());
+        // A range does exist if the caller asks about sequences below the point.
+        assert_eq!(list.received_ranges(s(10), s(50), 8), vec![(s(10), s(50))]);
+    }
+
+    #[test]
+    fn received_ranges_stops_at_upto() {
+        let mut list = RcvLossList::new(16);
+        list.insert(s(10), s(10));
+        list.insert(s(60), s(60));
+        // rcv_curr_seq is 50, so the gap at 60 is not yet in view and the run
+        // above 10 must be truncated at 50 rather than running to the next gap.
+        assert_eq!(list.received_ranges(s(10), s(50), 8), vec![(s(11), s(50))]);
+    }
+
+    #[test]
+    fn received_ranges_honours_the_limit() {
+        let mut list = RcvLossList::new(16);
+        for k in 0..10 {
+            list.insert(s(10 + k * 10), s(10 + k * 10));
+        }
+        let got = list.received_ranges(s(10), s(200), 3);
+        assert_eq!(got.len(), 3, "limit not honoured: {got:?}");
+        // Truncation keeps the ranges nearest the acknowledgement point.
+        assert_eq!(got[0], (s(11), s(19)));
+    }
+
+    #[test]
+    fn received_ranges_skips_gaps_below_the_ack_point() {
+        let mut list = RcvLossList::new(16);
+        // A stale gap the ACK point has already moved past must not produce a
+        // range starting below `from`.
+        list.insert(s(5), s(6));
+        list.insert(s(30), s(30));
+        let got = list.received_ranges(s(10), s(50), 8);
+        assert_eq!(got, vec![(s(10), s(29)), (s(31), s(50))]);
     }
 
     #[test]
