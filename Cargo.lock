@@ -1937,8 +1937,6 @@ name = "udt-proto"
 version = "0.0.0"
 dependencies = [
  "bytes",
- "md-5",
- "rand 0.9.5",
 ]
 
 [[package]]

@@ -11,8 +11,11 @@
 //! document where the C++ diverges, so a failure here is a finding, not a
 //! regression.
 //!
-//! All of them are `#[ignore]`d. They are diagnostics, they take seconds, and
-//! the C++ ones are expected to behave badly.
+//! The diagnostics here are `#[ignore]`d: they take seconds, and the C++ ones
+//! are expected to behave badly. The one exception is
+//! `cpp_tolerates_our_extended_acks`, which asserts a compatibility property
+//! and so has to run in CI — it is deliberately kept small enough not to load
+//! the machine the rest of the suite is sharing.
 
 #[cfg(test)]
 mod tests {
@@ -403,7 +406,13 @@ mod tests {
     /// selective-acknowledgement ranges it does not understand.
     #[tokio::test(flavor = "multi_thread")]
     async fn cpp_tolerates_our_extended_acks() {
-        const MSGS: usize = 120;
+        // Small on purpose. This is the only asserting test in a module of
+        // second-long diagnostics, so it runs alongside the whole interop suite,
+        // and a loss relay pushing a hundred messages is load every other test
+        // pays for. Forty messages is ~240 packets, which at 5% loss leaves a
+        // dozen gaps -- ample to produce the extended ACKs this is about, as the
+        // assertion below insists.
+        const MSGS: usize = 40;
         let outcome = cpp_to_rust_through_loss(5, MSGS).await;
         outcome.report("cpp→rust 5% loss");
         assert!(

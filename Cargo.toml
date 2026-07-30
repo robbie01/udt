@@ -26,4 +26,4 @@ edition = "2024"
 # The path dependencies below resolve to that sibling checkout.
 [workspace.dependencies]
 udt-proto = { path = "../udt/udt-proto" }
-udt-async = { path = "../udt/udt-async", features = ["tokio"] }
+udt-async = { path = "../udt/udt-async" }
