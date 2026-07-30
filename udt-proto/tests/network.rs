@@ -639,12 +639,13 @@ fn loss_cost_table() {
     // it is busy sending data that was not needed. Guessing which without
     // measuring it has been wrong twice.
     println!(
-        "\n  loss     mean     min     max     amp    cwnd   pace_us   (x clean, {} seeds)",
+        "\n  loss   ratio   clean_ms  lossy_ms     amp    cwnd   pace_us  ({} seeds)",
         SEEDS.len()
     );
     for loss_pct in [0.0f64, 1.0, 2.0, 5.0, 10.0] {
         let (mut ratios, mut amps, mut cwnds) = (Vec::new(), Vec::new(), Vec::new());
         let mut paces = Vec::new();
+        let (mut cleans, mut lossies) = (Vec::new(), Vec::new());
         for seed in SEEDS {
             let mut clean = Sim::new(LinkConfig::perfect(), seed);
             clean.connect();
@@ -656,6 +657,8 @@ fn loss_cost_table() {
             let lossy_us = lossy.transfer(MSGS, SIZE, SendOpts::ordered());
 
             ratios.push(lossy_us as f64 / clean_us as f64);
+            cleans.push(clean_us as f64 / 1000.0);
+            lossies.push(lossy_us as f64 / 1000.0);
             amps.push(lossy.a_to_b.sent as f64 / clean_sent.max(1) as f64);
             cwnds.push(lossy.a.stats().cwnd);
             paces.push(lossy.a.stats().snd_period_us);
@@ -663,16 +666,141 @@ fn loss_cost_table() {
         ratios.sort_by(f64::total_cmp);
         let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
         println!(
-            "  {loss_pct:>4.1}%  {:>7.2}  {:>6.2}  {:>6.2}  {:>6.2}  {:>6.0}  {:>8.1}",
+            "  {loss_pct:>4.1}%  {:>6.2}  {:>9.3}  {:>9.3}  {:>6.2}  {:>6.0}  {:>8.1}",
             mean(&ratios),
-            ratios[0],
-            ratios[ratios.len() - 1],
+            mean(&cleans),
+            mean(&lossies),
             mean(&amps),
             mean(&cwnds),
             mean(&paces),
         );
     }
     println!();
+}
+
+/// The round-trip estimate has to reflect the path, not the opening guess.
+///
+/// Every recovery timer is derived from it — the repeat-NAK interval is four
+/// times it, the retransmission timeout is built on it, the receiver's
+/// re-acknowledge hold-off is `RTT + 4·RTTVar`. The guess is 10 ms, the
+/// reference's `10 × SYN_INTERVAL`, and smoothing it away at an eighth per
+/// sample takes longer than a short transfer lasts. Left unfixed it read 3.5 ms
+/// and 7.4 ms mid-transfer on this link, whose actual round trip is 200 µs.
+#[test]
+fn the_round_trip_estimate_reflects_the_path() {
+    let mut sim = Sim::new(LinkConfig::perfect(), 3);
+    sim.connect();
+
+    // Completing the handshake is itself a round trip, so it is known by now.
+    for (who, rtt) in [("a", sim.a.stats().rtt_us), ("b", sim.b.stats().rtt_us)] {
+        assert!(rtt > 0 && rtt < 2_000, "{who} opened with an estimate of {rtt}us on a 200us path");
+    }
+
+    // And a transfer must not push it back up.
+    sim.transfer(40, 8192, SendOpts::ordered());
+    for (who, rtt) in [("a", sim.a.stats().rtt_us), ("b", sim.b.stats().rtt_us)] {
+        assert!(rtt < 2_000, "{who} drifted to {rtt}us over a clean transfer");
+    }
+}
+
+/// Where the time actually goes during a lossy transfer.
+///
+/// Records when each message is delivered and prints the largest gaps between
+/// deliveries, so a stall shows up as a gap rather than being averaged into a
+/// ratio. Written after four plausible explanations for the cost of loss --
+/// pacing, the congestion window, retransmission waste and detection latency --
+/// each turned out to move the total by under 4%.
+#[test]
+#[ignore = "measurement: prints a timeline, asserts nothing"]
+fn loss_timeline() {
+    const SEED: u64 = 42;
+    const MSGS: usize = 150;
+    const SIZE: usize = 8192;
+
+    for loss_pct in [0.0f64, 5.0] {
+        let mut sim = Sim::new(LinkConfig::lossy(loss_pct / 100.0), SEED);
+        sim.connect();
+        let start = sim.now;
+
+        let mut arrivals: Vec<u64> = Vec::new();
+        let mut queued = 0usize;
+        let mut pending: Option<bytes::Bytes> = None;
+        let mut last_progress = sim.now;
+        let mut dumped = false;
+        for _ in 0..MAX_STEPS {
+            while queued < MSGS {
+                let payload =
+                    pending.take().unwrap_or_else(|| bytes::Bytes::from(message(queued, SIZE)));
+                match sim.a.send_msg(payload.clone(), None, true, sim.now, &mut sim.a_tx) {
+                    SendOutcome::Queued => queued += 1,
+                    SendOutcome::WouldBlock => {
+                        pending = Some(payload);
+                        break;
+                    }
+                    SendOutcome::Rejected => panic!("rejected"),
+                }
+            }
+            sim.drain(Side::A);
+            while arrivals.len() < sim.b_got.len() {
+                arrivals.push(sim.now - start);
+                last_progress = sim.now;
+                dumped = false;
+            }
+            // During a long stall, print what both ends believe. Once per
+            // stall, so the output stays readable.
+            if !dumped && sim.now.saturating_sub(last_progress) > 4_000 {
+                dumped = true;
+                let (sa, sb) = (sim.a.stats(), sim.b.stats());
+                println!(
+                    "    STALL at {:.2}ms after msg {}:\n                           sender: last_ack={} curr={} inflight={} pending={} loss={} sacked={} \
+                     cwnd={:.0} pace={:.0} exp={}\n                           recvr: last_ack={} ackack={} curr={} loss={} ready={}",
+                    (sim.now - start) as f64 / 1000.0,
+                    arrivals.len(),
+                    sa.snd_last_ack,
+                    sa.snd_curr_seq,
+                    sa.snd_in_flight,
+                    sa.snd_pending,
+                    sa.snd_loss_len,
+                    sa.snd_sacked_len,
+                    sa.cwnd,
+                    sa.snd_period_us,
+                    sa.exp_count,
+                    sb.rcv_last_ack,
+                    sb.rcv_last_ack_ack,
+                    sb.rcv_curr_seq,
+                    sb.rcv_loss_len,
+                    sb.ready_msgs,
+                );
+            }
+            if arrivals.len() >= MSGS || !sim.step() {
+                break;
+            }
+        }
+
+        let total = arrivals.last().copied().unwrap_or(0);
+        let mut gaps: Vec<(u64, usize)> = Vec::new();
+        let mut prev = 0u64;
+        for (i, &at) in arrivals.iter().enumerate() {
+            gaps.push((at - prev, i));
+            prev = at;
+        }
+        gaps.sort_unstable_by_key(|(gap, _)| std::cmp::Reverse(*gap));
+        let stalled: u64 = gaps.iter().take(10).map(|(g, _)| g).sum();
+
+        println!(
+            "\n[loss {loss_pct:.0}%] {} of {MSGS} delivered in {:.3} ms",
+            arrivals.len(),
+            total as f64 / 1000.0
+        );
+        println!(
+            "  ten longest gaps total {:.3} ms, {:.0}% of the transfer:",
+            stalled as f64 / 1000.0,
+            100.0 * stalled as f64 / total.max(1) as f64
+        );
+        for (g, i) in gaps.iter().take(10) {
+            println!("    msg {i:>4} waited {:>8.3} ms", *g as f64 / 1000.0);
+        }
+    }
 }
 
 /// A path that carries small packets and silently discards large ones used to
