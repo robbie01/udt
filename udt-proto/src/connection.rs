@@ -1118,7 +1118,20 @@ impl Connection {
             self.rcv_loss.insert(expected_next, seq.prev());
             self.emit_nak_range(expected_next, seq.prev(), now_us, tx);
         }
-        self.rcv_loss.remove(seq);
+        // Filling a hole is the one arrival that can move the acknowledgement
+        // point a long way, so it is worth saying so at once.
+        //
+        // A full ACK blocked by that hole still resets the ACK timer and clears
+        // the packet counter, as though it had reported something. So when the
+        // hole is filled moments later there is no light ACK due and no full ACK
+        // for another control interval, while the point could have jumped past
+        // everything queued behind it. Both ends wait on that: the sender's
+        // window cannot open, and ordered delivery holds every completed message
+        // above the point. Measured as a 9.4 ms stall in a 16 ms transfer, with
+        // 63 packets acknowledgeable and a packet count of 1.
+        if self.rcv_loss.remove(seq) {
+            self.next_ack_us = self.next_ack_us.min(now_us);
+        }
 
         // Forwards only. This used to also take `seq` whenever the cursor read
         // zero, from when zero meant "nothing received yet" — but `post_connect`
