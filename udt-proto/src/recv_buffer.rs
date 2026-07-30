@@ -379,6 +379,12 @@ impl RecvBuffer {
         self.capacity.saturating_sub(pinned)
     }
 
+    /// How many packets the ring holds. Nothing further than this above the
+    /// base can be stored, whoever asks.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     #[cfg(test)]
     pub fn base_seq(&self) -> SeqNo {
         self.base_seq
