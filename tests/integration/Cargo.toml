@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dev-dependencies]
-udt-async = { path = "../../udt-async", features = ["tokio"] }
+udt-async = { path = "../../udt-async" }
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
 futures = { version = "0.3", default-features = false, features = ["executor"] }

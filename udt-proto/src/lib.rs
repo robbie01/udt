@@ -77,7 +77,6 @@
 #![warn(missing_docs)]
 
 pub mod congestion;
-pub mod prelude;
 
 /// Internals reachable by the fuzz targets.
 ///

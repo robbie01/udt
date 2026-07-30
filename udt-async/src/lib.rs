@@ -65,23 +65,15 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-#[cfg(feature = "tokio")]
 mod batch;
-#[cfg(feature = "tokio")]
 mod conn;
-#[cfg(feature = "tokio")]
 mod driver;
-#[cfg(feature = "tokio")]
 mod endpoint;
-#[cfg(feature = "tokio")]
 mod util;
 
-#[cfg(feature = "tokio")]
 pub use conn::{SendOptions, Socket};
-#[cfg(feature = "tokio")]
 pub use endpoint::{
     DEFAULT_MTU, Endpoint, EndpointConfig, Listener, MAX_PAYLOAD_SIZE, max_payload_for_mtu,
 };
 
-#[cfg(feature = "tokio")]
 pub use udt_proto::CcKind;

@@ -22,6 +22,4 @@ fuzzing = []
 
 [dependencies]
 bytes = "1"
-rand = "0.9"
-md-5 = "0.11"
 

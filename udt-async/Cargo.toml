@@ -15,11 +15,6 @@ readme = "../README.md"
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
-[features]
-default = ["tokio"]
-tokio = ["dep:tokio", "dep:quinn-udp", "dep:flume"]
-async-io = ["dep:async-io", "dep:futures-lite", "dep:async-channel"]
-
 [dependencies]
 # The version is required to publish: crates.io drops the path and resolves
 # the dependency from the registry, so it has to know which release to want.
@@ -27,13 +22,12 @@ udt-proto = { path = "../udt-proto", version = "0.0.0" }
 bytes = "1"
 rand = "0.9"
 
-tokio = { version = "1", features = ["net", "time", "sync", "rt", "rt-multi-thread", "macros"], optional = true }
+# Not optional. This crate *is* the Tokio driver: with it excluded there was no
+# `Endpoint` and no `Socket`, so the library exported nothing at all while still
+# pulling dependencies.
+tokio = { version = "1", features = ["net", "time", "sync", "rt", "rt-multi-thread", "macros"] }
 socket2 = "0.6"
-flume = { version = "0.11", default-features = false, features = ["async"], optional = true }
+flume = { version = "0.11", default-features = false, features = ["async"] }
 # Batched UDP IO (GSO / recvmmsg) behind a safe API, so this crate keeps
 # forbid(unsafe_code) while still using platform offloads.
-quinn-udp = { version = "0.5", optional = true }
-
-async-io = { version = "2", optional = true }
-futures-lite = { version = "2", optional = true }
-async-channel = { version = "2", optional = true }
+quinn-udp = "0.5"
