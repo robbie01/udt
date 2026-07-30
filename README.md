@@ -171,12 +171,13 @@ Windows. ECN, which the UDP layer already plumbs and this discards. Connection
 IDs, so a NAT rebind does not kill the connection. Path-MTU probing — black
 holes are detected and reported, never probed around.
 
-Selective acknowledgement is half-built on purpose. The wire half works: the
-receiver reports which ranges above the acknowledgement point arrived, the
-sender tracks them, and a peer that does not understand the extension reads the
-ACK exactly as before. The half that would use it — discounting those packets
-from the congestion window — is written, measured, and deliberately switched
-off, because it is a bad trade:
+Selective acknowledgement is half-built on purpose. The wire half works and is
+backward compatible: the receiver reports which ranges above the acknowledgement
+point arrived, the sender tracks them, and both the C++ fork and pristine
+upstream keep working against it — tested with a lossy relay and a count of
+extended ACKs on the wire, on the harness branch. The half that would use it —
+discounting those packets from the congestion window — is written, measured, and
+deliberately switched off, because it is a bad trade:
 
 | | before | after | |
 |---|---|---|---|

@@ -18,9 +18,11 @@ that would actually speed anything up is written, measured, and switched off.
   of the deterministic simulator. So `pack_data` keeps counting them, with a
   comment saying why, and everything behind it stays wired up ready.
 
-- **The interop test has not been run.** Everything below about C++ tolerating
-  a longer ACK comes from reading its source, which is a prior and not a
-  result. See "Wire format".
+- **Compatibility is settled.** Both the fork and pristine upstream keep
+  working against a Rust receiver whose ACKs carry ranges they know nothing
+  about — `cpp_tolerates_our_extended_acks` and
+  `upstream_tolerates_our_extended_acks` on the harness branch, each counting
+  extended ACKs on the wire so a clean link cannot pass for proof.
 
 ## The problem
 
@@ -176,25 +178,23 @@ own rate estimate. The extension may only ever be appended to a full 24-byte
 ACK — never a short one, and the encoder needs to enforce that rather than
 leave it to the caller.
 
-Reading the source is a prior, not an answer; what matters is the shipped binary,
-and this was read from the *fork*, not pristine upstream. Confirm it empirically
-before building on it:
+Reading the source is a prior, not an answer, and it was read from the *fork*
+rather than pristine upstream. Both were then run, on the harness branch:
 
-> Make the Rust side append a few dummy range words to every full ACK, then run
-> the `cpp-interop` suite, and the `upstream-compat` suite against `udt-orig`
-> as well — the fork is only near-stock in the packet layer, not identical.
-> Passing unchanged means tolerated.
+- `cpp_tolerates_our_extended_acks` (cpp-interop, the fork)
+- `upstream_tolerates_our_extended_acks` (upstream-compat, pristine `8272c25`)
 
-### If it turns out to need negotiating
+Each puts a lossy relay between a C++ sender and a Rust receiver and transfers
+with byte verification. Loss is what makes the receiver emit ranges at all, so
+each test also has the relay count ACKs on the wire whose body runs past 24
+bytes, and asserts the count is non-zero — otherwise a clean link would pass
+while proving nothing. The fork run sees ten across 120 messages at 5% loss.
 
-The handshake has no field free for a capability bit, and `version` is checked
-for equality against 4 by the C++ peer, so it cannot carry one. The workable
-route is to opt in by demonstration: send extended ACKs speculatively and only
-trust a peer's extended ACKs once it has sent one. That is only safe if
-over-long ACKs are ignored rather than rejected — the same question again.
+Both pass. The extension is backward compatible in practice, not just on paper.
 
-Failing that, it becomes a genuine wire break and should wait for whatever else
-wants one (connection IDs, ECN, a defined timestamp epoch).
+No negotiation is needed, which is fortunate: the handshake has no field free
+for a capability bit, and `version` is checked for equality against 4, so it
+could not have carried one.
 
 ## What it was worth
 
