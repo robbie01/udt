@@ -169,6 +169,7 @@ saturated connection does not allocate per packet.
 
 Windows. Selective acknowledgement, which is the largest structural gap — a
 single loss stalls the window, and it is why 5% loss costs so much more than 2%.
-ECN, which the UDP layer already plumbs and this discards. Connection IDs, so a
-NAT rebind does not kill the connection. Path-MTU probing — black holes are
-detected and reported, never probed around.
+[`docs/selective-ack.md`](docs/selective-ack.md) works out why and what the fix
+looks like. ECN, which the UDP layer already plumbs and this discards.
+Connection IDs, so a NAT rebind does not kill the connection. Path-MTU probing —
+black holes are detected and reported, never probed around.
