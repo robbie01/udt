@@ -900,10 +900,22 @@ fn an_idle_connection_is_nearly_silent() {
     let rate = (a.max(b)) as f64 / secs;
     println!("[idle] {a} and {b} packets over {secs:.0}s — {rate:.2}/s");
 
-    // A keep-alive every 15s is one packet per direction per 15s, so a shade
-    // under 0.07/s. One in three is generous room for the acknowledgement
-    // machinery without being anywhere near the old behaviour.
-    assert!(rate < 0.34, "an idle connection sent {rate:.2} packets a second");
+    // A keep-alive a second is one packet per direction per second. Three is
+    // generous room for the acknowledgement machinery without being anywhere
+    // near the 96/s this used to send.
+    assert!(rate < 3.0, "an idle connection sent {rate:.2} packets a second");
+
+    // And it must be frequent enough for the reference peer, which hangs up
+    // after five seconds of silence — so a lost keep-alive must not be enough
+    // to reach that.
+    let gap_us = 60_000_000.0 / a.max(b).max(1) as f64;
+    assert!(
+        gap_us * 2.0 < 5_000_000.0,
+        "keep-alives are {:.1}s apart, so losing one gives {:.1}s of silence and \
+         upstream UDT declares the connection broken at 5s",
+        gap_us / 1e6,
+        gap_us * 2.0 / 1e6,
+    );
     assert!(a > 0 && b > 0, "an idle connection went completely silent, so NAT will forget it");
     assert!(sim.a.stats().connected && sim.b.stats().connected, "an idle connection timed out");
 }

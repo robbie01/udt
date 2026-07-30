@@ -62,8 +62,18 @@ const MAX_SACK_RANGES: usize = 32;
 ///
 /// Its job is to stop a NAT or stateful firewall forgetting the mapping, and
 /// those hold UDP for tens of seconds — 30 s is the usual conservative figure.
-/// Five seconds sits well inside that, and four missed in a row is what
-/// [`EXP_HARD_TIMEOUT_US`] then treats as a dead peer.
+/// **The binding constraint is not the NAT, it is the reference peer.** Upstream
+/// UDT declares a connection broken after five seconds without hearing
+/// anything (`core.cpp`: `m_iEXPCount > 16 && currtime - m_ullLastRspTime >
+/// 5000000`). A keep-alive interval of five seconds therefore has no margin at
+/// all — one lost keep-alive means ten seconds of silence and the peer hangs
+/// up. It was set to exactly that, and `rust_connector_upstream_listener_echo`
+/// duly failed against pristine upstream on a slower CI machine while passing
+/// fifteen runs locally.
+///
+/// One second leaves room for four consecutive losses before the reference
+/// gives up, and is still fifty times quieter than riding the retransmission
+/// timer was.
 ///
 /// It used to ride the retransmission timer, which meant an idle connection
 /// exchanged **96 packets a second in each direction**: EXP fired at its floor,
@@ -71,7 +81,7 @@ const MAX_SACK_RANGES: usize = 32;
 /// both ends at the floor forever. That is about a thousand times more than the
 /// job needs, and a peer-to-peer process holding many idle connections pays it
 /// per connection.
-const KEEPALIVE_US: u64 = 5_000_000;
+const KEEPALIVE_US: u64 = 1_000_000;
 
 const DEFAULT_SND_BUF: usize = 8192;
 const DEFAULT_RCV_BUF: usize = 8192;
@@ -126,12 +136,13 @@ const BLACK_HOLE_MIN_US: u64 = 500_000;
 /// After EXP_MAX expirations the connection is only torn down once it has been
 /// silent for this long in total.
 ///
-/// Four [`KEEPALIVE_US`] intervals. The two have to be chosen together: an idle
-/// peer is only heard from once per keep-alive, so a timeout shorter than that
-/// tears down connections that are working perfectly well. The reference uses
-/// 5 s here and keeps alive far more often, which is the same relationship at a
-/// much higher cost.
-const EXP_HARD_TIMEOUT_US: u64 = 4 * KEEPALIVE_US;
+/// Ten [`KEEPALIVE_US`] intervals. The two have to be chosen together: an idle
+/// peer is only heard from once per keep-alive, so a timeout anywhere near that
+/// tears down connections that are working perfectly well.
+///
+/// Ten rather than a tighter multiple because the cost of waiting is only that
+/// a dead peer lingers, while the cost of being too eager is killing a live one.
+const EXP_HARD_TIMEOUT_US: u64 = 10 * KEEPALIVE_US;
 /// Handshake retransmit backoff, in µs, then `HS_RESEND_US` thereafter.
 ///
 /// A flat 250 ms — which is what the C++ reference uses — costs a full quarter
