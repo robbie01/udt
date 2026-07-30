@@ -231,23 +231,26 @@ over sixteen simulator seeds **on a 200 µs path**:
 | 5% loss | 28.03x | 1.88x |
 | 10% loss | 49.98x | 5.26x |
 
-**Those are local-network numbers and do not carry.** On a path with a
-round trip worth having this protocol for, the same sweep
-(`loss_cost_by_round_trip`) reads:
+**Those are local-network numbers.** Lengthening the round trip alone
+(`loss_cost_by_round_trip`) puts 2% loss at 7.2x and 5% at 8.3x, flat from 10 ms
+out to 200 ms — which at least says the recovery timers scale with the path
+rather than falling apart on a long one.
 
-| round trip | 2% loss | 5% loss |
-|---|---|---|
-| 0.2 ms | 1.14x | 2.18x |
-| 10 ms | 7.16x | 8.32x |
-| 50 ms | 7.52x | 8.58x |
-| 200 ms | 7.25x | 8.39x |
+But a long link with no bottleneck is not a real path either. With a rate, a
+serialisation delay and a buffer that drops (`cost_on_a_bottleneck`, 5 MB
+transfers):
 
-So loss on a real path costs seven to eight times the clean transfer, and that
-is the figure to plan around. Two things are reassuring in it: the ratio is flat
-from 10 ms to 200 ms, so the recovery timers scale with the path rather than
-falling apart on a long one, and reverse traffic stays at a tenth of forward
-throughout, so there is no acknowledgement or loss-report storm at distance.
-Closing the remaining gap is unfinished work.
+| link | 2% loss costs | goodput | standing queue | self-inflicted drops |
+|---|---|---|---|---|
+| 100 Mbit, 10 ms, 50 ms buffer | 1.28x | 59 Mbit/s | 14 ms | 77 |
+| 100 Mbit, 50 ms, 50 ms buffer | 2.88x | 20 Mbit/s | 26 ms | 76 |
+| 10 Mbit, 50 ms, 100 ms buffer | 1.51x | 5 Mbit/s | 77 ms | 86 |
+
+Loss costs less than the no-bottleneck sweep suggests, because the link is
+already the limit. The real problems that table shows are elsewhere: **a 100
+Mbit, 50 ms path yields only about half its capacity**, and **slow start
+overshoots the buffer on every link measured**, causing 594 to 1006 drops per
+transfer on links dropping nothing of their own. Both are unfinished.
 
 None of that came from congestion control, which is where it looked like it
 would. Four explanations were measured and discarded — pacing, the congestion
