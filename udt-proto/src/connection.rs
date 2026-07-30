@@ -224,6 +224,10 @@ pub struct ConnectionStats {
     pub snd_pending: usize,
     /// Packets known lost and awaiting retransmission.
     pub snd_loss_len: usize,
+    /// Packets the peer reported receiving out of order, above the
+    /// acknowledgement point. Tracked but not yet discounted from the window —
+    /// see `pack_data`.
+    pub snd_sacked_len: usize,
     /// Highest sequence number acknowledged to the peer.
     pub rcv_last_ack: u32,
     /// Highest acknowledgement the peer has confirmed receiving.
@@ -852,6 +856,7 @@ impl Connection {
             snd_in_flight: self.snd_buf.as_ref().map_or(0, |b| b.in_flight()),
             snd_pending: self.snd_buf.as_ref().map_or(0, |b| b.pending()),
             snd_loss_len: self.snd_loss.len(),
+            snd_sacked_len: self.snd_sacked.len(),
             rcv_last_ack: self.rcv_last_ack.raw(),
             rcv_last_ack_ack: self.rcv_last_ack_ack.raw(),
             rcv_curr_seq: self.rcv_curr_seq.raw(),
@@ -1577,20 +1582,21 @@ impl Connection {
             None => {
                 // New data — this is what the congestion/flow window limits.
                 //
-                // Packets the peer has selectively acknowledged are off the path
-                // and must not hold window open against us. Without discounting
-                // them a single loss pins the in-flight count at the full window
-                // until that one packet is repaired, however much later data got
-                // through — which is most of what loss costs this protocol.
+                // Selectively acknowledged packets are deliberately *not*
+                // discounted here, though they are off the path and the whole
+                // point of tracking them was to discount them. Doing so was
+                // measured on the simulator and is a bad trade: it improves 5%
+                // loss from 30.6x to 24.2x the clean transfer time and 10% from
+                // 49.9x to 37.9x, but regresses 1% from 2.4x to 3.6x and 2% from
+                // 11.9x to 19.2x. Real paths live at the low end.
                 //
-                // Saturating because both terms trace back to numbers a peer
-                // chose: `apply_sack` bounds the ranges it accepts, and this is
-                // the second line of defence behind it.
-                let in_flight = self
-                    .snd_buf
-                    .as_ref()
-                    .map_or(0, |b| b.in_flight())
-                    .saturating_sub(self.snd_sacked.len());
+                // The cause is not understood and is worth finding — it is not
+                // receiver overrun (an 8x receive ring changes nothing) and not
+                // the flow window (separating the two limits changes nothing);
+                // the extra data the discount puts on the path just costs more
+                // than the stall it avoids, in fixed-looking quanta that smell
+                // like the expiry timer. `loss_cost_table` is the measurement.
+                let in_flight = self.snd_buf.as_ref().map_or(0, |b| b.in_flight());
                 let max_flight = (self.cwnd.min(self.flow_wnd as f64)) as usize;
                 if in_flight >= max_flight {
                     return false;

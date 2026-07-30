@@ -598,6 +598,51 @@ fn loss_recovery_is_not_catastrophic() {
     assert!(mean < 50.0, "5% loss cost {mean:.1}x on average -- recovery is not proportional");
 }
 
+/// What loss actually costs, across a range of drop rates.
+///
+/// A measurement rather than an assertion — it prints a table and checks
+/// nothing, because the useful question ("did this change help?") is answered
+/// by running it on two revisions, not by a threshold. Virtual time, so the
+/// numbers are exactly reproducible and unaffected by the machine.
+///
+/// ```text
+/// cargo test -p udt-proto --test network loss_cost_table -- --ignored --nocapture
+/// ```
+///
+/// Report the mean. A single seed ranges from 7x to 35x at 5% loss on nothing
+/// but which packets get dropped, so a one-seed comparison says nothing at all.
+#[test]
+#[ignore = "measurement: prints a table, asserts nothing"]
+fn loss_cost_table() {
+    const SEEDS: [u64; 5] = [3, 17, 42, 77, 101];
+    const MSGS: usize = 150;
+    const SIZE: usize = 8192;
+
+    println!("\n  loss     mean     min     max   (x clean transfer time, {} seeds)", SEEDS.len());
+    for loss_pct in [0.0f64, 1.0, 2.0, 5.0, 10.0] {
+        let mut ratios = Vec::new();
+        for seed in SEEDS {
+            let mut clean = Sim::new(LinkConfig::perfect(), seed);
+            clean.connect();
+            let clean_us = clean.transfer(MSGS, SIZE, SendOpts::ordered());
+
+            let mut lossy = Sim::new(LinkConfig::lossy(loss_pct / 100.0), seed);
+            lossy.connect();
+            let lossy_us = lossy.transfer(MSGS, SIZE, SendOpts::ordered());
+
+            ratios.push(lossy_us as f64 / clean_us as f64);
+        }
+        ratios.sort_by(f64::total_cmp);
+        let mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
+        println!(
+            "  {loss_pct:>4.1}%  {mean:>7.2}  {:>6.2}  {:>6.2}",
+            ratios[0],
+            ratios[ratios.len() - 1],
+        );
+    }
+    println!();
+}
+
 /// A path that carries small packets and silently discards large ones used to
 /// hang the connection forever rather than failing it. The handshake is small,
 /// so it completes; every data packet then vanishes; and the peer's keep-alives

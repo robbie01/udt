@@ -171,13 +171,22 @@ Windows. ECN, which the UDP layer already plumbs and this discards. Connection
 IDs, so a NAT rebind does not kill the connection. Path-MTU probing — black
 holes are detected and reported, never probed around.
 
-Selective acknowledgement is implemented but only half-proven. A peer that does
-not understand it reads our ACKs exactly as before — the ranges go after the
-documented body, and that is asserted — but this has not yet been run against
-the C++ reference, so the compatibility claim rests on reading its source rather
-than on watching it work. Loss recovery is worth 30.6x → 24.2x the clean
-transfer time at 5% loss, measured across five simulator seeds. Real, and
-smaller than expected: most of what loss costs here turns out to be
-retransmission latency rather than the stalled window, so the remaining headroom
-is in how fast a hole is noticed and refilled, not in the window arithmetic.
-[`docs/selective-ack.md`](docs/selective-ack.md) has the details.
+Selective acknowledgement is half-built on purpose. The wire half works: the
+receiver reports which ranges above the acknowledgement point arrived, the
+sender tracks them, and a peer that does not understand the extension reads the
+ACK exactly as before. The half that would use it — discounting those packets
+from the congestion window — is written, measured, and deliberately switched
+off, because it is a bad trade:
+
+| | before | after | |
+|---|---|---|---|
+| 1% loss | 2.41x | 3.60x | 49% worse |
+| 2% loss | 11.85x | 19.19x | 62% worse |
+| 5% loss | 30.58x | 24.25x | 21% better |
+| 10% loss | 49.92x | 37.88x | 24% better |
+
+Cost of loss as a multiple of the clean transfer time, meaned over five
+simulator seeds. Real paths sit at the low end, so this loses more than it wins.
+The cause is not yet understood — it is not receiver overrun and not the flow
+window, both tested. `loss_cost_table` in `udt-proto/tests/network.rs` is the
+measurement; [`docs/selective-ack.md`](docs/selective-ack.md) has the rest.

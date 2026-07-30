@@ -1,14 +1,23 @@
 # Selective acknowledgement
 
-**Status: implemented, compatibility unconfirmed.** The design below is what
-was built. Two things to know before reading it as a plan:
+**Status: half-shipped on purpose.** The wire half is in and working. The half
+that would actually speed anything up is written, measured, and switched off.
 
-- **It helped less than expected.** 5% loss cost 30.6x the clean transfer time
-  before and 24.2x after, meaned over five simulator seeds. The stalled window
-  was a real cost but not the dominant one — most of what loss costs this
-  protocol is the latency of noticing a hole and refilling it, which this does
-  not touch. Anyone looking for the next big win on a lossy path should start
-  there rather than here.
+- **Discounting acknowledged packets from the congestion window is a bad
+  trade.** It helps where loss is heavy and hurts where it is light, and real
+  paths are light:
+
+  | | before | after | |
+  |---|---|---|---|
+  | 1% loss | 2.41x | 3.60x | 49% worse |
+  | 2% loss | 11.85x | 19.19x | 62% worse |
+  | 5% loss | 30.58x | 24.25x | 21% better |
+  | 10% loss | 49.92x | 37.88x | 24% better |
+
+  Cost of loss as a multiple of the clean transfer time, meaned over five seeds
+  of the deterministic simulator. So `pack_data` keeps counting them, with a
+  comment saying why, and everything behind it stays wired up ready.
+
 - **The interop test has not been run.** Everything below about C++ tolerating
   a longer ACK comes from reading its source, which is a prior and not a
   result. See "Wire format".
@@ -38,10 +47,14 @@ Lose packet *N* while *N+1 … N+1000* arrive, and `snd_last_ack` stays at *N*.
 *N* is repaired — one round trip minimum, and on this implementation the tail
 case used to be far worse.
 
-This is why loss costs so much more than its rate suggests. Measured on the
-deterministic simulator, 5% loss costs roughly 25x the clean transfer time; the
-loss itself accounts for a small fraction of that, and the stalled window for
-the rest.
+This looks like why loss costs so much more than its rate suggests: 5% loss
+costs about 30x the clean transfer time on the simulator, and the drops
+themselves are a small fraction of that.
+
+**That reasoning turned out to be wrong**, and the rest of this document was
+written before it was tested. Removing the stall does not remove the cost — see
+"What it was worth". Read the design below as a record of what was built and
+why, not as a claim that the diagnosis was right.
 
 ## What UDT already gives us
 
@@ -185,21 +198,45 @@ wants one (connection IDs, ECN, a defined timestamp epoch).
 
 ## What it was worth
 
-**30.6x → 24.2x** the clean transfer time at 5% loss, meaned over five seeds of
-the deterministic simulator (`loss_recovery_is_not_catastrophic`, which now
-prints the figure under `--nocapture`). No measurable effect on a clean path,
-where there are no gaps and the range list is empty.
+Cost of loss as a multiple of the clean transfer time, meaned over five seeds
+(`loss_cost_table`, which prints the whole sweep under `--nocapture`):
 
-That is about a fifth of the recovery cost, against a prediction — written in
-this document before it was built — that the stalled window was *most* of it.
-It was not. The remaining ~24x is dominated by how long a hole takes to be
-noticed and refilled: NAK timing, the retransmission path, and the expiry timer.
-That is where the next attempt should go.
+| | discount off | discount on | |
+|---|---|---|---|
+| 1% loss | 2.41x | 3.60x | 49% worse |
+| 2% loss | 11.85x | 19.19x | 62% worse |
+| 5% loss | 30.58x | 24.25x | 21% better |
+| 10% loss | 49.92x | 37.88x | 24% better |
 
-Worth stating plainly because the number is easy to over-read in either
-direction: measure with the mean over seeds, never one. A single seed on that
-test ranges from 7x to 35x on nothing but which packets get dropped, so any
-single-seed comparison of this change would have been meaningless.
+So the diagnosis was half right. The window stall is real and removing it does
+help — but only once loss is heavy enough that holes are near-continuous. Below
+that, letting the sender put the freed window back on the path costs more than
+the stall did, and 1–2% is where real paths live. Hence: switched off.
+
+The first measurement taken was 5% only, which showed a clean 21% win and
+nothing else. Sweeping the rate is what turned a success into a regression, and
+is the reason `loss_cost_table` exists rather than a single-point assertion.
+
+### What is known about the cause
+
+Not much, and it is worth finding.
+
+- **Not receiver overrun.** An 8x receive ring changes the numbers not at all.
+- **Not the flow window.** Separating the two limits — discounting from the
+  congestion window only, since a packet held for reassembly still occupies the
+  peer's buffer — also changes nothing, because `flow_wnd` never binds at this
+  transfer size.
+- **Not the loss-list pruning.** Dropping the `snd_loss.remove_range` call
+  leaves the numbers identical; the discount alone accounts for the whole
+  effect, in both directions.
+- The regressed figures cluster on repeated values (13.86 appears as both the
+  1% maximum and the 2% minimum), which looks like a fixed quantum being hit a
+  varying number of times. The expiry timer is the obvious suspect, at 10 ms a
+  firing against a clean transfer of a few ms.
+
+A single seed on this test ranges from 7x to 35x at 5% loss on nothing but which
+packets get dropped, so any single-seed comparison is meaningless. Mean over
+seeds, always.
 
 ## Interaction with what is already there
 
