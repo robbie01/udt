@@ -1670,18 +1670,34 @@ impl Connection {
                 //
                 // Selectively acknowledged packets are deliberately *not*
                 // discounted here, though they are off the path and the whole
-                // point of tracking them was to discount them. Doing so was
-                // measured on the simulator and is a bad trade: it improves 5%
-                // loss from 30.6x to 24.2x the clean transfer time and 10% from
-                // 49.9x to 37.9x, but regresses 1% from 2.4x to 3.6x and 2% from
-                // 11.9x to 19.2x. Real paths live at the low end.
+                // point of tracking them was to discount them.
                 //
-                // The cause is not understood and is worth finding — it is not
-                // receiver overrun (an 8x receive ring changes nothing) and not
-                // the flow window (separating the two limits changes nothing);
-                // the extra data the discount puts on the path just costs more
-                // than the stall it avoids, in fixed-looking quanta that smell
-                // like the expiry timer. `loss_cost_table` is the measurement.
+                // The reason is that the window is not what limits this. Over
+                // 32 seeds of `loss_cost_table`, cwnd sits at 144-250 packets
+                // while the pacing interval — the sending *rate* congestion
+                // control asks for — is what the sender actually waits on, and
+                // amplification stays near 1.0 throughout. Loss costs 5-50x
+                // here because of `udt_cc`, not because a hole pins the window.
+                //
+                // So discounting cannot help by the mechanism it was built for,
+                // and measurement agrees it is not helping by any other:
+                //
+                //           off      on
+                //    1%    4.70x   3.78x    20% better
+                //    2%   10.51x  12.25x    17% worse
+                //    5%   28.13x  27.05x     4% better
+                //   10%   49.70x  44.91x    10% better
+                //
+                // Mixed in sign, inside the noise of a 32-seed mean whose own
+                // spread runs 1.0x to 64x — and the pacing interval roughly
+                // doubles when it is on, so what movement there is comes from
+                // perturbing the rate controller rather than from freeing the
+                // window. Turning it on would be adopting an accident.
+                //
+                // Everything behind it stays wired and `snd_sacked_len` is in
+                // `ConnectionStats`; re-enabling is this one `saturating_sub`.
+                // Worth revisiting once the rate controller is addressed, which
+                // is the actual lever.
                 let in_flight = self.snd_buf.as_ref().map_or(0, |b| b.in_flight());
                 let max_flight = (self.cwnd.min(self.flow_wnd as f64)) as usize;
                 if in_flight >= max_flight {
