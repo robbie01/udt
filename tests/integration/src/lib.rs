@@ -661,13 +661,67 @@ mod tests {
     const BENCH_CHUNK: usize = 64 * 1024;
     const PINGPONG_MSGS: usize = 400;
 
+    /// One transfer, one number.
+    ///
+    /// A smoke figure only: enough to notice that throughput has fallen off a
+    /// cliff, useless for telling two builds apart. Use [`Samples`] for that —
+    /// these single-shot numbers have been seen to differ by a factor of two
+    /// between consecutive runs of the same binary.
     fn report(name: &str, bytes: usize, elapsed: f64) {
         println!(
-            "[{name:<26}] {:>7.1} MB/s  ({} MiB in {:.2}s)",
+            "[{name:<26}] {:>7.1} MB/s  ({} MiB in {:.2}s, single run)",
             bytes as f64 / 1e6 / elapsed,
             bytes / (1024 * 1024),
             elapsed,
         );
+    }
+
+    /// Throughput measured repeatedly, reported as a distribution.
+    ///
+    /// A single number is not a measurement here. The same binary on the same
+    /// idle machine has been seen to differ by 5x between sessions and by 2x
+    /// between consecutive runs, which over this project's history produced
+    /// several confident and wrong conclusions — a machine artefact read as a
+    /// code regression, and twice the reverse. Anything comparing two builds
+    /// needs the spread, not the mean, and needs to discard the first round.
+    #[derive(Default)]
+    struct Samples {
+        rates: Vec<f64>,
+    }
+
+    impl Samples {
+        /// Record one round. `bytes` over `secs` becomes a rate in MB/s.
+        fn push(&mut self, bytes: usize, secs: f64) {
+            if secs > 0.0 {
+                self.rates.push(bytes as f64 / 1e6 / secs);
+            }
+        }
+
+        /// Print the median, and the range around it.
+        ///
+        /// The first round is dropped: it pays for connection setup, slow start,
+        /// and whatever the allocator and page cache have not warmed yet.
+        fn report(&self, name: &str) {
+            let mut r = self.rates.clone();
+            if r.len() > 2 {
+                r.remove(0);
+            }
+            if r.is_empty() {
+                println!("[{name:<26}] no samples");
+                return;
+            }
+            r.sort_by(f64::total_cmp);
+            let median = r[r.len() / 2];
+            let (lo, hi) = (r[0], r[r.len() - 1]);
+            // Spread relative to the median is the number that says whether a
+            // difference between two builds means anything.
+            let spread = if median > 0.0 { (hi - lo) / median * 100.0 } else { 0.0 };
+            println!(
+                "[{name:<26}] {median:>7.1} MB/s  median of {:>2}  \
+                 (min {lo:>7.1} max {hi:>7.1}, spread {spread:>5.1}%)",
+                r.len(),
+            );
+        }
     }
 
     fn report_latency(name: &str, msgs: usize, elapsed: f64) {
@@ -703,21 +757,26 @@ mod tests {
     /// Our own code — packet assembly, the receive ring, congestion control —
     /// is a few percent. The per-packet copies and allocations that look
     /// expensive when reading the source are not where the time goes, and
-    /// shaving them further would not move the number.
+    /// shaving them further does not move the number. That has been tested
+    /// twice since: pooling the receive buffers to avoid a copy measured 25%
+    /// *slower*, and moving the socket writes to a task of their own measured
+    /// 5–20% slower on both platforms.
     ///
-    /// Single-connection throughput is therefore a **syscall-rate ceiling**:
-    /// ~375 MB/s at a 1436-byte payload is ~260k packets/s, and every packet
-    /// costs one `sendto` on one side and one `recvfrom` on the other. The
-    /// two-connection benchmark reaches ~580 MB/s precisely because it spreads
-    /// those syscalls over more cores.
+    /// So single-connection throughput is a **syscall-rate ceiling**, and the
+    /// only thing that has ever moved it is making each syscall carry more.
+    /// Segmentation offload and `recvmmsg` (through `quinn-udp`) did exactly
+    /// that on Linux, which is why it now reaches gigabytes a second where
+    /// macOS, which has neither, sits near 500 MB/s at the same packet size.
     ///
-    /// Note `sendto` outnumbers `recvfrom` roughly 2:1: the receive path already
-    /// batches (`RECV_BATCH` drains everything queued per wakeup) while the send
-    /// path cannot — UDP is one datagram per call. Closing that asymmetry needs
-    /// `sendmmsg`/`recvmmsg`, which macOS does not have; on Linux it is the one
-    /// change with real headroom left. Raising the MSS would also cut packets
-    /// per byte, but changes what the benchmark measures and does not reflect a
-    /// 1500-byte-MTU path.
+    /// What is left is not in this file's reach:
+    ///
+    /// * On platforms without offload, connections sharing an endpoint's port
+    ///   are limited by one reader doing one syscall per packet. It cannot be
+    ///   split — several readers on one socket reorder a flow, which UDT reads
+    ///   as loss, and that wedged the connection outright when tried. It needs
+    ///   the kernel to fan out with flow affinity, or a socket per connection.
+    /// * Raising the MTU cuts packets per byte, but then the benchmark stops
+    ///   describing a 1500-byte path.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn profile_stream_rust_to_rust() {
@@ -725,9 +784,11 @@ mod tests {
         let (server, mut client) = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
         let chunk = vec![0x5Au8; BENCH_CHUNK];
 
-        let start = std::time::Instant::now();
-        let mut total = 0usize;
+        // Timed per round rather than in aggregate, so the output carries a
+        // spread. See `Samples`.
+        let mut samples = Samples::default();
         for _ in 0..ROUNDS {
+            let round = std::time::Instant::now();
             let c = chunk.clone();
             let sender = tokio::spawn(async move {
                 let mut sent = 0usize;
@@ -744,10 +805,10 @@ mod tests {
             while got < BENCH_TOTAL {
                 got += server.recv(&mut buf).await.unwrap();
             }
-            total += got;
             client = sender.await.unwrap();
+            samples.push(got, round.elapsed().as_secs_f64());
         }
-        report("profile rust→rust", total, start.elapsed().as_secs_f64());
+        samples.report("profile rust→rust");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -769,17 +830,26 @@ mod tests {
     /// Both connections are accepted through one endpoint, so their inbound
     /// traffic funnels through the single mux task — which is what this is for
     /// measuring.
+    ///
+    /// **This one is noisy.** Rounds are held to a common barrier, so a round
+    /// costs whatever the slower connection costs, and the two do not share the
+    /// endpoint's reader evenly from round to round. Measured on macOS it ran a
+    /// 61% spread around the median where the single-connection case ran 2.4%.
+    /// Treat a difference below that as nothing at all, and prefer
+    /// `rendezvous_parallel_scaling` for questions about how connections share
+    /// an endpoint.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn profile_stream_two_connections() {
+        const CONNS: usize = 2;
         const ROUNDS: usize = 8;
-        const PER_CONN: usize = BENCH_TOTAL / 2;
+        const PER_CONN: usize = BENCH_TOTAL / CONNS;
 
         let ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
         let server_addr = ep.local_addr();
         let listener = ep.listen(4).unwrap();
 
-        let conn_tasks: Vec<_> = (0..2)
+        let conn_tasks: Vec<_> = (0..CONNS)
             .map(|_| {
                 tokio::spawn(async move {
                     let cep = Endpoint::bind("127.0.0.1:0").await.unwrap();
@@ -788,7 +858,7 @@ mod tests {
             })
             .collect();
         let mut servers = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..CONNS {
             servers.push(listener.accept().await.unwrap());
         }
         let mut clients = Vec::new();
@@ -796,19 +866,25 @@ mod tests {
             clients.push(t.await.unwrap());
         }
 
-        let start = std::time::Instant::now();
-        let mut total = 0usize;
+        // The connections are held to the same round boundaries so each round
+        // can be timed as a whole, which is what makes the aggregate rate
+        // meaningful per round rather than only across the whole run. Each
+        // worker is a party, and so is this task, which does the timing.
+        let gate = Arc::new(tokio::sync::Barrier::new(CONNS + 1));
+
         let xfer: Vec<_> = servers
             .into_iter()
             .zip(clients)
             .map(|(srv, (cli, _cep))| {
+                let gate = Arc::clone(&gate);
                 tokio::spawn(async move {
-                    let wr = std::sync::Arc::new(cli);
+                    let wr = Arc::new(cli);
                     let chunk = vec![0xAAu8; BENCH_CHUNK];
                     let mut got = 0usize;
                     for _ in 0..ROUNDS {
+                        gate.wait().await;
                         let c = chunk.clone();
-                        let w = std::sync::Arc::clone(&wr);
+                        let w = Arc::clone(&wr);
                         let sender = tokio::spawn(async move {
                             let mut sent = 0usize;
                             while sent < PER_CONN {
@@ -819,22 +895,31 @@ mod tests {
                             }
                         });
                         let mut buf = vec![0u8; BENCH_CHUNK * 2];
-                        let mut round = 0usize;
-                        while round < PER_CONN {
-                            round += srv.recv(&mut buf).await.unwrap();
+                        let mut moved = 0usize;
+                        while moved < PER_CONN {
+                            moved += srv.recv(&mut buf).await.unwrap();
                         }
-                        got += round;
+                        got += moved;
                         sender.await.unwrap();
+                        gate.wait().await;
                     }
                     (got, wr)
                 })
             })
             .collect();
-        for t in xfer {
-            let (n, _held) = t.await.unwrap();
-            total += n;
+
+        let mut samples = Samples::default();
+        for _ in 0..ROUNDS {
+            gate.wait().await;
+            let round = std::time::Instant::now();
+            gate.wait().await;
+            // Every connection moves PER_CONN in the round.
+            samples.push(PER_CONN * CONNS, round.elapsed().as_secs_f64());
         }
-        report("profile rust 2-conn", total, start.elapsed().as_secs_f64());
+        for t in xfer {
+            let (_n, _held) = t.await.unwrap();
+        }
+        samples.report("profile rust 2-conn");
     }
 
     /// Rendezvous connections created from one endpoint all share that
@@ -845,16 +930,37 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn rendezvous_parallel_scaling() {
+        // Runs of each configuration. This is the least stable measurement
+        // here — a single connection finishing late drags the whole aggregate
+        // down, since it waits for all of them — so it is taken repeatedly and
+        // reduced to a median.
+        const RUNS: usize = 3;
+
         for n in [1usize, 2, 4, 8] {
-            let shared = rendezvous_throughput(n, true).await;
-            let separate = rendezvous_throughput(n, false).await;
+            let mut shared = Vec::new();
+            let mut separate = Vec::new();
+            for _ in 0..RUNS {
+                shared.push(rendezvous_throughput(n, true).await);
+                separate.push(rendezvous_throughput(n, false).await);
+            }
+            let (s, sp) = (median(&mut shared), median(&mut separate));
+            // `median` sorted them, so the ends are now the min and max.
             println!(
-                "[rendezvous n={n:<2}] shared endpoint {shared:>7.1} MB/s   \
-                 separate endpoints {separate:>7.1} MB/s   \
-                 ratio {:.2}",
-                shared / separate,
+                "[rendezvous n={n:<2}] shared endpoint {s:>7.1} MB/s   \
+                 separate endpoints {sp:>7.1} MB/s   \
+                 ratio {:.2}   (median of {RUNS}, shared {:>7.1}-{:>7.1})",
+                s / sp,
+                shared[0],
+                shared[shared.len() - 1],
             );
         }
+    }
+
+    /// Median of `v`, which is sorted in place — callers rely on that to read
+    /// the min and max off the ends afterwards.
+    fn median(v: &mut [f64]) -> f64 {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
     }
 
     /// Run `n` concurrent rendezvous transfers, either all from one endpoint or
