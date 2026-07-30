@@ -32,6 +32,22 @@ mod tests {
     struct Relay {
         dropped: AtomicU64,
         forwarded: AtomicU64,
+        /// ACKs seen carrying more than the 24-byte body UDT defines — i.e.
+        /// ones with selective-acknowledgement ranges appended. Counted on the
+        /// wire rather than inferred, so a test asserting the peer coped with
+        /// them can prove it actually saw one.
+        extended_acks: AtomicU64,
+    }
+
+    /// Whether `d` is an ACK control packet whose body runs past the documented
+    /// 24 bytes. Word 0 bit 31 marks a control packet and bits 30..16 its type;
+    /// 2 is ACK. The body follows the 16-byte header.
+    fn is_extended_ack(d: &[u8]) -> bool {
+        if d.len() <= 16 + 24 {
+            return false;
+        }
+        let word0 = u32::from_be_bytes(d[0..4].try_into().unwrap());
+        word0 >> 31 == 1 && (word0 >> 16) & 0x7FFF == 2
     }
 
     /// Drop `loss_pct` of datagrams in both directions.
@@ -41,6 +57,7 @@ mod tests {
         let relay = Arc::new(Relay {
             dropped: AtomicU64::new(0),
             forwarded: AtomicU64::new(0),
+            extended_acks: AtomicU64::new(0),
         });
 
         let task_sock = Arc::clone(&sock);
@@ -68,6 +85,9 @@ mod tests {
                     continue;
                 }
                 task_relay.forwarded.fetch_add(1, Ordering::Relaxed);
+                if is_extended_ack(&buf[..n]) {
+                    task_relay.extended_acks.fetch_add(1, Ordering::Relaxed);
+                }
                 let _ = task_sock.send_to(&buf[..n], to).await;
             }
         });
@@ -79,10 +99,12 @@ mod tests {
     /// flowing.
     struct Outcome {
         delivered: usize,
+        total: usize,
         elapsed: Duration,
         finished: bool,
         relay_forwarded: u64,
         relay_dropped: u64,
+        relay_extended_acks: u64,
     }
 
     impl Outcome {
@@ -94,12 +116,13 @@ mod tests {
             };
             println!(
                 "[{label:<28}] {}/{} msgs in {:>6.2}s  {rate:>7.1} MB/s  \
-                 relay fwd={} drop={}  {}",
+                 relay fwd={} drop={} ext-ack={}  {}",
                 self.delivered,
-                MSGS,
+                self.total,
                 self.elapsed.as_secs_f64(),
                 self.relay_forwarded,
                 self.relay_dropped,
+                self.relay_extended_acks,
                 if self.finished {
                     "completed"
                 } else {
@@ -234,10 +257,12 @@ mod tests {
         sender.abort();
         Outcome {
             delivered,
+            total: MSGS,
             elapsed,
             finished: delivered >= MSGS,
             relay_forwarded: relay.forwarded.load(Ordering::Relaxed),
             relay_dropped: relay.dropped.load(Ordering::Relaxed),
+            relay_extended_acks: relay.extended_acks.load(Ordering::Relaxed),
         }
     }
 
@@ -287,11 +312,115 @@ mod tests {
         sender.abort();
         Outcome {
             delivered,
+            total: MSGS,
             elapsed,
             finished: delivered >= MSGS,
             relay_forwarded: relay.forwarded.load(Ordering::Relaxed),
             relay_dropped: relay.dropped.load(Ordering::Relaxed),
+            relay_extended_acks: relay.extended_acks.load(Ordering::Relaxed),
         }
+    }
+
+    /// A C++ sender feeding a Rust receiver over a path that drops packets.
+    ///
+    /// This is the compatibility gate for selective acknowledgement. The Rust
+    /// receiver appends the ranges it has received after the documented 24-byte
+    /// ACK body, which UDT knows nothing about, so every ACK the C++ sender sees
+    /// here is longer than any ACK its own receiver would ever produce. Reading
+    /// `processCtrl` says it should not care — the only length test on that path
+    /// picks out a 4-byte lite ACK, and nothing bounds the body above — but what
+    /// matters is the shipped binary, and this runs it.
+    ///
+    /// Loss is the point: on a clean link the Rust receiver has no gaps, emits
+    /// no ranges, and the test would prove nothing. The assertion on
+    /// `relay_dropped` is there to make sure the path really did misbehave.
+    ///
+    /// If this fails, the extension is not backward compatible and has to be
+    /// negotiated. See `docs/selective-ack.md` on master.
+    async fn cpp_to_rust_through_loss(loss_pct: u64, msgs: usize) -> Outcome {
+        use udt_compat::Endpoint as CppEndpoint;
+
+        let server_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+        let listener = server_ep.listen(4).unwrap();
+        let (relay_addr, relay) = spawn_relay(server_ep.local_addr(), loss_pct).await;
+        let client_ep = Arc::new(CppEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap());
+
+        let (server, client) =
+            tokio::join!(async { listener.accept().await.expect("accept") }, async {
+                client_ep
+                    .connect(relay_addr, false)
+                    .await
+                    .expect("cpp connect")
+            });
+        let client = Arc::new(client);
+
+        let start = Instant::now();
+        let sender = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                let chunk = vec![0xA5u8; CHUNK];
+                for _ in 0..msgs {
+                    if client.send(&chunk).await.is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+
+        let mut delivered = 0usize;
+        let mut buf = vec![0u8; CHUNK * 2];
+        while delivered < msgs && start.elapsed() < BUDGET {
+            match tokio::time::timeout(Duration::from_secs(2), server.recv(&mut buf)).await {
+                Ok(Ok(n)) => {
+                    assert_eq!(
+                        n, CHUNK,
+                        "message {delivered} arrived with the wrong length"
+                    );
+                    assert!(
+                        buf[..n].iter().all(|&b| b == 0xA5),
+                        "message {delivered} arrived corrupted"
+                    );
+                    delivered += 1;
+                }
+                Ok(Err(_)) => break,
+                Err(_) => continue,
+            }
+        }
+        let elapsed = start.elapsed();
+        sender.abort();
+        Outcome {
+            delivered,
+            total: msgs,
+            elapsed,
+            finished: delivered >= msgs,
+            relay_forwarded: relay.forwarded.load(Ordering::Relaxed),
+            relay_dropped: relay.dropped.load(Ordering::Relaxed),
+            relay_extended_acks: relay.extended_acks.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The C++ reference must keep working against a Rust peer whose ACKs carry
+    /// selective-acknowledgement ranges it does not understand.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cpp_tolerates_our_extended_acks() {
+        const MSGS: usize = 120;
+        let outcome = cpp_to_rust_through_loss(5, MSGS).await;
+        outcome.report("cpp→rust 5% loss");
+        assert!(
+            outcome.relay_extended_acks > 0,
+            "no ACK carrying selective-acknowledgement ranges crossed the wire, \
+             so the C++ sender was never asked to tolerate one and this test \
+             proves nothing (relay dropped {} of {})",
+            outcome.relay_dropped,
+            outcome.relay_dropped + outcome.relay_forwarded,
+        );
+        assert_eq!(
+            outcome.delivered, MSGS,
+            "a C++ sender stopped making progress against a Rust receiver that \
+             appends selective-acknowledgement ranges to its ACKs: delivered \
+             {}/{MSGS} in {:?}. The extension is not backward compatible.",
+            outcome.delivered, outcome.elapsed,
+        );
     }
 
     /// Where the crossover is between the two implementations on a clean link.

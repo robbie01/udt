@@ -317,6 +317,119 @@ mod tests {
         let _held = join(sender, "upstream bulk send").await;
     }
 
+    // ── Extended ACKs against pristine upstream ──────────────────────────────
+
+    /// Forward datagrams to `server`, dropping `loss_pct` of them, and count the
+    /// ACKs coming back that carry more than UDT's documented 24-byte body.
+    async fn lossy_relay(
+        server: std::net::SocketAddr,
+        loss_pct: u64,
+    ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicU64>) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = sock.local_addr().unwrap();
+        let extended = Arc::new(AtomicU64::new(0));
+
+        let task_sock = Arc::clone(&sock);
+        let task_extended = Arc::clone(&extended);
+        tokio::spawn(async move {
+            let mut counter = 0u64;
+            let mut client: Option<std::net::SocketAddr> = None;
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let Ok((n, from)) = task_sock.recv_from(&mut buf).await else {
+                    return;
+                };
+                let to = if from == server {
+                    match client {
+                        Some(c) => c,
+                        None => continue,
+                    }
+                } else {
+                    client = Some(from);
+                    server
+                };
+                counter = counter.wrapping_mul(6364136223846793005).wrapping_add(1);
+                if (counter >> 33) % 100 < loss_pct {
+                    continue;
+                }
+                // Control packet (word 0 bit 31), type 2 (ACK), body past 24.
+                if n > 16 + 24 {
+                    let w0 = u32::from_be_bytes(buf[0..4].try_into().unwrap());
+                    if w0 >> 31 == 1 && (w0 >> 16) & 0x7FFF == 2 {
+                        task_extended.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                let _ = task_sock.send_to(&buf[..n], to).await;
+            }
+        });
+        (addr, extended)
+    }
+
+    /// Pristine upstream must keep working against a Rust receiver whose ACKs
+    /// carry selective-acknowledgement ranges it knows nothing about.
+    ///
+    /// The fork is covered by `cpp_tolerates_our_extended_acks` in cpp-interop,
+    /// but the fork is not upstream — this asks the same question of unmodified
+    /// dorkbox/udt. Loss is what makes the Rust receiver emit ranges at all, and
+    /// the counter proves some crossed the wire rather than letting the test
+    /// pass while asserting nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upstream_tolerates_our_extended_acks() {
+        use std::sync::atomic::Ordering;
+        const MSGS: usize = 60;
+
+        let ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+        let listener = ep.listen(4).unwrap();
+        let (relay_addr, extended) = lossy_relay(ep.local_addr(), 5).await;
+
+        let connect = tokio::task::spawn_blocking(move || {
+            let client_ep = udt_orig::Endpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            (client_ep.connect(relay_addr, false), client_ep)
+        });
+        let server = tokio::time::timeout(T, listener.accept())
+            .await
+            .expect("rust accept timed out")
+            .expect("rust accept failed");
+        let (client, _client_ep) = join(connect, "upstream connect through relay").await;
+        let client = client.expect("upstream connect failed");
+
+        let sender = tokio::task::spawn_blocking(move || {
+            for i in 0..MSGS {
+                let chunk = vec![pattern(i); BULK_CHUNK];
+                if client.send(&chunk).is_err() {
+                    break;
+                }
+            }
+            client
+        });
+
+        let mut buf = vec![0u8; BULK_CHUNK * 2];
+        for i in 0..MSGS {
+            let n = tokio::time::timeout(T, server.recv(&mut buf))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "upstream stopped making progress against a Rust receiver \
+                         sending extended ACKs: timed out on message {i} of {MSGS}"
+                    )
+                })
+                .expect("rust recv failed");
+            assert_eq!(n, BULK_CHUNK, "message {i} arrived with the wrong length");
+            assert!(
+                buf[..n].iter().all(|&b| b == pattern(i)),
+                "message {i} corrupted in transit from upstream",
+            );
+        }
+        let _held = join(sender, "upstream send through relay").await;
+
+        assert!(
+            extended.load(Ordering::Relaxed) > 0,
+            "no extended ACK crossed the wire, so upstream was never asked to \
+             tolerate one and this test proves nothing",
+        );
+    }
+
     // ── Message boundaries ───────────────────────────────────────────────────
     //
     // Upstream computes its payload size as `MSS - 28 - 16` = 1456 bytes, while
