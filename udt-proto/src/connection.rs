@@ -642,7 +642,26 @@ impl Connection {
             || self.cc_ack_interval_pkts.is_some_and(|n| self.pkt_count >= n)
         {
             self.emit_ack(now_us, false, tx);
-            self.next_ack_us = now_us + self.ack_int_us();
+            // An acknowledgement point the peer has not confirmed is retried on
+            // the round trip rather than on the control interval.
+            //
+            // `emit_ack` has a rule for exactly this — re-announce an unchanged
+            // point after `RTT + 4·RTTVar` — and it was dead code, because
+            // nothing called `emit_ack` again until this timer came round ten
+            // milliseconds later. So a lost ACK shut the sender's window for a
+            // control interval and the expiry timer was what eventually reopened
+            // it: 10.4 ms of a 16.6 ms transfer, the last stall in the timeline.
+            //
+            // It costs no extra reverse traffic. Acknowledgements per forward
+            // packet are unchanged at every loss rate measured, because the
+            // transfer finishes sooner by more than the added cadence spends.
+            self.next_ack_us = now_us
+                + if self.rcv_last_ack > self.rcv_last_ack_ack {
+                    let unconfirmed = (self.rtt_us + 4 * self.rtt_var_us).max(0) as u64;
+                    self.ack_int_us().min(unconfirmed.max(MIN_RECOVERY_US))
+                } else {
+                    self.ack_int_us()
+                };
             self.pkt_count = 0;
             self.light_ack_count = 1;
         } else if self.pkt_count >= LIGHT_ACK_INTERVAL * self.light_ack_count {

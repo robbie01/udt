@@ -639,7 +639,7 @@ fn loss_cost_table() {
     // it is busy sending data that was not needed. Guessing which without
     // measuring it has been wrong twice.
     println!(
-        "\n  loss   ratio   clean_ms  lossy_ms     amp    cwnd   pace_us   rtt_us  ({} seeds)",
+        "\n  loss   ratio   clean_ms  lossy_ms     amp    cwnd   pace_us   rtt_us   rev/fwd  ({} seeds)",
         SEEDS.len()
     );
     for loss_pct in [0.0f64, 1.0, 2.0, 5.0, 10.0] {
@@ -647,6 +647,7 @@ fn loss_cost_table() {
         let mut paces = Vec::new();
         let (mut cleans, mut lossies) = (Vec::new(), Vec::new());
         let mut rtts = Vec::new();
+        let mut revs = Vec::new();
         for seed in SEEDS {
             let mut clean = Sim::new(LinkConfig::perfect(), seed);
             clean.connect();
@@ -664,11 +665,13 @@ fn loss_cost_table() {
             cwnds.push(lossy.a.stats().cwnd);
             paces.push(lossy.a.stats().snd_period_us);
             rtts.push(lossy.a.stats().rtt_us as f64);
+            // Reverse-direction datagrams per forward one: the ACK/NAK overhead.
+            revs.push(lossy.b_to_a.sent as f64 / lossy.a_to_b.sent.max(1) as f64);
         }
         ratios.sort_by(f64::total_cmp);
         let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
         println!(
-            "  {loss_pct:>4.1}%  {:>6.2}  {:>9.3}  {:>9.3}  {:>6.2}  {:>6.0}  {:>8.1}  {:>7.0}",
+            "  {loss_pct:>4.1}%  {:>6.2}  {:>9.3}  {:>9.3}  {:>6.2}  {:>6.0}  {:>8.1}  {:>7.0}  {:>8.2}",
             mean(&ratios),
             mean(&cleans),
             mean(&lossies),
@@ -676,6 +679,7 @@ fn loss_cost_table() {
             mean(&cwnds),
             mean(&paces),
             mean(&rtts),
+            mean(&revs),
         );
     }
     println!();
