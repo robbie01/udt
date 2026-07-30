@@ -10,7 +10,14 @@ where TCP's window growth is the bottleneck rather than the network — long fat
 pipes, high-latency paths, bulk transfer.
 
 **Status: pre-release.** Nothing is published to crates.io and the version is
-`0.0.0`; `udt-proto`'s API is explicitly not stable yet.
+`0.0.0`; `udt-proto`'s API is explicitly not stable yet. Dual-licensed
+MIT OR Apache-2.0. Minimum supported Rust is 1.88, which is where let-chains
+stabilised.
+
+Publishing goes `udt-proto` first, then `udt-async`: the second depends on the
+first, and cargo resolves that from the registry rather than the path when it
+packages, so `--dry-run` on `udt-async` cannot pass until `udt-proto` is up. CI
+dry-runs the one it can.
 
 [UDT]: https://udt.sourceforge.io/
 

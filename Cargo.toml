@@ -13,3 +13,10 @@ members = [
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/robbie01/udt"
+authors = ["Robert B. Langer <robbie@sohio.net>"]
+# Let-chains are what set this: `if let Some(x) = ... && cond` is used
+# throughout and stabilised in 1.88. Edition 2024 alone would only need 1.85.
+# Verified by building the workspace on 1.88, not guessed from a feature list.
+rust-version = "1.88"

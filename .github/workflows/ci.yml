@@ -66,6 +66,38 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  msrv:
+    # Keep in step with `rust-version` in the workspace manifest. Job names
+    # cannot read `env`, so the number appears twice on purpose.
+    name: msrv (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+      # The libraries only. Test and benchmark code is not what a consumer
+      # compiles, so holding it to the same floor would raise the floor for
+      # nobody's benefit.
+      - run: cargo build -p udt-proto -p udt-async
+
+  publish-dry-run:
+    name: publishable
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Catches the things that only bite at publish time: a dependency without
+      # a version requirement, metadata that does not validate, a file the
+      # tarball needs and does not have.
+      #
+      # `udt-proto` only. `udt-async` depends on it by path, and cargo resolves
+      # that from the registry when packaging, so it cannot be verified until
+      # `udt-proto` is actually published. That also fixes the publish order.
+      - run: cargo publish --dry-run -p udt-proto
+
   fuzz:
     name: fuzz (smoke)
     runs-on: ubuntu-latest

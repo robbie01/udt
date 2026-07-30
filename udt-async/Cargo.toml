@@ -2,6 +2,18 @@
 name = "udt-async"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Reliable, message-oriented transport over UDP on Tokio, wire-compatible with the C++ UDT reference"
+keywords = ["udt", "udp", "tokio", "async", "transport"]
+categories = ["network-programming", "asynchronous"]
+readme = "../README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["tokio"]
@@ -9,7 +21,9 @@ tokio = ["dep:tokio", "dep:quinn-udp", "dep:flume"]
 async-io = ["dep:async-io", "dep:futures-lite", "dep:async-channel"]
 
 [dependencies]
-udt-proto = { path = "../udt-proto" }
+# The version is required to publish: crates.io drops the path and resolves
+# the dependency from the registry, so it has to know which release to want.
+udt-proto = { path = "../udt-proto", version = "0.0.0" }
 bytes = "1"
 rand = "0.9"
 
