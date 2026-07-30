@@ -72,24 +72,23 @@ const EXP_MAX: u32 = 16;
 /// is 10 ms, so a single one is far too little to conclude that.
 const PROBE_EXPIRIES: u32 = 3;
 
-/// Floor on each expiry interval, in microseconds.
+/// Floor on the recovery timers, in microseconds.
 ///
-/// A minimum exists so that a noisy round-trip estimate cannot drive the timer
-/// down to nothing. It is *not* meant to set the pace on a short path -- the
-/// RTT-derived term already does that -- but the reference's flat 300 ms
-/// dominates it on anything under a 290 ms round trip, which is very nearly
-/// every path.
+/// A floor exists so a noisy round-trip estimate cannot drive a timer down to
+/// nothing, and so it cannot ask for a wakeup finer than the driver can
+/// deliver. One millisecond is roughly tokio's timer granularity, so below this
+/// the number would be a fiction.
 ///
-/// That matters because this timer is what recovers a lost tail. A gap in the
-/// middle of the stream is repaired by the NAK the next packet triggers, but
-/// when the loss is the last packet there is no next packet, and nothing moves
-/// until this fires. Measured on loopback with eight connections saturating the
-/// socket buffer, roughly one connection in four hit that and finished 300 or
-/// 600 ms late while its peers took 55 ms, dragging the aggregate down tenfold.
+/// It is deliberately **not** [`SYN_US`]. That is UDT's control cadence — how
+/// often to acknowledge — and has no business deciding how fast a lost packet
+/// is noticed. Using it for both put both recovery timers at ~50x the round
+/// trip on a fast path, and one firing then cost more than an entire clean
+/// transfer: the loss sweep showed a repeated 13.86x quantum that was exactly
+/// this, and seeds split into "lost no NAK" at 1.00x and "lost one" at 13.86x.
 ///
-/// One control interval is the floor now: below that the protocol cannot react
-/// anyway, and above it the RTT term takes over.
-const MIN_EXP_PER_COUNT_US: u64 = SYN_US as u64;
+/// The reference is worse still — a flat 300 ms, which dominates the RTT term
+/// on anything under a 290 ms round trip, i.e. very nearly every path.
+const MIN_RECOVERY_US: u64 = 1_000;
 /// Largest round-trip time a peer may report, in microseconds.
 ///
 /// Ten seconds is far beyond any working path, and the value drives the
@@ -99,10 +98,16 @@ const MAX_REPORTED_RTT_US: i32 = 10_000_000;
 
 /// Expiry firings with no data acknowledged before the path is declared
 /// unusable.
-///
-/// Firings are at least [`MIN_EXP_PER_COUNT_US`] apart, so this is a couple of
-/// seconds of the peer answering while nothing this side sends arrives.
 const BLACK_HOLE_EXP_COUNT: u32 = 8;
+
+/// How long that has to have been going on, as well.
+///
+/// The count alone used to imply a duration, back when firings were at least a
+/// control interval apart. They are now [`MIN_RECOVERY_US`] apart on a fast
+/// path, which turns eight of them into some tens of milliseconds — far too
+/// eager a moment to declare a path broken and tear the connection down. So the
+/// wall clock is checked too, and the count is left to mean what it says.
+const BLACK_HOLE_MIN_US: u64 = 500_000;
 
 /// After EXP_MAX expirations the connection is only torn down once it has been
 /// silent for this long in total (matches C++ `5 000 000 µs` guard).
@@ -310,6 +315,10 @@ pub struct Connection {
     /// at 1 forever, so on its own it cannot notice a path that carries small
     /// packets and drops large ones.
     exp_without_progress: u32,
+    /// When that run of firings began, so the black-hole check can ask how long
+    /// it has really been rather than inferring it from a count of firings
+    /// whose spacing now depends on the path.
+    no_progress_since_us: Option<u64>,
     /// Whether the peer has ever acknowledged a single byte of data.
     data_ever_acked: bool,
     /// When the last full ACK was emitted, for re-ACK rate limiting.
@@ -470,6 +479,7 @@ impl Connection {
             next_snd_us: now_us,
             last_rsp_us: now_us,
             exp_without_progress: 0,
+            no_progress_since_us: None,
             data_ever_acked: false,
             last_ack_us: now_us,
             exp_count: 1,
@@ -655,6 +665,7 @@ impl Connection {
 
             if !self.snd_buf_is_empty() {
                 self.exp_without_progress += 1;
+                self.no_progress_since_us.get_or_insert(now_us);
             }
 
             // A peer that answers while nothing we send arrives means the path
@@ -663,7 +674,10 @@ impl Connection {
             // the connection never fails: the peer's keep-alives keep resetting
             // `exp_count`, so the hard timeout is never reached and the sender
             // retransmits into the void indefinitely.
+            let stalled_for =
+                self.no_progress_since_us.map_or(0, |since| now_us.saturating_sub(since));
             if self.exp_without_progress >= BLACK_HOLE_EXP_COUNT
+                && stalled_for >= BLACK_HOLE_MIN_US
                 && !self.data_ever_acked
                 && !self.snd_buf_is_empty()
             {
@@ -1234,6 +1248,7 @@ impl Connection {
             // Real forward progress: whatever the path is doing, it is
             // carrying our data.
             self.exp_without_progress = 0;
+            self.no_progress_since_us = None;
             self.data_ever_acked = true;
         }
 
@@ -1747,17 +1762,30 @@ impl Connection {
         self.cc_rto_us = o.rto_us.map(|us| us as u64);
     }
 
-    /// Interval until the next EXP (retransmission timeout) firing.
+    /// Interval until the next EXP firing.
     ///
-    /// Uses the CC's RTO if it supplies one, else the C++ formula:
-    /// `max(count × (RTT + 4·RTTVar) + SYN, count × MIN_EXP_PER_COUNT)`.
+    /// Uses the CC's RTO if it supplies one, else the C++ formula with the
+    /// granularity term and the floor both taken from [`MIN_RECOVERY_US`]:
+    /// `max(count × (RTT + 4·RTTVar) + floor, count × floor)`.
+    ///
+    /// The floor depends on what the timer is *for*, because this one wears two
+    /// hats. With data outstanding it is the retransmission timeout and belongs
+    /// near the round trip. With nothing outstanding it only paces the
+    /// keep-alive in `on_timeout`'s `else` branch, which belongs at the control
+    /// interval — a millisecond keep-alive on an idle connection is a thousand
+    /// packets a second saying nothing.
+    ///
+    /// The reference uses its 10 ms `SYN` interval as the granularity term, and
+    /// that addend alone — not the floor beside it — is what pinned this at
+    /// ~10 ms however short the path.
     fn exp_int_us(&self) -> u64 {
         if let Some(rto) = self.cc_rto_us {
             return self.exp_count as u64 * rto;
         }
-        let rtt_based = self.exp_count as u64 * (self.rtt_us as u64 + 4 * self.rtt_var_us as u64)
-            + SYN_US as u64;
-        let min_based = self.exp_count as u64 * MIN_EXP_PER_COUNT_US;
+        let floor = if self.snd_buf_is_empty() { SYN_US as u64 } else { MIN_RECOVERY_US };
+        let rtt_based =
+            self.exp_count as u64 * (self.rtt_us as u64 + 4 * self.rtt_var_us as u64) + floor;
+        let min_based = self.exp_count as u64 * floor;
         rtt_based.max(min_based)
     }
 
@@ -1766,8 +1794,15 @@ impl Connection {
         self.cc_ack_period_us.unwrap_or(SYN_US as u64)
     }
 
+    /// Interval between repeat NAKs for gaps still outstanding.
+    ///
+    /// The first NAK goes out the moment a gap is spotted, in `recv_data`; this
+    /// paces the ones after it, and so it is what a *lost* NAK costs. Four round
+    /// trips is the reference's figure and is kept; the floor beneath it is not,
+    /// because at [`SYN_US`] a lost NAK on a fast path cost 10 ms — fifty round
+    /// trips to re-ask a question whose answer takes one.
     fn nak_int_us(&self) -> u64 {
-        (4 * self.rtt_us as u64).max(SYN_US as u64)
+        (4 * self.rtt_us as u64).max(MIN_RECOVERY_US)
     }
 
     fn ts(&self, now_us: u64) -> u32 {
@@ -2046,7 +2081,40 @@ mod tests {
         c.exp_count = 4;
         let fourth = c.exp_int_us();
         assert!(fourth > first, "the expiry timer should back off, not stay flat");
-        assert!(first >= MIN_EXP_PER_COUNT_US, "the interval should respect its floor");
+        assert!(first >= MIN_RECOVERY_US, "the interval should respect its floor");
+    }
+
+    /// The floor depends on whether the timer is retransmitting or only
+    /// keeping alive, and getting that backwards is a thousand keep-alives a
+    /// second on an idle connection.
+    #[test]
+    fn an_idle_connection_keeps_alive_at_the_control_interval() {
+        let mut c = connected(1_000_000);
+        c.rtt_us = 100;
+        c.rtt_var_us = 10;
+        c.exp_count = 1;
+
+        assert!(c.snd_buf_is_empty());
+        assert!(
+            c.exp_int_us() >= SYN_US as u64,
+            "an idle connection should not wake at the recovery floor: {}us",
+            c.exp_int_us()
+        );
+
+        // With something outstanding it becomes a retransmission timeout, and
+        // on a fast path that must be nowhere near the control interval.
+        let mut tx = TransmitBuf::new();
+        assert_eq!(
+            c.send_msg(Bytes::from(vec![0u8; 64]), None, true, 1_000_000, &mut tx),
+            SendOutcome::Queued
+        );
+        assert!(!c.snd_buf_is_empty());
+        assert!(
+            c.exp_int_us() < SYN_US as u64,
+            "a retransmission timeout should track the path, not the control \
+             interval: {}us",
+            c.exp_int_us()
+        );
     }
 
     #[test]
@@ -2063,9 +2131,12 @@ mod tests {
         let mut c = connected(1_000_000);
         c.rtt_us = 50_000;
         assert_eq!(c.nak_int_us(), 200_000, "should be four round trips");
-        // ...but never tighter than the control interval, however fast the link.
+        // ...down to the floor, which is the driver's timer granularity and
+        // deliberately not the control interval: re-asking a question whose
+        // answer takes one round trip should not cost fifty.
         c.rtt_us = 1;
-        assert_eq!(c.nak_int_us(), SYN_US as u64);
+        assert_eq!(c.nak_int_us(), MIN_RECOVERY_US);
+        assert!(MIN_RECOVERY_US < SYN_US as u64);
     }
 
     /// The receiver only records gaps above `rcv_curr_seq`, which is what keeps

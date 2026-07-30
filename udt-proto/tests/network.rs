@@ -609,35 +609,67 @@ fn loss_recovery_is_not_catastrophic() {
 /// cargo test -p udt-proto --test network loss_cost_table -- --ignored --nocapture
 /// ```
 ///
-/// Report the mean. A single seed ranges from 7x to 35x at 5% loss on nothing
-/// but which packets get dropped, so a one-seed comparison says nothing at all.
+/// Report the mean, over plenty of seeds. A single seed ranges from 1.6x to 53x
+/// at 5% loss on nothing but which packets get dropped, and even a five-seed
+/// mean moved 8% between two builds differing only in a timer floor — which read
+/// as a regression until sixteen seeds showed it was not.
+///
+/// # What this found
+///
+/// `amp` near 1.0 with a large `cwnd` and a stretched `pace_us` is the whole
+/// story of what loss costs here: the sender wastes almost nothing on the wire
+/// and is never window-bound, it is simply idle between packets because
+/// congestion control has widened the sending interval. At 10% loss the interval
+/// grows ~32x and the transfer takes ~50x.
+///
+/// Detection latency and window accounting were both investigated before this
+/// and are both red herrings — dropping the recovery timers from a 10 ms floor
+/// to 1 ms moved these figures by under 4%. The lever is in
+/// [`congestion::udt_cc`](../src/congestion/udt_cc.rs), not here.
 #[test]
 #[ignore = "measurement: prints a table, asserts nothing"]
 fn loss_cost_table() {
-    const SEEDS: [u64; 5] = [3, 17, 42, 77, 101];
+    const SEEDS: [u64; 16] = [3, 17, 42, 77, 101, 5, 23, 61, 89, 113, 7, 31, 53, 71, 97, 127];
     const MSGS: usize = 150;
     const SIZE: usize = 8192;
 
-    println!("\n  loss     mean     min     max   (x clean transfer time, {} seeds)", SEEDS.len());
+    // `amp` is datagrams put on the wire per datagram the clean run needed. It
+    // is what tells the two possible costs apart: near 1.0 means the sender is
+    // idle -- waiting on a timer or a closed window -- while a large value means
+    // it is busy sending data that was not needed. Guessing which without
+    // measuring it has been wrong twice.
+    println!(
+        "\n  loss     mean     min     max     amp    cwnd   pace_us   (x clean, {} seeds)",
+        SEEDS.len()
+    );
     for loss_pct in [0.0f64, 1.0, 2.0, 5.0, 10.0] {
-        let mut ratios = Vec::new();
+        let (mut ratios, mut amps, mut cwnds) = (Vec::new(), Vec::new(), Vec::new());
+        let mut paces = Vec::new();
         for seed in SEEDS {
             let mut clean = Sim::new(LinkConfig::perfect(), seed);
             clean.connect();
             let clean_us = clean.transfer(MSGS, SIZE, SendOpts::ordered());
+            let clean_sent = clean.a_to_b.sent;
 
             let mut lossy = Sim::new(LinkConfig::lossy(loss_pct / 100.0), seed);
             lossy.connect();
             let lossy_us = lossy.transfer(MSGS, SIZE, SendOpts::ordered());
 
             ratios.push(lossy_us as f64 / clean_us as f64);
+            amps.push(lossy.a_to_b.sent as f64 / clean_sent.max(1) as f64);
+            cwnds.push(lossy.a.stats().cwnd);
+            paces.push(lossy.a.stats().snd_period_us);
         }
         ratios.sort_by(f64::total_cmp);
-        let mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
         println!(
-            "  {loss_pct:>4.1}%  {mean:>7.2}  {:>6.2}  {:>6.2}",
+            "  {loss_pct:>4.1}%  {:>7.2}  {:>6.2}  {:>6.2}  {:>6.2}  {:>6.0}  {:>8.1}",
+            mean(&ratios),
             ratios[0],
             ratios[ratios.len() - 1],
+            mean(&amps),
+            mean(&cwnds),
+            mean(&paces),
         );
     }
     println!();
