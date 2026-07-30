@@ -687,6 +687,63 @@ fn loss_cost_table() {
     println!();
 }
 
+/// The same loss sweep on paths with a realistic round trip.
+///
+/// Everything else here runs at a 200 µs round trip, which is a local network.
+/// This protocol exists for long fat pipes, and every recovery timer is derived
+/// from the round-trip estimate — so a floor that is sensible at 200 µs can be
+/// nonsense at 100 ms. The repeat-NAK interval is four round trips with a 1 ms
+/// floor: fine locally, and twenty NAKs per round trip if the floor were ever
+/// what applied on a long path.
+///
+/// A measurement, not an assertion — the useful output is whether the cost of
+/// loss stays proportionate as the path lengthens.
+#[test]
+#[ignore = "measurement: prints a table, asserts nothing"]
+fn loss_cost_by_round_trip() {
+    const SEEDS: [u64; 8] = [3, 17, 42, 77, 101, 5, 23, 61];
+    const MSGS: usize = 60;
+    const SIZE: usize = 8192;
+
+    println!("\n  rtt      loss    ratio   clean_ms  lossy_ms   rev/fwd  ({} seeds)", SEEDS.len());
+    for one_way_us in [100u64, 5_000, 25_000, 100_000] {
+        for loss_pct in [0.0f64, 2.0, 5.0] {
+            let (mut ratios, mut cleans, mut lossies, mut revs) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for seed in SEEDS {
+                let clean_cfg = LinkConfig { delay_us: one_way_us, ..LinkConfig::perfect() };
+                let mut clean = Sim::new(clean_cfg, seed);
+                clean.connect();
+                let clean_us = clean.transfer(MSGS, SIZE, SendOpts::ordered());
+
+                let cfg = LinkConfig {
+                    loss: loss_pct / 100.0,
+                    delay_us: one_way_us,
+                    ..LinkConfig::perfect()
+                };
+                let mut lossy = Sim::new(cfg, seed);
+                lossy.connect();
+                let lossy_us = lossy.transfer(MSGS, SIZE, SendOpts::ordered());
+
+                ratios.push(lossy_us as f64 / clean_us as f64);
+                cleans.push(clean_us as f64 / 1000.0);
+                lossies.push(lossy_us as f64 / 1000.0);
+                revs.push(lossy.b_to_a.sent as f64 / lossy.a_to_b.sent.max(1) as f64);
+            }
+            let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+            println!(
+                "  {:>5}ms  {loss_pct:>4.1}%  {:>6.2}  {:>9.2}  {:>9.2}  {:>8.2}",
+                one_way_us * 2 / 1000,
+                mean(&ratios),
+                mean(&cleans),
+                mean(&lossies),
+                mean(&revs),
+            );
+        }
+    }
+    println!();
+}
+
 /// An idle connection must be nearly silent.
 ///
 /// The keep-alive exists to stop a NAT or stateful firewall forgetting the

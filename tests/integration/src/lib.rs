@@ -304,6 +304,40 @@ mod tests {
         }
     }
 
+    /// Closing tells the peer *why*, not just that.
+    ///
+    /// Every cause used to arrive as one `BrokenPipe`, so an application could
+    /// not tell a peer closing cleanly from a path that will not carry its
+    /// packets — opposite decisions: one says stop, the other says retry with a
+    /// smaller MTU.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closed_connection_says_why() {
+        use udt_async::DisconnectReason;
+
+        let (server, client) = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
+        assert_eq!(client.disconnect_reason(), None, "a live connection has no reason yet");
+
+        // The peer going away cleanly is a shutdown, and it reads as one.
+        drop(client);
+        let mut buf = vec![0u8; 1024];
+        let err = tokio::time::timeout(Duration::from_secs(5), server.recv(&mut buf))
+            .await
+            .expect("recv should not hang after the peer closed")
+            .expect_err("recv should fail once the peer has gone");
+
+        assert_eq!(
+            server.disconnect_reason(),
+            Some(DisconnectReason::Shutdown),
+            "a clean peer close should be reported as one, got {:?}",
+            server.disconnect_reason()
+        );
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::ConnectionAborted,
+            "the error kind should distinguish a peer close from anything else"
+        );
+    }
+
     // ── Streaming integrity ───────────────────────────────────────────────────
     //
     // Unlike the echo tests above, these keep many messages in flight at once so

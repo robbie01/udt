@@ -21,6 +21,36 @@ dry-runs the one it can.
 
 [UDT]: https://udt.sourceforge.io/
 
+## Security
+
+**UDT has no encryption and no authentication.** Nothing here adds any. On a
+path an attacker can read, every byte is in the clear; on a path an attacker can
+write to, they can forge data and control packets. Treat this as you would
+plain TCP: fine on a network you trust, not fine on the open internet by itself.
+
+Run something over it. A Noise handshake on the message stream gives roughly
+what TLS gives TCP, and suits peer-to-peer better because it needs no
+certificate authority. What that does **not** cover is the transport's own
+control packets — acknowledgements, loss reports, shutdown — which sit beneath
+the payload and stay forgeable. TCP+TLS has the same seam, which is why `RST`
+injection works there.
+
+What this does do about that:
+
+- The socket identifier a peer must match to be listened to is randomly chosen
+  rather than counted up from one, so blind injection needs a 32-bit guess.
+  Roughly what TCP gets by requiring an injected `RST` to land inside the
+  receive window.
+- No unauthenticated packet is fatal on its own. An acknowledgement for data
+  that was never sent, or an error signal, is dropped rather than closing the
+  connection — both were previously a one-packet kill from off path.
+- The handshake is stateless behind a cookie, so an unverified peer cannot make
+  a listener allocate anything, and the reply is no larger than the request.
+
+An on-path attacker can still deny service by forging a `Shutdown`, exactly as
+they can with a TCP `RST`. Nothing short of authenticating the control plane —
+which would break wire compatibility — fixes that.
+
 ## Layout
 
 | Crate | What it is |
@@ -191,8 +221,8 @@ the ranges go after the documented ACK body, and both the C++ fork and pristine
 upstream keep working against it, tested with a lossy relay and a count of
 extended ACKs on the wire.
 
-Loss now costs roughly what it should. Over sixteen simulator seeds, as a
-multiple of the clean transfer time:
+Loss costs much less than it did. As a multiple of the clean transfer time,
+over sixteen simulator seeds **on a 200 µs path**:
 
 | | at the start | now |
 |---|---|---|
@@ -200,6 +230,24 @@ multiple of the clean transfer time:
 | 2% loss | 12.92x | 1.30x |
 | 5% loss | 28.03x | 1.88x |
 | 10% loss | 49.98x | 5.26x |
+
+**Those are local-network numbers and do not carry.** On a path with a
+round trip worth having this protocol for, the same sweep
+(`loss_cost_by_round_trip`) reads:
+
+| round trip | 2% loss | 5% loss |
+|---|---|---|
+| 0.2 ms | 1.14x | 2.18x |
+| 10 ms | 7.16x | 8.32x |
+| 50 ms | 7.52x | 8.58x |
+| 200 ms | 7.25x | 8.39x |
+
+So loss on a real path costs seven to eight times the clean transfer, and that
+is the figure to plan around. Two things are reassuring in it: the ratio is flat
+from 10 ms to 200 ms, so the recovery timers scale with the path rather than
+falling apart on a long one, and reverse traffic stays at a tenth of forward
+throughout, so there is no acknowledgement or loss-report storm at distance.
+Closing the remaining gap is unfinished work.
 
 None of that came from congestion control, which is where it looked like it
 would. Four explanations were measured and discarded — pacing, the congestion

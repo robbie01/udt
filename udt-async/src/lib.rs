@@ -62,6 +62,14 @@
 //! [Tokio]: https://tokio.rs
 //! [`send`]: Socket::send
 //! [`recv`]: Socket::recv
+//! # Security
+//!
+//! UDT has no encryption and no authentication, and this crate adds none. On a
+//! path an attacker can read, every byte is in the clear; on one they can write
+//! to, they can forge data and control packets. Run a Noise handshake or
+//! similar over it, and note that this protects the payload only — the
+//! transport's own control packets sit beneath it, as they do under TLS.
+//!
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -77,3 +85,5 @@ pub use endpoint::{
 };
 
 pub use udt_proto::CcKind;
+/// Why a connection ended — see [`Socket::disconnect_reason`].
+pub use udt_proto::DisconnectReason;

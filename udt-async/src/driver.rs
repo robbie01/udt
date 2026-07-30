@@ -11,7 +11,7 @@
 //! [`crate::conn`] for the measurements.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 use tokio::net::UdpSocket;
@@ -55,6 +55,8 @@ struct Driver {
     blocked: Option<SendReq>,
     /// Resolved once the send buffer drains.
     pending_flush: Option<oneshot::Sender<()>>,
+    /// Where to record why this connection ended, for the application's benefit.
+    reason: Arc<OnceLock<DisconnectReason>>,
     done: bool,
 }
 
@@ -66,6 +68,7 @@ impl Driver {
         recv_tx: flume::Sender<Bytes>,
         connected_tx: Option<oneshot::Sender<()>>,
         io: BatchIo,
+        reason: Arc<OnceLock<DisconnectReason>>,
     ) -> Self {
         Driver {
             conn,
@@ -78,6 +81,7 @@ impl Driver {
             connected_tx,
             blocked: None,
             pending_flush: None,
+            reason,
             done: false,
         }
     }
@@ -95,6 +99,9 @@ impl Driver {
                 }
                 Event::Disconnected(reason) => {
                     debug_disconnect(&self.conn, reason);
+                    // Recorded before the channels drop, so the application's
+                    // next `send` or `recv` can say why rather than only that.
+                    let _ = self.reason.set(reason);
                     self.done = true;
                 }
             }
@@ -233,10 +240,11 @@ pub(crate) async fn run_owned(
     mut send_rx: mpsc::Receiver<SendReq>,
     recv_tx: flume::Sender<Bytes>,
     connected_tx: Option<oneshot::Sender<()>>,
+    reason: Arc<OnceLock<DisconnectReason>>,
 ) {
     let Ok(io) = BatchIo::new(&socket) else { return };
     let mut rx = RecvBuffers::new(&io);
-    let mut d = Driver::new(conn, socket, peer, recv_tx, connected_tx, io);
+    let mut d = Driver::new(conn, socket, peer, recv_tx, connected_tx, io, reason);
     let mut inbound: Vec<Inbound> = Vec::new();
 
     // Send the opening handshake.
@@ -309,13 +317,14 @@ pub(crate) async fn run_shared(
     mut send_rx: mpsc::Receiver<SendReq>,
     recv_tx: flume::Sender<Bytes>,
     connected_tx: Option<oneshot::Sender<()>>,
+    reason: Arc<OnceLock<DisconnectReason>>,
     on_exit: impl FnOnce(),
 ) {
     let Ok(io) = BatchIo::new(&socket) else {
         on_exit();
         return;
     };
-    let mut d = Driver::new(conn, socket, peer, recv_tx, connected_tx, io);
+    let mut d = Driver::new(conn, socket, peer, recv_tx, connected_tx, io, reason);
 
     d.conn.on_timer(now_us(), &mut d.tx, &mut d.events);
 

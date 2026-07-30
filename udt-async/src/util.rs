@@ -81,10 +81,6 @@ pub(crate) fn sockaddr_to_peer_addr(addr: SocketAddr) -> PeerAddr {
     }
 }
 
-pub(crate) fn closed() -> io::Error {
-    io::Error::new(io::ErrorKind::BrokenPipe, "connection closed")
-}
-
 /// Whether a socket error is about a datagram rather than about the socket.
 ///
 /// A UDP socket can report the fate of something it *already sent* on a later

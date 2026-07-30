@@ -73,6 +73,14 @@
 //! [`next_deadline_us`]: Connection::next_deadline_us
 //! [`send_msg`]: Connection::send_msg
 //! [`recv_msg`]: Connection::recv_msg
+//! # Security
+//!
+//! UDT has no encryption and no authentication, and this crate adds none. On a
+//! path an attacker can read, every byte is in the clear; on one they can write
+//! to, they can forge data and control packets. Run a Noise handshake or
+//! similar over it, and note that this protects the payload only — the
+//! transport's own control packets sit beneath it, as they do under TLS.
+//!
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 

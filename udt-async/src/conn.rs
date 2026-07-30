@@ -19,12 +19,12 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
-
-use crate::util::closed;
+use udt_proto::DisconnectReason;
 
 /// Work handed from the application to the driver.
 pub(crate) enum SendReq {
@@ -72,9 +72,60 @@ pub struct Socket {
     pub(crate) recv_rx: flume::Receiver<Bytes>,
     pub(crate) peer_addr: SocketAddr,
     pub(crate) local_addr: SocketAddr,
+    /// Why the connection ended, once it has.
+    ///
+    /// Written by the driver as it exits and read by every method that can
+    /// report a closed connection. Without it all five causes arrive as one
+    /// `BrokenPipe`, and an application cannot tell a peer closing cleanly from
+    /// a path that will not carry its packets — which are opposite decisions:
+    /// one says stop, the other says retry with a smaller MTU.
+    pub(crate) reason: Arc<OnceLock<DisconnectReason>>,
+}
+
+/// Turn a recorded reason into the error a caller sees.
+///
+/// The kinds are a coarse hint for code that matches on them; the precise
+/// answer is [`Socket::disconnect_reason`], which loses nothing.
+pub(crate) fn closed_with(reason: Option<DisconnectReason>) -> io::Error {
+    let (kind, msg) = match reason {
+        Some(DisconnectReason::Shutdown) => {
+            (io::ErrorKind::ConnectionAborted, "peer closed the connection")
+        }
+        Some(DisconnectReason::LocalClose) => {
+            (io::ErrorKind::BrokenPipe, "connection closed locally")
+        }
+        Some(DisconnectReason::Timeout) => (io::ErrorKind::TimedOut, "peer stopped responding"),
+        Some(DisconnectReason::PeerError) => {
+            (io::ErrorKind::InvalidData, "peer sent something unusable, or rejected the handshake")
+        }
+        Some(DisconnectReason::PathMtu) => (
+            io::ErrorKind::Other,
+            "the path did not carry any full-size packet, though the peer answered — \
+             retry with a smaller MTU",
+        ),
+        None => (io::ErrorKind::BrokenPipe, "connection closed"),
+    };
+    io::Error::new(kind, msg)
 }
 
 impl Socket {
+    /// Why the connection ended, or `None` while it is still up.
+    ///
+    /// The errors returned by [`send`](Self::send) and [`recv`](Self::recv)
+    /// carry a matching [`io::ErrorKind`], but several causes have no exact kind
+    /// and this does not lose them. [`DisconnectReason::PathMtu`] in particular
+    /// is worth acting on: the peer is reachable and the path will carry a
+    /// smaller packet, so reconnecting with a lower
+    /// [`EndpointConfig::mtu`](crate::EndpointConfig::mtu) is likely to work
+    /// where retrying unchanged will not.
+    pub fn disconnect_reason(&self) -> Option<DisconnectReason> {
+        self.reason.get().copied()
+    }
+
+    fn closed(&self) -> io::Error {
+        closed_with(self.disconnect_reason())
+    }
+
     /// Sends a message, preserving order relative to earlier sends.
     ///
     /// Waits if the send buffer is full.
@@ -116,7 +167,7 @@ impl Socket {
     ///
     /// As [`send`](Self::send).
     pub async fn send_bytes_with(&self, buf: Bytes, opts: SendOptions) -> io::Result<()> {
-        self.send_tx.send(opts.into_req(buf)).await.map_err(|_| closed())
+        self.send_tx.send(opts.into_req(buf)).await.map_err(|_| self.closed())
     }
 
     /// Sends a message if there is room to queue it, without waiting.
@@ -144,7 +195,7 @@ impl Socket {
             mpsc::error::TrySendError::Full(_) => {
                 io::Error::new(io::ErrorKind::WouldBlock, "send queue full")
             }
-            mpsc::error::TrySendError::Closed(_) => closed(),
+            mpsc::error::TrySendError::Closed(_) => self.closed(),
         })
     }
 
@@ -171,7 +222,7 @@ impl Socket {
     ///
     /// As [`recv`](Self::recv).
     pub async fn recv_bytes(&self) -> io::Result<Bytes> {
-        self.recv_rx.recv_async().await.map_err(|_| closed())
+        self.recv_rx.recv_async().await.map_err(|_| self.closed())
     }
 
     /// Receives a message if one is ready, without waiting.
@@ -188,7 +239,7 @@ impl Socket {
             Err(flume::TryRecvError::Empty) => {
                 Err(io::Error::new(io::ErrorKind::WouldBlock, "no message ready"))
             }
-            Err(flume::TryRecvError::Disconnected) => Err(closed()),
+            Err(flume::TryRecvError::Disconnected) => Err(self.closed()),
         }
     }
 
@@ -203,8 +254,8 @@ impl Socket {
     /// [`ErrorKind::BrokenPipe`]: std::io::ErrorKind::BrokenPipe
     pub async fn flush(&self) -> io::Result<()> {
         let (notify, done) = oneshot::channel();
-        self.send_tx.send(SendReq::Flush { notify }).await.map_err(|_| closed())?;
-        done.await.map_err(|_| closed())
+        self.send_tx.send(SendReq::Flush { notify }).await.map_err(|_| self.closed())?;
+        done.await.map_err(|_| self.closed())
     }
 
     /// The peer's address.
