@@ -1372,7 +1372,7 @@ impl Connection {
         self.state = ConnState::Connected;
         self.post_connect(peer_isn, mss, flow_wnd, now_us);
         if let Some(rtt) = handshake_rtt {
-            self.feed_rtt(rtt);
+            self.feed_rtt(rtt, now_us);
         }
         out.push(Event::Connected);
     }
@@ -1414,7 +1414,7 @@ impl Connection {
             // both underflows the subtraction and panics `abs`. It also
             // reaches the retransmission timer, so a peer could stretch or
             // collapse our timers at will.
-            self.feed_rtt(full.rtt_us.max(0) as u64);
+            self.feed_rtt(full.rtt_us.max(0) as u64, now_us);
             if full.avail_buf_pkts > 0 {
                 self.flow_wnd = (full.avail_buf_pkts as u32).min(MAX_FLOW_WND);
             }
@@ -1568,7 +1568,7 @@ impl Connection {
             if data_ack > self.rcv_last_ack_ack {
                 self.rcv_last_ack_ack = data_ack;
             }
-            self.feed_rtt(rtt_us as u64);
+            self.feed_rtt(rtt_us as u64, now_us);
         }
     }
 
@@ -1948,7 +1948,7 @@ impl Connection {
     /// therefore sat unreported for tens of milliseconds, and the stall inflated
     /// the estimate further. `loss_timeline` shows what that cost: at 5% loss,
     /// three stalls of 11-38 ms were 67 ms of a 74 ms transfer.
-    fn feed_rtt(&mut self, sample_us: u64) {
+    fn feed_rtt(&mut self, sample_us: u64, now_us: u64) {
         let sample = sample_us.min(MAX_REPORTED_RTT_US as u64) as i32;
         if sample <= 0 {
             return;
@@ -1957,6 +1957,17 @@ impl Connection {
             self.rtt_sampled = true;
             self.rtt_us = sample;
             self.rtt_var_us = sample / 2;
+            // Correcting the estimate is not enough on its own: `post_connect`
+            // has already armed the repeat-NAK timer at `now + 4 × RTT`, and at
+            // that point RTT was still the 10 ms guess, so the first chance to
+            // re-report a gap is forty milliseconds out. Until it comes round the
+            // only loss report is the immediate one `recv_data` sends on spotting
+            // a gap, so one lost NAK stalls the transfer for the rest of that
+            // interval — 38.5 ms of a 74 ms transfer, measured.
+            //
+            // Pulled in rather than reset: a timer already sooner than this was
+            // armed from something better than a guess.
+            self.next_nak_us = self.next_nak_us.min(now_us + self.nak_int_us());
             return;
         }
         let var = (sample - self.rtt_us).abs() / 4;
@@ -2442,16 +2453,24 @@ mod tests {
         let mut c = connected(1_000_000);
         assert_eq!(c.rtt_us, 10_000, "the opening guess should be the reference's");
 
-        c.feed_rtt(200);
+        // Armed from the guess, so forty milliseconds out.
+        c.next_nak_us = 1_000_000 + c.nak_int_us();
+        assert!(c.next_nak_us >= 1_040_000);
+
+        c.feed_rtt(200, 1_000_000);
         assert_eq!(c.rtt_us, 200, "the first measurement should replace, not blend");
+        assert!(
+            c.next_nak_us <= 1_000_000 + c.nak_int_us(),
+            "the NAK timer kept the interval it was armed with from the guess"
+        );
 
         // Later ones are smoothed, so a single outlier cannot capture it.
-        c.feed_rtt(10_000);
+        c.feed_rtt(10_000, 1_100_000);
         assert!(c.rtt_us < 1_500, "one slow sample moved the estimate to {}us", c.rtt_us);
 
         // Nonsense is ignored rather than folded in.
         let before = c.rtt_us;
-        c.feed_rtt(0);
+        c.feed_rtt(0, 1_200_000);
         assert_eq!(c.rtt_us, before);
     }
 
