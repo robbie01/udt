@@ -639,13 +639,14 @@ fn loss_cost_table() {
     // it is busy sending data that was not needed. Guessing which without
     // measuring it has been wrong twice.
     println!(
-        "\n  loss   ratio   clean_ms  lossy_ms     amp    cwnd   pace_us  ({} seeds)",
+        "\n  loss   ratio   clean_ms  lossy_ms     amp    cwnd   pace_us   rtt_us  ({} seeds)",
         SEEDS.len()
     );
     for loss_pct in [0.0f64, 1.0, 2.0, 5.0, 10.0] {
         let (mut ratios, mut amps, mut cwnds) = (Vec::new(), Vec::new(), Vec::new());
         let mut paces = Vec::new();
         let (mut cleans, mut lossies) = (Vec::new(), Vec::new());
+        let mut rtts = Vec::new();
         for seed in SEEDS {
             let mut clean = Sim::new(LinkConfig::perfect(), seed);
             clean.connect();
@@ -662,17 +663,19 @@ fn loss_cost_table() {
             amps.push(lossy.a_to_b.sent as f64 / clean_sent.max(1) as f64);
             cwnds.push(lossy.a.stats().cwnd);
             paces.push(lossy.a.stats().snd_period_us);
+            rtts.push(lossy.a.stats().rtt_us as f64);
         }
         ratios.sort_by(f64::total_cmp);
         let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
         println!(
-            "  {loss_pct:>4.1}%  {:>6.2}  {:>9.3}  {:>9.3}  {:>6.2}  {:>6.0}  {:>8.1}",
+            "  {loss_pct:>4.1}%  {:>6.2}  {:>9.3}  {:>9.3}  {:>6.2}  {:>6.0}  {:>8.1}  {:>7.0}",
             mean(&ratios),
             mean(&cleans),
             mean(&lossies),
             mean(&amps),
             mean(&cwnds),
             mean(&paces),
+            mean(&rtts),
         );
     }
     println!();
@@ -701,7 +704,42 @@ fn the_round_trip_estimate_reflects_the_path() {
     for (who, rtt) in [("a", sim.a.stats().rtt_us), ("b", sim.b.stats().rtt_us)] {
         assert!(rtt < 2_000, "{who} drifted to {rtt}us over a clean transfer");
     }
+
+    // The same under loss, where the handshake takes retransmits and the seed
+    // comes from the last request rather than the first.
+    let mut lossy = Sim::new(LinkConfig::lossy(0.05), 3);
+    lossy.connect();
+    for (who, rtt) in [("a", lossy.a.stats().rtt_us), ("b", lossy.b.stats().rtt_us)] {
+        assert!(rtt > 0 && rtt < 2_000, "{who} opened at {rtt}us through loss");
+    }
 }
+
+/// A timer armed from the opening guess has to be corrected once the path is
+/// known, not left to expire on the guess.
+///
+/// `post_connect` arms the repeat-NAK timer at `now + 4 × RTT`, and with the
+/// 10 ms guess that is 40 ms away. Until it fires the only loss report is the
+/// immediate one `recv_data` sends on spotting a gap, so one lost NAK stalls
+/// the transfer for the rest of that interval — 38.5 ms of a 74 ms transfer,
+/// measured. It matters most on the listener-accepted side, which has no
+/// handshake round trip to seed from and so still opens on the guess.
+#[test]
+fn a_nak_timer_armed_from_the_guess_is_pulled_in_once_the_path_is_known() {
+    let mut sim = Sim::new(LinkConfig::perfect(), 5);
+    sim.connect();
+
+    // A gap has to be re-reportable within a few round trips of the connection
+    // opening, not tens of milliseconds.
+    let due_in = sim.b.next_deadline_us().expect("connected") - sim.now;
+    assert!(
+        due_in <= 4 * SYN_US_APPROX,
+        "the receiver's next timer is {due_in}us out, so a lost NAK waits that long"
+    );
+}
+
+/// The control interval, for tests that need to reason in units of it. Not
+/// exported by the crate, and duplicating it here beats making it public.
+const SYN_US_APPROX: u64 = 10_000;
 
 /// Where the time actually goes during a lossy transfer.
 ///
