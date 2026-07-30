@@ -67,6 +67,36 @@ pub(crate) fn closed() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "connection closed")
 }
 
+/// Whether a socket error is about a datagram rather than about the socket.
+///
+/// A UDP socket can report the fate of something it *already sent* on a later
+/// call: an ICMP unreachable comes back, and the next `recv` or `send` surfaces
+/// it. The socket is fine. Treating it as fatal throws away a working endpoint
+/// because one peer went away.
+///
+/// This is not a hypothetical tidy-up. Windows raises `WSAECONNRESET` this way
+/// on *unconnected* sockets, which is exactly what an endpoint's shared socket
+/// is, and `quinn-udp` does not set `SIO_UDP_CONNRESET` to suppress it. With
+/// four clients connecting to one listener at once, some datagram reaches a port
+/// that has already gone, and the endpoint's reader — which used to return on
+/// any error at all — died. Every connection on that port then failed at once:
+/// `s6_multi_connection_same_listener` on `windows-latest` timed out on connect
+/// and accept and saw a live connection report `BrokenPipe`.
+///
+/// Suppressing it at the socket would need `SIO_UDP_CONNRESET`, and there is no
+/// safe API for that, so it is handled where it surfaces instead.
+pub(crate) fn is_transient(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::Interrupted
+    )
+}
+
 /// Size the kernel socket buffers before handing the socket to tokio.
 ///
 /// This matters more than it looks. With the OS defaults — tens to a few

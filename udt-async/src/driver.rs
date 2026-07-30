@@ -101,7 +101,11 @@ impl Driver {
         }
 
         if !self.tx.is_empty() {
-            if self.io.send_all(&self.socket, self.peer, &self.tx).await.is_err() {
+            // A send can report an earlier datagram's ICMP response rather than
+            // anything wrong here, so it is not on its own grounds to close.
+            if let Err(e) = self.io.send_all(&self.socket, self.peer, &self.tx).await
+                && !crate::util::is_transient(&e)
+            {
                 self.done = true;
             }
             self.tx.clear();
@@ -247,7 +251,11 @@ pub(crate) async fn run_owned(
 
         tokio::select! {
             result = d.io.recv_batch(&d.socket, &mut rx.storage, &mut rx.metas) => {
-                let Ok(mut count) = result else { return };
+                let mut count = match result {
+                    Ok(n) => n,
+                    Err(e) if crate::util::is_transient(&e) => continue,
+                    Err(_) => return,
+                };
                 // One call may return several datagrams via recvmmsg, and each
                 // buffer several more coalesced by receive offload. Where the
                 // platform has neither, this loop keeps one wakeup from costing

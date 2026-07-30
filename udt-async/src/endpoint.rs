@@ -435,6 +435,9 @@ async fn run_reader(ep: Arc<EndpointInner>) {
         let count = tokio::select! {
             result = io.recv_batch(&ep.socket, &mut rx.storage, &mut rx.metas) => match result {
                 Ok(n) => n,
+                // Every connection on this port depends on this task, so an
+                // error about one departed peer must not end it.
+                Err(e) if crate::util::is_transient(&e) => continue,
                 Err(_) => return,
             },
             _ = ep.wind_down.notified() => {
