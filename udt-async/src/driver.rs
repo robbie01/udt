@@ -38,6 +38,19 @@ const SEND_DRAIN_CAP: usize = 32;
 /// How long the driver parks when the state machine wants no timer at all.
 const IDLE_TICK: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The two things a driver publishes for its `Socket` to read.
+///
+/// Bundled because they are always created, cloned and passed together, and
+/// threading them separately through both entry points pushed the argument
+/// count past what is readable.
+#[derive(Clone, Default)]
+pub(crate) struct Shared {
+    /// Why the connection ended, once it has.
+    pub(crate) reason: Arc<OnceLock<DisconnectReason>>,
+    /// Latest protocol state, republished each wakeup.
+    pub(crate) stats: Arc<OnceLock<crate::util::Mutex<udt_proto::ConnectionStats>>>,
+}
+
 /// Everything a driver needs, whatever its datagrams arrive on.
 struct Driver {
     conn: Connection,
@@ -55,8 +68,8 @@ struct Driver {
     blocked: Option<SendReq>,
     /// Resolved once the send buffer drains.
     pending_flush: Option<oneshot::Sender<()>>,
-    /// Where to record why this connection ended, for the application's benefit.
-    reason: Arc<OnceLock<DisconnectReason>>,
+    /// What this driver reports back to its `Socket`.
+    shared: Shared,
     done: bool,
 }
 
@@ -68,7 +81,7 @@ impl Driver {
         recv_tx: flume::Sender<Bytes>,
         connected_tx: Option<oneshot::Sender<()>>,
         io: BatchIo,
-        reason: Arc<OnceLock<DisconnectReason>>,
+        shared: Shared,
     ) -> Self {
         Driver {
             conn,
@@ -81,14 +94,26 @@ impl Driver {
             connected_tx,
             blocked: None,
             pending_flush: None,
-            reason,
+            shared,
             done: false,
+        }
+    }
+
+    /// Republish protocol state where `Socket::stats` can read it.
+    fn publish_stats(&self) {
+        let snapshot = self.conn.stats();
+        match self.shared.stats.get() {
+            Some(m) => *crate::util::lock(m) = snapshot,
+            None => {
+                let _ = self.shared.stats.set(crate::util::Mutex::new(snapshot));
+            }
         }
     }
 
     /// Write everything the state machine queued, then hand completed messages
     /// to the application.
     async fn flush(&mut self) {
+        self.publish_stats();
         for event in self.events.drain(..) {
             match event {
                 Event::DataReady => {}
@@ -101,7 +126,7 @@ impl Driver {
                     debug_disconnect(&self.conn, reason);
                     // Recorded before the channels drop, so the application's
                     // next `send` or `recv` can say why rather than only that.
-                    let _ = self.reason.set(reason);
+                    let _ = self.shared.reason.set(reason);
                     self.done = true;
                 }
             }
@@ -240,11 +265,11 @@ pub(crate) async fn run_owned(
     mut send_rx: mpsc::Receiver<SendReq>,
     recv_tx: flume::Sender<Bytes>,
     connected_tx: Option<oneshot::Sender<()>>,
-    reason: Arc<OnceLock<DisconnectReason>>,
+    shared: Shared,
 ) {
     let Ok(io) = BatchIo::new(&socket) else { return };
     let mut rx = RecvBuffers::new(&io);
-    let mut d = Driver::new(conn, socket, peer, recv_tx, connected_tx, io, reason);
+    let mut d = Driver::new(conn, socket, peer, recv_tx, connected_tx, io, shared);
     let mut inbound: Vec<Inbound> = Vec::new();
 
     // Send the opening handshake.
@@ -317,14 +342,14 @@ pub(crate) async fn run_shared(
     mut send_rx: mpsc::Receiver<SendReq>,
     recv_tx: flume::Sender<Bytes>,
     connected_tx: Option<oneshot::Sender<()>>,
-    reason: Arc<OnceLock<DisconnectReason>>,
+    shared: Shared,
     on_exit: impl FnOnce(),
 ) {
     let Ok(io) = BatchIo::new(&socket) else {
         on_exit();
         return;
     };
-    let mut d = Driver::new(conn, socket, peer, recv_tx, connected_tx, io, reason);
+    let mut d = Driver::new(conn, socket, peer, recv_tx, connected_tx, io, shared);
 
     d.conn.on_timer(now_us(), &mut d.tx, &mut d.events);
 

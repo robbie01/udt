@@ -304,6 +304,41 @@ mod tests {
         }
     }
 
+    /// A live connection can be inspected.
+    ///
+    /// `ConnectionStats` existed in the protocol crate and was unreachable from
+    /// here, so an operator had no view of round-trip time, window or backlog on
+    /// a connection that was misbehaving.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_connection_can_be_inspected() {
+        let (server, client) = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
+
+        let payload = vec![0x33u8; 64 * 1024];
+        client.send(&payload).await.expect("send failed");
+        let mut buf = vec![0u8; payload.len() * 2];
+        let n = tokio::time::timeout(Duration::from_secs(5), server.recv(&mut buf))
+            .await
+            .expect("recv timed out")
+            .expect("recv failed");
+        assert_eq!(n, payload.len());
+
+        let s = client.stats().expect("a connected socket should report state");
+        assert!(s.connected, "reported as not connected while it plainly is");
+        assert!(s.rtt_us > 0, "no round-trip estimate");
+        assert!(s.cwnd > 0.0, "no congestion window");
+
+        // And it stops reporting rather than going stale once the peer is gone.
+        drop(server);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while client.stats().is_some_and(|s| s.connected) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !client.stats().is_some_and(|s| s.connected),
+            "still reporting a live connection after the peer went away"
+        );
+    }
+
     /// Closing tells the peer *why*, not just that.
     ///
     /// Every cause used to arrive as one `BrokenPipe`, so an application could

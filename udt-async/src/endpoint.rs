@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 use tokio::net::{ToSocketAddrs, UdpSocket};
@@ -286,7 +286,7 @@ impl Endpoint {
         let (send_tx, send_rx) = mpsc::channel::<SendReq>(SEND_BACKLOG);
         let (recv_tx, recv_rx) = flume::bounded::<Bytes>(RECV_BACKLOG);
         let (connected_tx, connected) = oneshot::channel::<()>();
-        let reason = Arc::new(OnceLock::new());
+        let shared = driver::Shared::default();
         tokio::spawn(driver::run_owned(
             conn,
             socket,
@@ -294,13 +294,20 @@ impl Endpoint {
             send_rx,
             recv_tx,
             Some(connected_tx),
-            Arc::clone(&reason),
+            shared.clone(),
         ));
 
         connected
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect handshake failed"))?;
-        Ok(Socket { send_tx, recv_rx, peer_addr: peer, local_addr, reason })
+        Ok(Socket {
+            send_tx,
+            recv_rx,
+            peer_addr: peer,
+            local_addr,
+            reason: shared.reason,
+            stats: shared.stats,
+        })
     }
 
     /// Connects to a peer that is calling this at the same time.
@@ -403,7 +410,7 @@ fn spawn_shared(
 
     let udp = Arc::clone(&ep.socket);
     let owner = Arc::clone(ep);
-    let reason: Arc<OnceLock<udt_proto::DisconnectReason>> = Arc::new(OnceLock::new());
+    let shared = driver::Shared::default();
     tokio::spawn(driver::run_shared(
         conn,
         udp,
@@ -412,11 +419,18 @@ fn spawn_shared(
         send_rx,
         recv_tx,
         Some(connected_tx),
-        Arc::clone(&reason),
+        shared.clone(),
         move || owner.remove_route(peer),
     ));
 
-    let socket = Socket { send_tx, recv_rx, peer_addr: peer, local_addr: ep.local_addr, reason };
+    let socket = Socket {
+        send_tx,
+        recv_rx,
+        peer_addr: peer,
+        local_addr: ep.local_addr,
+        reason: shared.reason,
+        stats: shared.stats,
+    };
     (socket, connected)
 }
 

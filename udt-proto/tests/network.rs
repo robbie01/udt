@@ -55,11 +55,45 @@ struct LinkConfig {
     /// Silently discard anything larger than this, modelling a path whose MTU
     /// is smaller than the connection negotiated.
     mtu_limit: Option<usize>,
+    /// Bottleneck rate in bits per second, or `None` for a link that carries
+    /// everything offered to it instantly.
+    ///
+    /// Without one there is no queue, and without a queue there is nothing to
+    /// overfill — so a sender that asks for more than the path holds is never
+    /// corrected, and the delay it inflicts on itself never appears. Two real
+    /// defects hid behind that: the congestion window's positive feedback loop,
+    /// and every figure in this file being measured against an infinitely fast
+    /// link.
+    capacity_bps: Option<u64>,
+    /// How much queue the bottleneck will hold before dropping, as the time it
+    /// would take to drain. Milliseconds of buffer is how the hardware is
+    /// usually described, and it scales with the rate the way a packet count
+    /// does not.
+    buffer_us: u64,
 }
 
 impl LinkConfig {
     fn perfect() -> Self {
-        LinkConfig { loss: 0.0, duplicate: 0.0, delay_us: 100, jitter_us: 0, mtu_limit: None }
+        LinkConfig {
+            loss: 0.0,
+            duplicate: 0.0,
+            delay_us: 100,
+            jitter_us: 0,
+            mtu_limit: None,
+            capacity_bps: None,
+            buffer_us: 0,
+        }
+    }
+
+    /// A path with a real bottleneck: `mbps` of capacity, `rtt_ms` of round
+    /// trip, and `buffer_ms` of queue before it starts dropping.
+    fn bottleneck(mbps: u64, rtt_ms: u64, buffer_ms: u64) -> Self {
+        LinkConfig {
+            delay_us: rtt_ms * 1000 / 2,
+            capacity_bps: Some(mbps * 1_000_000),
+            buffer_us: buffer_ms * 1000,
+            ..Self::perfect()
+        }
     }
 
     fn lossy(loss: f64) -> Self {
@@ -85,11 +119,24 @@ struct Link {
     inflight: Vec<(u64, bytes::Bytes)>,
     sent: u64,
     dropped: u64,
+    /// When the bottleneck finishes with everything already queued on it.
+    /// Anything offered before then waits, which is what a queue is.
+    busy_until_us: u64,
+    /// Largest queue seen, as drain time.
+    peak_queue_us: u64,
 }
 
 impl Link {
     fn new(cfg: LinkConfig, seed: u64) -> Self {
-        Link { cfg, rng: Rng::new(seed), inflight: Vec::new(), sent: 0, dropped: 0 }
+        Link {
+            cfg,
+            rng: Rng::new(seed),
+            inflight: Vec::new(),
+            sent: 0,
+            dropped: 0,
+            busy_until_us: 0,
+            peak_queue_us: 0,
+        }
     }
 
     fn send(&mut self, now: u64, datagram: bytes::Bytes) {
@@ -102,7 +149,28 @@ impl Link {
             self.dropped += 1;
             return;
         }
-        let arrival = now + self.cfg.delay_us + self.rng.range(self.cfg.jitter_us);
+
+        // Serialisation: a bottleneck can only put one packet on the wire at a
+        // time, so a burst queues behind itself and the queue is what a sender
+        // has to learn not to build.
+        let ready_us = match self.cfg.capacity_bps {
+            None => now,
+            Some(bps) => {
+                let start = now.max(self.busy_until_us);
+                let queued_us = start - now;
+                self.peak_queue_us = self.peak_queue_us.max(queued_us);
+                if queued_us > self.cfg.buffer_us {
+                    // Tail drop: the queue is full.
+                    self.dropped += 1;
+                    return;
+                }
+                let serialise_us = (datagram.len() as u64 * 8 * 1_000_000) / bps;
+                self.busy_until_us = start + serialise_us.max(1);
+                self.busy_until_us
+            }
+        };
+
+        let arrival = ready_us + self.cfg.delay_us + self.rng.range(self.cfg.jitter_us);
         self.inflight.push((arrival, datagram.clone()));
         if self.rng.chance(self.cfg.duplicate) {
             let again = now + self.cfg.delay_us + self.rng.range(self.cfg.jitter_us);
@@ -738,6 +806,67 @@ fn loss_cost_by_round_trip() {
                 mean(&cleans),
                 mean(&lossies),
                 mean(&revs),
+            );
+        }
+    }
+    println!();
+}
+
+/// What a transfer costs on a path with a real bottleneck.
+///
+/// Every other measurement here runs on a link that carries whatever is offered
+/// to it instantly, so there is no queue, nothing to overfill, and a sender that
+/// asks for more than the path holds is never corrected. That hid the congestion
+/// window's positive feedback loop completely — it took a separate model to see
+/// it — and it means throughput figures from this file describe an infinitely
+/// fast link.
+///
+/// `queue_ms` is the standing delay the transfer inflicts on itself, which is
+/// what a competing flow on the same bottleneck would experience.
+#[test]
+#[ignore = "measurement: prints a table, asserts nothing"]
+fn cost_on_a_bottleneck() {
+    const SEEDS: [u64; 6] = [3, 17, 42, 77, 101, 5];
+    // Large enough that the control loop reaches steady state: at 60 messages
+    // the window formula barely matters, and every difference between one and
+    // another is slow-start overshoot.
+    const MSGS: usize = 600;
+    const SIZE: usize = 8192;
+
+    println!(
+        "\n  link                    loss   ratio  goodput_mbps  queue_ms  drops  ({} seeds)",
+        SEEDS.len()
+    );
+    for (label, mbps, rtt_ms, buf_ms) in [
+        ("100mbit 10ms 50ms buf", 100u64, 10u64, 50u64),
+        ("100mbit 50ms 50ms buf", 100, 50, 50),
+        ("10mbit 50ms 100ms buf", 10, 50, 100),
+    ] {
+        for loss_pct in [0.0f64, 2.0] {
+            let (mut ratios, mut mbps_got, mut queues, mut drops) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for seed in SEEDS {
+                let base = LinkConfig::bottleneck(mbps, rtt_ms, buf_ms);
+                let mut clean = Sim::new(base, seed);
+                clean.connect();
+                let clean_us = clean.transfer(MSGS, SIZE, SendOpts::ordered());
+
+                let mut sim = Sim::new(LinkConfig { loss: loss_pct / 100.0, ..base }, seed);
+                sim.connect();
+                let us = sim.transfer(MSGS, SIZE, SendOpts::ordered());
+
+                ratios.push(us as f64 / clean_us as f64);
+                mbps_got.push((MSGS * SIZE * 8) as f64 / us as f64);
+                queues.push(sim.a_to_b.peak_queue_us as f64 / 1000.0);
+                drops.push(sim.a_to_b.dropped as f64);
+            }
+            let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+            println!(
+                "  {label:<22}  {loss_pct:>4.1}%  {:>6.2}  {:>12.1}  {:>8.1}  {:>5.0}",
+                mean(&ratios),
+                mean(&mbps_got),
+                mean(&queues),
+                mean(&drops),
             );
         }
     }

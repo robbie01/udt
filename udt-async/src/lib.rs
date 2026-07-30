@@ -85,5 +85,7 @@ pub use endpoint::{
 };
 
 pub use udt_proto::CcKind;
+/// A snapshot of protocol state — see [`Socket::stats`].
+pub use udt_proto::ConnectionStats;
 /// Why a connection ended — see [`Socket::disconnect_reason`].
 pub use udt_proto::DisconnectReason;

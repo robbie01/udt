@@ -24,7 +24,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
-use udt_proto::DisconnectReason;
+use udt_proto::{ConnectionStats, DisconnectReason};
+
+use crate::util::{Mutex, lock};
 
 /// Work handed from the application to the driver.
 pub(crate) enum SendReq {
@@ -72,6 +74,13 @@ pub struct Socket {
     pub(crate) recv_rx: flume::Receiver<Bytes>,
     pub(crate) peer_addr: SocketAddr,
     pub(crate) local_addr: SocketAddr,
+    /// Latest protocol state, republished by the driver as it runs.
+    ///
+    /// A mutex rather than a channel because a reader only ever wants the most
+    /// recent value, and an unread channel would either grow or block the
+    /// driver. Uncontended in practice: the driver writes once per wakeup and
+    /// nothing reads it unless asked.
+    pub(crate) stats: Arc<OnceLock<Mutex<ConnectionStats>>>,
     /// Why the connection ended, once it has.
     ///
     /// Written by the driver as it exits and read by every method that can
@@ -120,6 +129,17 @@ impl Socket {
     /// where retrying unchanged will not.
     pub fn disconnect_reason(&self) -> Option<DisconnectReason> {
         self.reason.get().copied()
+    }
+
+    /// A snapshot of the connection's protocol state.
+    ///
+    /// Round-trip estimate, congestion window, what is in flight, what is
+    /// waiting to be retransmitted. `None` once the connection has closed.
+    ///
+    /// For logging and diagnosis, not for control: the field set follows
+    /// whatever the protocol happens to track and is not stable.
+    pub fn stats(&self) -> Option<ConnectionStats> {
+        self.stats.get().map(|s| *lock(s))
     }
 
     fn closed(&self) -> io::Error {

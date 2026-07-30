@@ -83,8 +83,24 @@ impl UdtCc {
     ///
     /// The minimum is the path without a queue, so the same formula against it
     /// asks for a bounded amount and the loop is broken. Delay-based
-    /// controllers all do some version of this; it is the one line that stops
-    /// this one filling whatever buffer it meets.
+    /// controllers all do some version of this.
+    ///
+    /// **It is a trade, not a free win**, and the fluid model overstates it.
+    /// Against a packet-level bottleneck (`cost_on_a_bottleneck`, 5 MB over
+    /// 100 Mbit/50 ms and 10 Mbit/50 ms links) it reliably buys lower queueing
+    /// delay and fewer self-inflicted drops — 154 against 354 on the slow link
+    /// with no link loss at all, and 25.8 ms of standing queue against 44.4 ms
+    /// — and it costs goodput once the path is also losing packets, 19.5 Mbit/s
+    /// against 29.6 in the worst case measured.
+    ///
+    /// Kept because a transfer that fills someone's uplink buffer degrades
+    /// everything else sharing it, and this is meant for peer-to-peer use on
+    /// connections their owners are also using. A deployment that wants the
+    /// throughput instead should take `rtt_us` here and accept the queue.
+    ///
+    /// Neither choice addresses slow start, which overshoots the buffer on
+    /// every link measured and accounts for most of the drops in the clean
+    /// runs.
     fn window_for(&self, rcv_rate_pps: f64, rtt_us: f64) -> f64 {
         let base = self.min_rtt_us.unwrap_or(rtt_us);
         rcv_rate_pps / 1_000_000.0 * (base + self.rc_interval_us as f64) + 16.0
