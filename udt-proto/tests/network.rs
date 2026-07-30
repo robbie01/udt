@@ -590,12 +590,14 @@ fn loss_recovery_is_not_catastrophic() {
     }
 
     let mean = total / SEEDS.len() as f64;
-    // Printed because the bound is loose on purpose -- a single seed ranges from
-    // 7x to 35x on drop pattern alone, so the assert can only catch a collapse.
-    // The number itself is what tells you whether a change to loss recovery did
-    // anything, and `--nocapture` is how you see it.
+    // The seeds are fixed and time is virtual, so this figure is exact rather
+    // than sampled, which is what lets the bound sit close to it. It has come a
+    // long way: 30x when this test was written, 1.6x now that the recovery
+    // stalls are gone. Four is roughly twice the measured cost -- room for
+    // ordinary drift, tight enough that a returning stall fails here instead of
+    // being absorbed by a bound set for the old behaviour.
     println!("[loss 5%] {mean:.1}x the clean transfer time, mean of {} seeds", SEEDS.len());
-    assert!(mean < 50.0, "5% loss cost {mean:.1}x on average -- recovery is not proportional");
+    assert!(mean < 4.0, "5% loss cost {mean:.1}x on average -- recovery is not proportional");
 }
 
 /// What loss actually costs, across a range of drop rates.

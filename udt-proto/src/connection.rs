@@ -1850,38 +1850,38 @@ impl Connection {
             None => {
                 // New data — this is what the congestion/flow window limits.
                 //
-                // Selectively acknowledged packets are deliberately *not*
-                // discounted here, though they are off the path and the whole
-                // point of tracking them was to discount them.
+                // Packets the peer has selectively acknowledged are discounted
+                // here: they are off the path, so counting them would pin the
+                // window behind a hole that has already been worked around.
                 //
-                // The reason is that the window is not what limits this. Over
-                // 32 seeds of `loss_cost_table`, cwnd sits at 144-250 packets
-                // while the pacing interval — the sending *rate* congestion
-                // control asks for — is what the sender actually waits on, and
-                // amplification stays near 1.0 throughout. Loss costs 5-50x
-                // here because of `udt_cc`, not because a hole pins the window.
-                //
-                // So discounting cannot help by the mechanism it was built for,
-                // and measurement agrees it is not helping by any other. Asked
-                // twice, the second time after the round-trip estimate was fixed
-                // and the numbers had moved a long way:
+                // This was off for most of its life, and correctly so. While the
+                // recovery stalls were in place the window was almost never what
+                // limited this sender -- it sat idle on timers instead -- so
+                // discounting could not help by its own mechanism, and measured
+                // mixed in sign twice. With those fixed the window binds, and the
+                // third measurement is unambiguous over 32 seeds:
                 //
                 //           off      on
-                //    1%     5.43    3.91    28% better
-                //    2%    11.35   13.08    15% worse
-                //    5%    17.80   18.91     6% worse
-                //   10%    24.90   22.11    11% better
+                //    1%     1.42    1.10    23% better
+                //    2%     1.78    1.30    27% better
+                //    5%     3.11    1.88    40% better
+                //   10%     5.05    5.26     4% worse
                 //
-                // Mixed in sign both times, and the pacing interval roughly
-                // doubles when it is on, so what movement there is comes from
-                // perturbing the rate controller rather than from freeing the
-                // window. Turning it on would be adopting an accident.
+                // Every secondary number agrees, which is what settles it after
+                // two rejections: amplification comes down rather than up, so
+                // the extra data in flight is not bought with retransmissions;
+                // reverse traffic comes down; and the pacing interval comes down
+                // too, where enabling this used to roughly double it. The 10%
+                // case is inside the noise of a mean whose spread is wide.
                 //
-                // Everything behind it stays wired and `snd_sacked_len` is in
-                // `ConnectionStats`; re-enabling is this one `saturating_sub`.
-                // Worth revisiting once the rate controller is addressed, which
-                // is the actual lever.
-                let in_flight = self.snd_buf.as_ref().map_or(0, |b| b.in_flight());
+                // Saturating because the subtrahend traces back to a number the
+                // peer chose. `apply_sack` bounds the ranges it will accept, and
+                // this is the second line of defence behind that.
+                let in_flight = self
+                    .snd_buf
+                    .as_ref()
+                    .map_or(0, |b| b.in_flight())
+                    .saturating_sub(self.snd_sacked.len());
                 let max_flight = (self.cwnd.min(self.flow_wnd as f64)) as usize;
                 if in_flight >= max_flight {
                     return false;

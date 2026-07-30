@@ -1,28 +1,23 @@
 # Selective acknowledgement
 
-**Status: half-shipped on purpose.** The wire half is in and working. The half
-that would actually speed anything up is written, measured, and switched off.
+**Status: shipped and enabled.**
 
-- **Discounting acknowledged packets from the congestion window is a bad
-  trade.** It helps where loss is heavy and hurts where it is light, and real
-  paths are light:
+The wire half went in first and the window discount was left off for a long
+while, correctly: two measurements found it mixed in sign, and the mechanism
+argument was against it because the window was almost never what limited the
+sender. It sat idle on timers instead.
 
-  | | before | after | |
-  |---|---|---|---|
-  | 1% loss | 2.41x | 3.60x | 49% worse |
-  | 2% loss | 11.85x | 19.19x | 62% worse |
-  | 5% loss | 30.58x | 24.25x | 21% better |
-  | 10% loss | 49.92x | 37.88x | 24% better |
+Once those stalls were fixed (see "What it was worth") the window does bind, and
+the third measurement over 32 seeds is unambiguous — 23% better at 1% loss, 27%
+at 2%, 40% at 5%, and 4% worse at 10%, inside the noise. Amplification, reverse
+traffic and the pacing interval all improve with it on, where enabling it used to
+roughly double the pacing. So it is on.
 
-  Cost of loss as a multiple of the clean transfer time, meaned over five seeds
-  of the deterministic simulator. So `pack_data` keeps counting them, with a
-  comment saying why, and everything behind it stays wired up ready.
-
-- **Compatibility is settled.** Both the fork and pristine upstream keep
-  working against a Rust receiver whose ACKs carry ranges they know nothing
-  about — `cpp_tolerates_our_extended_acks` and
-  `upstream_tolerates_our_extended_acks` on the harness branch, each counting
-  extended ACKs on the wire so a clean link cannot pass for proof.
+Compatibility is settled: both the fork and pristine upstream keep working
+against a receiver whose ACKs carry ranges they know nothing about —
+`cpp_tolerates_our_extended_acks` and `upstream_tolerates_our_extended_acks` on
+the harness branch, each counting extended ACKs on the wire so a clean link
+cannot pass for proof.
 
 ## The problem
 
@@ -49,14 +44,14 @@ Lose packet *N* while *N+1 … N+1000* arrive, and `snd_last_ack` stays at *N*.
 *N* is repaired — one round trip minimum, and on this implementation the tail
 case used to be far worse.
 
-This looks like why loss costs so much more than its rate suggests: 5% loss
-costs about 30x the clean transfer time on the simulator, and the drops
-themselves are a small fraction of that.
+This looked like why loss cost so much more than its rate suggested: 5% loss cost
+about 30x the clean transfer time, and the drops themselves were a small fraction
+of that.
 
-**That reasoning turned out to be wrong**, and the rest of this document was
-written before it was tested. Removing the stall does not remove the cost — see
-"What it was worth". Read the design below as a record of what was built and
-why, not as a claim that the diagnosis was right.
+The diagnosis was half right, and it took a long time to find out which half.
+The stall is real and relieving it does help — but only once the sender is
+actually held up by its window rather than by a timer, and for most of this
+work it was held up by timers. See "What it was worth".
 
 ## What UDT already gives us
 
@@ -193,45 +188,66 @@ could not have carried one.
 
 ## What it was worth
 
-Cost of loss as a multiple of the clean transfer time, meaned over five seeds
-(`loss_cost_table`, which prints the whole sweep under `--nocapture`):
+Cost of loss as a multiple of the clean transfer time (`loss_cost_table`, which
+prints the whole sweep under `--nocapture`):
 
-| | discount off | discount on | |
+| | at the start | now | with the discount |
 |---|---|---|---|
-| 1% loss | 2.41x | 3.60x | 49% worse |
-| 2% loss | 11.85x | 19.19x | 62% worse |
-| 5% loss | 30.58x | 24.25x | 21% better |
-| 10% loss | 49.92x | 37.88x | 24% better |
+| 1% loss | 5.47x | 1.42x | **1.10x** |
+| 2% loss | 12.92x | 1.78x | **1.30x** |
+| 5% loss | 28.03x | 3.11x | **1.88x** |
+| 10% loss | 49.98x | 5.05x | 5.26x |
 
-So the diagnosis was half right. The window stall is real and removing it does
-help — but only once loss is heavy enough that holes are near-continuous. Below
-that, letting the sender put the freed window back on the path costs more than
-the stall did, and 1–2% is where real paths live. Hence: switched off.
+Almost none of that came from this feature, and that is the point worth
+recording. The discount was measured three times. Twice it was mixed in sign and
+was left off, because the window was rarely the constraint: the sender was idle
+on timers. Four discrete stalls were found and fixed first —
 
-The first measurement taken was 5% only, which showed a clean 21% win and
-nothing else. Sweeping the rate is what turned a success into a regression, and
-is the reason `loss_cost_table` exists rather than a single-point assertion.
+- a round-trip estimate that opened at 10 ms and never converged, so every
+  recovery timer derived from it was an order of magnitude too slow;
+- a repeat-NAK timer armed from that guess and never corrected, putting the
+  first chance to re-report a gap 40 ms out;
+- a full ACK blocked by a hole that still reset its timer and cleared its packet
+  counter, as though it had reported something, so the moment the hole filled
+  there was nothing due to announce it;
+- a rule for re-announcing an unconfirmed acknowledgement after `RTT + 4·RTTVar`
+  that nothing ever reached, because the ACK timer only came round every 10 ms.
 
-### What is known about the cause
+— and only then did the window start to bind, at which point the discount
+measured 23–40% better at 1–5% loss and went on.
 
-Not much, and it is worth finding.
+The lesson is in how they were found rather than in the numbers. Four
+explanations for the cost were measured and discarded first: pacing (whose
+interval tracked the slowdown almost one-for-one, and fixing it changed the
+transfer time not at all), the congestion window, retransmission waste, and
+detection latency. What worked was `loss_timeline`, which records when each
+message arrives and prints the largest gaps, plus a dump of both peers' state
+mid-stall. Aggregates hid all four bugs; the timeline showed each of them at a
+glance.
 
-- **Not receiver overrun.** An 8x receive ring changes the numbers not at all.
-- **Not the flow window.** Separating the two limits — discounting from the
-  congestion window only, since a packet held for reassembly still occupies the
-  peer's buffer — also changes nothing, because `flow_wnd` never binds at this
-  transfer size.
-- **Not the loss-list pruning.** Dropping the `snd_loss.remove_range` call
-  leaves the numbers identical; the discount alone accounts for the whole
-  effect, in both directions.
-- The regressed figures cluster on repeated values (13.86 appears as both the
-  1% maximum and the 2% minimum), which looks like a fixed quantum being hit a
-  varying number of times. The expiry timer is the obvious suspect, at 10 ms a
-  firing against a clean transfer of a few ms.
+### Dead ends, so they are not retried
 
-A single seed on this test ranges from 7x to 35x at 5% loss on nothing but which
-packets get dropped, so any single-seed comparison is meaningless. Mean over
-seeds, always.
+Each of these was measured and is not the lever:
+
+- **Receiver overrun.** An 8x receive ring changes nothing.
+- **The flow window.** Discounting from the congestion window only — on the
+  grounds that a packet held for reassembly still occupies the peer's buffer —
+  changes nothing, because `flow_wnd` never binds at this transfer size.
+- **Loss-list pruning.** Dropping the `snd_loss.remove_range` call leaves the
+  numbers identical.
+- **`LIGHT_ACK_INTERVAL`.** 64, 32 and 16 give bit-identical results. The
+  threshold was never approached: during the stall the packet counter read 1,
+  because a blocked full ACK had just cleared it.
+- **Nudging the ACK timer on a large unacknowledged run.** Much worse — 8.40x to
+  16.49x at 5% loss. Filling a hole is the right trigger; volume is not.
+- **The pacing interval.** It tracked the slowdown almost one-for-one across loss
+  rates, which is why it was so convincing. Fixing it dropped the interval 12x
+  and left the transfer time bit-identical.
+
+A single seed ranges from 1.6x to 53x at 5% loss on nothing but which packets get
+dropped, so single-seed comparisons are meaningless — one nearly cost a correct
+decision here, when five seeds said the discount made 1% loss 49% worse and
+sixteen said 20% better. Sixteen is the floor; 32 for anything close.
 
 ## Interaction with what is already there
 

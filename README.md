@@ -184,30 +184,30 @@ in anger — treat it as unproven rather than unsupported.
 Connections are tied to the address pair and stay that way; a NAT rebind ends
 them, by choice.
 
-The thing most worth fixing is congestion control. Amplification under loss is
-near 1.0 and the window stays wide open, so almost nothing is wasted and nothing
-is window-bound — the sender is simply idle between packets because the rate
-controller has stretched the sending interval 10–34×. That is the whole reason
-5% loss costs ~28× a clean transfer and 10% costs ~50×. `loss_cost_table` in
-`udt-proto/tests/network.rs` reports it.
+Selective acknowledgement is in and on. The receiver reports which ranges above
+the acknowledgement point arrived and the sender discounts them from its window,
+so a hole no longer pins everything behind it. It is a compatible extension —
+the ranges go after the documented ACK body, and both the C++ fork and pristine
+upstream keep working against it, tested with a lossy relay and a count of
+extended ACKs on the wire.
 
-Selective acknowledgement is half-built on purpose. The wire half works and is
-backward compatible: the receiver reports which ranges above the acknowledgement
-point arrived, the sender tracks them, and both the C++ fork and pristine
-upstream keep working against it — tested with a lossy relay and a count of
-extended ACKs on the wire, on the harness branch. The half that would use it —
-discounting those packets from the congestion window — is written, measured, and
-deliberately switched off, because it is a bad trade:
+Loss now costs roughly what it should. Over sixteen simulator seeds, as a
+multiple of the clean transfer time:
 
-| | before | after | |
-|---|---|---|---|
-| 1% loss | 2.41x | 3.60x | 49% worse |
-| 2% loss | 11.85x | 19.19x | 62% worse |
-| 5% loss | 30.58x | 24.25x | 21% better |
-| 10% loss | 49.92x | 37.88x | 24% better |
+| | at the start | now |
+|---|---|---|
+| 1% loss | 5.47x | 1.10x |
+| 2% loss | 12.92x | 1.30x |
+| 5% loss | 28.03x | 1.88x |
+| 10% loss | 49.98x | 5.26x |
 
-Cost of loss as a multiple of the clean transfer time, meaned over five
-simulator seeds. Real paths sit at the low end, so this loses more than it wins.
-The cause is not yet understood — it is not receiver overrun and not the flow
-window, both tested. `loss_cost_table` in `udt-proto/tests/network.rs` is the
-measurement; [`docs/selective-ack.md`](docs/selective-ack.md) has the rest.
+None of that came from congestion control, which is where it looked like it
+would. Four explanations were measured and discarded — pacing, the congestion
+window, retransmission waste, detection latency — before a delivery timeline
+showed the cost was a handful of discrete stalls rather than a rate. Every one
+of them was a timer scheduled from a value that was not yet known: an opening
+round-trip guess that never converged, a NAK timer armed from that guess and
+never corrected, an ACK blocked by a hole that reset its timer as though it had
+reported something, and a re-announce rule that nothing ever reached. `loss_cost
+_table` and `loss_timeline` in `udt-proto/tests/network.rs` are what found them,
+and [`docs/selective-ack.md`](docs/selective-ack.md) has the rest.
