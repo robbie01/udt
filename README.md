@@ -167,9 +167,18 @@ saturated connection does not allocate per packet.
 
 ## Not done yet
 
-Windows. ECN, which the UDP layer already plumbs and this discards. Connection
-IDs, so a NAT rebind does not kill the connection. Path-MTU probing — black
-holes are detected and reported, never probed around.
+Windows. Path-MTU probing — black holes are detected and reported, never probed
+around.
+
+Connections are tied to the address pair and stay that way; a NAT rebind ends
+them, by choice.
+
+The thing most worth fixing is congestion control. Amplification under loss is
+near 1.0 and the window stays wide open, so almost nothing is wasted and nothing
+is window-bound — the sender is simply idle between packets because the rate
+controller has stretched the sending interval 10–34×. That is the whole reason
+5% loss costs ~28× a clean transfer and 10% costs ~50×. `loss_cost_table` in
+`udt-proto/tests/network.rs` reports it.
 
 Selective acknowledgement is half-built on purpose. The wire half works and is
 backward compatible: the receiver reports which ranges above the acknowledgement

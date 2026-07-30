@@ -11,7 +11,7 @@ use tokio::net::{ToSocketAddrs, UdpSocket};
 use tokio::sync::{Notify, mpsc, oneshot};
 use udt_proto::{CcKind, Connection, Listener as ProtoListener, ListenerEvent, SeqNo};
 
-use crate::batch::{BatchIo, RecvBuffers};
+use crate::batch::{BatchIo, Inbound, RecvBuffers};
 use crate::conn::{RECV_BACKLOG, SEND_BACKLOG, SendReq, Socket};
 use crate::driver;
 use crate::util::{
@@ -132,7 +132,7 @@ struct EndpointInner {
     /// readers only ever look routes up, and taking a read lock lets several
     /// of them dispatch to different connections at once. Writes happen once
     /// per connection, at accept and at close.
-    routes: RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>,
+    routes: RwLock<HashMap<SocketAddr, mpsc::Sender<Inbound>>>,
     listener: Mutex<Option<ListenerSlot>>,
     /// False once the `Endpoint` handle is dropped. Readers keep serving
     /// existing connections after that, and stop when the last one goes.
@@ -383,7 +383,7 @@ fn spawn_shared(
     conn: Connection,
     peer: SocketAddr,
 ) -> (Socket, oneshot::Receiver<()>) {
-    let (datagram_tx, datagram_rx) = mpsc::channel::<Bytes>(DATAGRAM_BACKLOG);
+    let (datagram_tx, datagram_rx) = mpsc::channel::<Inbound>(DATAGRAM_BACKLOG);
     let (send_tx, send_rx) = mpsc::channel::<SendReq>(SEND_BACKLOG);
     let (recv_tx, recv_rx) = flume::bounded::<Bytes>(RECV_BACKLOG);
     let (connected_tx, connected) = oneshot::channel::<()>();
@@ -429,7 +429,7 @@ async fn run_reader(ep: Arc<EndpointInner>) {
     let mut rx = RecvBuffers::new(&io);
     // Most datagrams arrive from the same peer as the last; remembering the
     // previous route turns the hash lookup into an address comparison.
-    let mut cached: Option<(SocketAddr, mpsc::Sender<Bytes>)> = None;
+    let mut cached: Option<(SocketAddr, mpsc::Sender<Inbound>)> = None;
 
     loop {
         let count = tokio::select! {
@@ -488,7 +488,7 @@ async fn run_reader(ep: Arc<EndpointInner>) {
                     // rest of the run waits for the peer to retransmit, which
                     // is what an opening connection does anyway.
                     if let Some(datagram) = datagrams.next() {
-                        handle_handshake(&ep, from, datagram).await;
+                        handle_handshake(&ep, from, datagram.bytes).await;
                     }
                 }
             }

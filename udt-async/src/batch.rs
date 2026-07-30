@@ -115,8 +115,17 @@ impl BatchIo {
         data: &[u8],
         segment_size: Option<usize>,
     ) -> io::Result<()> {
-        let transmit =
-            Transmit { destination: peer, ecn: None, contents: data, segment_size, src_ip: None };
+        // ECT(0) asks routers on the path to mark rather than drop when they
+        // start queueing. Nothing is required of the peer: a receiver that does
+        // not understand the marking simply never reports it, and a path that
+        // strips the bits behaves exactly as before.
+        let transmit = Transmit {
+            destination: peer,
+            ecn: Some(quinn_udp::EcnCodepoint::Ect0),
+            contents: data,
+            segment_size,
+            src_ip: None,
+        };
         sock.async_io(Interest::WRITABLE, || self.state.send(UdpSockRef::from(sock), &transmit))
             .await
     }
@@ -174,6 +183,18 @@ impl BatchIo {
     }
 }
 
+/// A datagram as it came off the socket, with the one piece of IP-layer context
+/// the protocol cannot see for itself.
+///
+/// `ce` is the ECN CE codepoint: the path told us it is congested. It has to
+/// travel with the datagram because connections sharing an endpoint's port
+/// receive over a channel, and the metadata would otherwise be dropped at the
+/// reader.
+pub(crate) struct Inbound {
+    pub(crate) bytes: Bytes,
+    pub(crate) ce: bool,
+}
+
 /// Receive storage sized for this socket's offload settings.
 ///
 /// Each buffer must hold a full generic-receive-offload run rather than a
@@ -206,12 +227,16 @@ impl RecvBuffers {
     ///
     /// The run is copied once and the datagrams are slices sharing it, so the
     /// copy is per run rather than per packet -- up to 64 of them share one.
-    pub(crate) fn take_datagrams(&mut self, index: usize) -> impl Iterator<Item = Bytes> + use<> {
+    pub(crate) fn take_datagrams(&mut self, index: usize) -> impl Iterator<Item = Inbound> + use<> {
         let meta = self.metas[index];
         let buf = &self.storage[index];
         let len = meta.len.min(buf.len());
         let run = Bytes::copy_from_slice(&buf[..len]);
-        split_run(run, meta.stride)
+        // One codepoint covers the whole offload run, so every datagram in it
+        // carries the same mark. That is the kernel's granularity, not a
+        // simplification of ours.
+        let ce = meta.ecn == Some(quinn_udp::EcnCodepoint::Ce);
+        split_run(run, meta.stride).map(move |bytes| Inbound { bytes, ce })
     }
 }
 

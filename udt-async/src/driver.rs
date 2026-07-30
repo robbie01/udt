@@ -18,7 +18,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use udt_proto::{Connection, DisconnectReason, Event, SendOutcome, TransmitBuf};
 
-use crate::batch::{BatchIo, RecvBuffers};
+use crate::batch::{BatchIo, Inbound, RecvBuffers};
 use crate::conn::SendReq;
 use crate::util::now_us;
 
@@ -166,6 +166,21 @@ impl Driver {
         }
     }
 
+    /// Feed one arrival to the state machine, along with what the IP layer
+    /// said about it.
+    ///
+    /// A CE mark means the path is congested, and the protocol cannot see IP
+    /// headers, so it has to be told. The warning goes to the *peer* — the
+    /// marking happened on the path carrying data to us, so it is the peer's
+    /// rate that needs to come down.
+    fn on_inbound(&mut self, datagram: Inbound) {
+        let now = now_us();
+        if datagram.ce {
+            self.conn.congestion_experienced(now, &mut self.tx);
+        }
+        self.conn.on_datagram(datagram.bytes, now, &mut self.tx, &mut self.events);
+    }
+
     /// Run the protocol timers if any is already due.
     ///
     /// Worth doing straight after arrivals rather than waiting for the sleep
@@ -218,7 +233,7 @@ pub(crate) async fn run_owned(
     let Ok(io) = BatchIo::new(&socket) else { return };
     let mut rx = RecvBuffers::new(&io);
     let mut d = Driver::new(conn, socket, peer, recv_tx, connected_tx, io);
-    let mut inbound: Vec<Bytes> = Vec::new();
+    let mut inbound: Vec<Inbound> = Vec::new();
 
     // Send the opening handshake.
     d.conn.on_timer(now_us(), &mut d.tx, &mut d.events);
@@ -253,7 +268,7 @@ pub(crate) async fn run_owned(
                     }
                 }
                 for datagram in inbound.drain(..) {
-                    d.conn.on_datagram(datagram, now_us(), &mut d.tx, &mut d.events);
+                    d.on_inbound(datagram);
                 }
                 d.run_due_timers();
             }
@@ -282,7 +297,7 @@ pub(crate) async fn run_shared(
     conn: Connection,
     socket: Arc<UdpSocket>,
     peer: SocketAddr,
-    mut datagrams: mpsc::Receiver<Bytes>,
+    mut datagrams: mpsc::Receiver<Inbound>,
     mut send_rx: mpsc::Receiver<SendReq>,
     recv_tx: flume::Sender<Bytes>,
     connected_tx: Option<oneshot::Sender<()>>,
@@ -306,14 +321,14 @@ pub(crate) async fn run_shared(
         tokio::select! {
             first = datagrams.recv() => {
                 let Some(first) = first else { break };
-                d.conn.on_datagram(first, now_us(), &mut d.tx, &mut d.events);
+                d.on_inbound(first);
                 // Take whatever else the reader has already queued, so a busy
                 // connection costs one wakeup per batch rather than per packet.
                 let mut taken = 1;
                 while taken < RECV_DRAIN_CAP {
                     match datagrams.try_recv() {
                         Ok(datagram) => {
-                            d.conn.on_datagram(datagram, now_us(), &mut d.tx, &mut d.events);
+                            d.on_inbound(datagram);
                             taken += 1;
                         }
                         Err(_) => break,

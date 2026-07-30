@@ -325,6 +325,13 @@ pub struct Connection {
     last_ack_us: u64,
     exp_count: u32,
 
+    /// Earliest time we may tell the peer the path is congested again, and the
+    /// last time we acted on being told. Both are one round trip apart at most:
+    /// congestion is a property of the path over an RTT, so reacting to every
+    /// marked packet in a window would cut the rate once per packet.
+    next_cwarn_us: u64,
+    last_cwarn_react_us: u64,
+
     /// Last ACK sub-sequence we returned an ACK2 for, and when.
     /// ACK2s are rate limited to roughly one per SYN interval (C++
     /// `m_iSndLastAck2` / `m_ullSndLastAck2Time`).
@@ -483,6 +490,8 @@ impl Connection {
             data_ever_acked: false,
             last_ack_us: now_us,
             exp_count: 1,
+            next_cwarn_us: 0,
+            last_cwarn_react_us: 0,
             snd_last_ack2: AckSeqNo::new(0),
             snd_last_ack2_us: now_us,
             // C++ initialises the delivery-rate estimate to 16 pkt/s and the
@@ -911,6 +920,42 @@ impl Connection {
         );
     }
 
+    /// Report that a datagram arrived marked as having passed through
+    /// congestion, and tell the peer so it can slow down.
+    ///
+    /// The IO layer calls this: ECN lives in the IP header, which a sans-IO
+    /// protocol never sees. Pass `true` only for the CE codepoint — ECT(0) and
+    /// ECT(1) merely say the sender asked for marking, and reacting to those
+    /// would throttle every connection that opted in.
+    ///
+    /// This is a *signal to the peer*, not a brake on this side. The marking
+    /// happened on the path carrying data towards us, and it is the peer's
+    /// sending rate that needs to come down; ours is governed by whatever the
+    /// other direction reports.
+    ///
+    /// Wire-compatible: it emits UDT's existing `CongestionWarning`, which the
+    /// reference implementation already understands. Rate-limited to one per
+    /// round trip, since congestion is a property of a path over an RTT and a
+    /// marked window would otherwise produce a warning per packet.
+    pub fn congestion_experienced(&mut self, now_us: u64, tx: &mut TransmitBuf) {
+        if !matches!(self.state, ConnState::Connected) || now_us < self.next_cwarn_us {
+            return;
+        }
+        let gap = (self.rtt_us.max(0) as u64).max(MIN_RECOVERY_US);
+        self.next_cwarn_us = now_us + gap;
+        let (ts, peer) = (self.ts(now_us), self.peer_id);
+        tx.push(|dst| {
+            codec::encode_control(
+                crate::packet::ControlType::CongestionWarning,
+                0,
+                ts,
+                peer,
+                &[0u8; 4],
+                dst,
+            )
+        });
+    }
+
     /// Whether the handshake has completed and data may be sent.
     pub fn is_connected(&self) -> bool {
         matches!(self.state, ConnState::Connected)
@@ -1089,6 +1134,17 @@ impl Connection {
                 out.push(Event::Disconnected(DisconnectReason::PeerError));
             }
             ControlBody::CongestionWarning => {
+                self.last_rsp_us = now_us;
+                self.exp_count = 1;
+                // Once per round trip, not once per warning. A peer marking a
+                // whole window would otherwise cut the rate once per packet in
+                // it, which is a collapse rather than a response — RFC 3168
+                // §6.1.2 draws the same line for TCP.
+                let gap = (self.rtt_us.max(0) as u64).max(MIN_RECOVERY_US);
+                if now_us.saturating_sub(self.last_cwarn_react_us) < gap {
+                    return;
+                }
+                self.last_cwarn_react_us = now_us;
                 let ctx = self.cc_ctx(now_us);
                 let o = self.cc.on_loss(&[], ctx);
                 self.apply_cc(o);
@@ -1994,6 +2050,83 @@ mod tests {
 
         c.snd_sacked.remove_up_to(SeqNo::new(160));
         assert_eq!(c.snd_sacked.len(), 0);
+    }
+
+    /// A CE-marked arrival must tell the *peer* to slow down, using the control
+    /// packet UDT already defines so a reference peer understands it.
+    #[test]
+    fn a_congestion_mark_warns_the_peer() {
+        let mut c = connected(1_000_000);
+        let mut tx = TransmitBuf::new();
+        c.congestion_experienced(1_000_000, &mut tx);
+
+        assert!(
+            decode_all(&tx)
+                .iter()
+                .any(|p| matches!(p, Packet::Control { body: ControlBody::CongestionWarning, .. })),
+            "no congestion warning was sent"
+        );
+    }
+
+    /// Once per round trip, not once per marked packet. A router marking a whole
+    /// window would otherwise cut the peer's rate once per packet in it.
+    #[test]
+    fn congestion_warnings_are_limited_to_one_per_round_trip() {
+        let mut c = connected(1_000_000);
+        c.rtt_us = 20_000;
+        let mut tx = TransmitBuf::new();
+
+        let warnings = |tx: &TransmitBuf| {
+            decode_all(tx)
+                .iter()
+                .filter(|p| {
+                    matches!(p, Packet::Control { body: ControlBody::CongestionWarning, .. })
+                })
+                .count()
+        };
+
+        // A whole window's worth of marks inside one round trip.
+        for i in 0..50 {
+            c.congestion_experienced(1_000_000 + i * 100, &mut tx);
+        }
+        assert_eq!(warnings(&tx), 1, "a marked window produced a warning per packet");
+
+        // A round trip later, the path is worth reporting on again.
+        c.congestion_experienced(1_000_000 + 20_001, &mut tx);
+        assert_eq!(warnings(&tx), 2, "the next round trip should be reportable");
+    }
+
+    /// The receiving half of the same rule: the rate comes down once per round
+    /// trip however many warnings arrive.
+    #[test]
+    fn reacting_to_warnings_is_limited_to_one_per_round_trip() {
+        let mut c = connected(1_000_000);
+        c.rtt_us = 20_000;
+        let mut tx = TransmitBuf::new();
+        let mut out = Vec::new();
+
+        let mut warn = BytesMut::new();
+        codec::encode_control(
+            crate::packet::ControlType::CongestionWarning,
+            0,
+            0,
+            c.socket_id(),
+            &[0u8; 4],
+            &mut warn,
+        );
+        let warn = warn.freeze();
+
+        c.on_datagram(warn.clone(), 1_000_000, &mut tx, &mut out);
+        let after_one = c.stats().snd_period_us;
+
+        for i in 1..20 {
+            c.on_datagram(warn.clone(), 1_000_000 + i * 100, &mut tx, &mut out);
+        }
+        assert_eq!(
+            c.stats().snd_period_us,
+            after_one,
+            "twenty warnings in one round trip cut the rate more than once"
+        );
     }
 
     #[test]
