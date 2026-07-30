@@ -9,9 +9,8 @@ of the same length, in order, with congestion control. It is built for links
 where TCP's window growth is the bottleneck rather than the network — long fat
 pipes, high-latency paths, bulk transfer.
 
-**Status: pre-release.** Nothing is published to crates.io, the version is
-`0.0.0`, and `udt-proto`'s API is explicitly not stable yet. Windows has never
-been compiled, let alone tested.
+**Status: pre-release.** Nothing is published to crates.io and the version is
+`0.0.0`; `udt-proto`'s API is explicitly not stable yet.
 
 [UDT]: https://udt.sourceforge.io/
 
@@ -143,10 +142,14 @@ On a 24-core Linux host: 3.2 GB/s single connection, 4.5 GB/s on two, and about
 Apple-silicon laptop: 530 MB/s single connection, 0.3 ms to establish a
 rendezvous pair.
 
-One known shortfall: on platforms without batched receive — macOS, Windows —
-connections that share an endpoint's port are limited by a single reader task
-doing one syscall per packet. Give bulk transfers an endpoint each there.
-`EndpointConfig::mtu` and the `Endpoint` docs say more.
+One known shortfall: without `recvmmsg`, connections sharing an endpoint's port
+funnel through a single reader task that gets one *call* per wakeup. Give bulk
+transfers an endpoint each there. `EndpointConfig::mtu` and the `Endpoint` docs
+say more.
+
+That is macOS and Windows, but the two are not alike: Windows has no `recvmmsg`
+yet does coalesce received datagrams, so one call there can still return up to 64
+of them, where macOS has neither and gets one packet per call.
 
 ## Design notes
 
@@ -168,7 +171,8 @@ saturated connection does not allocate per packet.
 
 ## Not done yet
 
-Windows.
+Windows is built and tested in CI now, on `windows-latest`, but has never run
+in anger — treat it as unproven rather than unsupported.
 
 Connections are tied to the address pair and stay that way; a NAT rebind ends
 them, by choice.

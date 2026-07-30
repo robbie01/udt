@@ -141,9 +141,11 @@ impl BatchIo {
         storage: &mut [Vec<u8>],
         metas: &mut [RecvMeta],
     ) -> io::Result<usize> {
-        // The single-buffer case is the whole of macOS and Windows, and it is
-        // the one that runs per datagram rather than per batch — keep the
-        // scatter-gather list on the stack so the hot path never allocates.
+        // The single-buffer case is macOS and Windows, wherever `recvmmsg` is
+        // missing, and it is the one that runs per call rather than per batch —
+        // keep the scatter-gather list on the stack so the hot path never
+        // allocates. Note that a single buffer is not a single datagram on
+        // Windows, which coalesces up to 64 into one even without `recvmmsg`.
         if let [buf] = storage {
             let mut bufs = [IoSliceMut::new(buf.as_mut_slice())];
             return sock

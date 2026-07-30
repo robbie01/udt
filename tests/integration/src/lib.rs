@@ -775,6 +775,9 @@ mod tests {
     ///   split — several readers on one socket reorder a flow, which UDT reads
     ///   as loss, and that wedged the connection outright when tried. It needs
     ///   the kernel to fan out with flow affinity, or a socket per connection.
+    ///   Windows is less exposed than macOS here: it has no `recvmmsg` either,
+    ///   but it does coalesce received datagrams, so one call can still return
+    ///   a run of them.
     /// * Raising the MTU cuts packets per byte, but then the benchmark stops
     ///   describing a 1500-byte path.
     #[tokio::test(flavor = "multi_thread")]
