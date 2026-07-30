@@ -1830,16 +1830,17 @@ impl Connection {
                 // here because of `udt_cc`, not because a hole pins the window.
                 //
                 // So discounting cannot help by the mechanism it was built for,
-                // and measurement agrees it is not helping by any other:
+                // and measurement agrees it is not helping by any other. Asked
+                // twice, the second time after the round-trip estimate was fixed
+                // and the numbers had moved a long way:
                 //
                 //           off      on
-                //    1%    4.70x   3.78x    20% better
-                //    2%   10.51x  12.25x    17% worse
-                //    5%   28.13x  27.05x     4% better
-                //   10%   49.70x  44.91x    10% better
+                //    1%     5.43    3.91    28% better
+                //    2%    11.35   13.08    15% worse
+                //    5%    17.80   18.91     6% worse
+                //   10%    24.90   22.11    11% better
                 //
-                // Mixed in sign, inside the noise of a 32-seed mean whose own
-                // spread runs 1.0x to 64x — and the pacing interval roughly
+                // Mixed in sign both times, and the pacing interval roughly
                 // doubles when it is on, so what movement there is comes from
                 // perturbing the rate controller rather than from freeing the
                 // window. Turning it on would be adopting an accident.
