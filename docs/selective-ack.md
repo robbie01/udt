@@ -123,23 +123,18 @@ So the shape is: on a SACK-bearing ACK, for each reported range, `snd_sacked
 .insert(a, b)` and `snd_loss.remove_range(a, b)`; on the cumulative point moving,
 `snd_sacked.remove_up_to(ack)`; and one changed line in `pack_data`.
 
-### Prerequisite: `RcvLossList::insert` does not coalesce
+### The invariant the complement walk needs
 
-Computing the complement in (1) is only correct if the gap ranges are sorted and
-non-overlapping. `RcvLossList::insert` sorts but does not merge — its trailing
-comment says "coalesce defensively" and then no coalescing happens, unlike
-`SndLossList::insert`, which calls `coalesce_at`. The comment describes
-behaviour that is not implemented.
+Computing the complement in (1) is only correct if the gaps are sorted and free
+of overlaps. That used to be a comment claiming `RcvLossList::insert` coalesced
+defensively while it did no such thing; it is now enforced, shared with the send
+side, and asserted after every insert and removal in debug builds.
 
-Whether overlap is reachable today is a separate question — the receiver only
-inserts gaps it has not seen, which are disjoint in ordinary operation — but two
-things follow regardless. It is the kind of invariant the fuzzer's `connection`
-target should be made to attack, since `remove(seq)` returns after the *first*
-matching range, so a sequence sitting in a second overlapping range would stay
-"lost" and be NAKed forever; and `len()` would over-count, double-counting the
-intersection. Settle it before building the complement walk on top of the
-invariant: either enforce it in `insert` or prove it holds and correct the
-comment.
+One consequence for the walk: `insert` merges across the sequence-space wrap, so
+a gap held here can run past the top of the space, and raw start order is not
+offset order near the wrap. `received_ranges` therefore works in offsets from
+the acknowledgement point and re-sorts before walking, rather than trusting
+`SeqNo` ordering. `apply_sack` clamps the same way on the receiving end.
 
 ## Wire format
 

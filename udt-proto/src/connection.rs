@@ -877,6 +877,26 @@ impl Connection {
         self.socket_id
     }
 
+    /// Panics unless the loss lists still hold the shape the rest of the code
+    /// reads them for: sorted by start and free of overlaps.
+    ///
+    /// For the fuzz targets, which call it after every step. Nothing in normal
+    /// operation should need to ask.
+    #[cfg(feature = "fuzzing")]
+    #[doc(hidden)]
+    pub fn assert_loss_lists_well_formed(&self) {
+        assert!(
+            crate::loss_list::is_sorted_disjoint(self.rcv_loss.ranges_snapshot()),
+            "receiver loss list is not sorted and disjoint: {:?}",
+            self.rcv_loss.ranges_snapshot()
+        );
+        assert!(
+            crate::loss_list::is_sorted_disjoint(self.snd_loss.ranges_snapshot()),
+            "sender loss list is not sorted and disjoint: {:?}",
+            self.snd_loss.ranges_snapshot()
+        );
+    }
+
     /// Whether the handshake has completed and data may be sent.
     pub fn is_connected(&self) -> bool {
         matches!(self.state, ConnState::Connected)
@@ -955,7 +975,13 @@ impl Connection {
         }
         self.rcv_loss.remove(seq);
 
-        if seq > self.rcv_curr_seq || self.rcv_curr_seq == SeqNo::new(0) {
+        // Forwards only. This used to also take `seq` whenever the cursor read
+        // zero, from when zero meant "nothing received yet" — but `post_connect`
+        // has set the cursor to a real sequence long before any data arrives
+        // here, and zero is a sequence like any other. A peer that puts the
+        // wrap a few packets into the connection could reach it, and dragging
+        // the cursor backwards re-opens gaps the loss list already holds.
+        if seq > self.rcv_curr_seq {
             self.rcv_curr_seq = seq;
         }
 
@@ -1004,6 +1030,27 @@ impl Connection {
                 out.push(Event::Disconnected(DisconnectReason::Shutdown));
             }
             ControlBody::MsgDrop { msg_no, first, last } => {
+                // Both ends of the range come off the wire, and the three
+                // things below each read it their own way. Measured as
+                // distances from the cursor rather than compared against it:
+                // a peer can name sequences anywhere in the space, and
+                // `SeqNo`'s ordering means nothing beyond half of it.
+                //
+                // What survives is a range that runs forwards and lies within
+                // the ring's reach. A range running backwards is not a range —
+                // the buffer would drop nothing, the loss list would trim by
+                // the reversed pair, and the cursor would sit still. And
+                // nothing beyond the ring can be held, so a range running past
+                // it is honoured only as far as the ring reaches: stepping the
+                // cursor out there would make the next arrival look like a gap
+                // of half the sequence space.
+                let reach = self.rcv_buf.as_ref().map_or(0, |b| b.capacity() as i32);
+                let from = first.offset_from(self.rcv_curr_seq).max(-reach);
+                let to = last.offset_from(self.rcv_curr_seq).min(reach);
+                if to < from {
+                    return;
+                }
+                let (first, last) = (self.rcv_curr_seq.shift(from), self.rcv_curr_seq.shift(to));
                 if let Some(buf) = self.rcv_buf.as_mut() {
                     // Retire the message by number where we hold it, and by
                     // sequence range regardless: the usual reason the sender
@@ -1300,11 +1347,20 @@ impl Connection {
     /// ignoring one costs a round trip of window, while disconnecting on a
     /// malformed tail would hand a peer a way to kill the connection outright.
     fn apply_sack(&mut self, sack: &[(SeqNo, SeqNo)]) -> bool {
+        // As offsets from the acknowledgement point, exactly as `recv_nak`
+        // treats its ranges: comparing the sequence numbers themselves says
+        // nothing once a peer is free to name anything in the space, and the
+        // acknowledgement point is not covered by its own ACK, so a range has
+        // to start strictly above it.
+        let outstanding = self.snd_curr_seq.offset_from(self.snd_last_ack);
         let mut any = false;
         for &(start, end) in sack {
-            if start > end || start <= self.snd_last_ack || end > self.snd_curr_seq {
+            let from = start.offset_from(self.snd_last_ack).max(1);
+            let to = end.offset_from(self.snd_last_ack).min(outstanding);
+            if to < from {
                 continue;
             }
+            let (start, end) = (self.snd_last_ack.shift(from), self.snd_last_ack.shift(to));
             self.snd_sacked.insert(start, end);
             // Nothing that arrived needs retransmitting.
             self.snd_loss.remove_range(start, end);
@@ -1314,8 +1370,23 @@ impl Connection {
     }
 
     fn recv_nak(&mut self, nak: crate::packet::NakList, now_us: u64) {
-        for (s, e) in &nak.0 {
-            self.snd_loss.insert(*s, *e);
+        // Every sequence named here becomes a retransmission that the pacing
+        // loop walks one at a time, and both ends of each range come off the
+        // wire. A NAK claiming a third of the sequence space is twenty bytes
+        // to send and a billion iterations of `pop_front` to work through, so
+        // a range is recorded only where it overlaps what is actually
+        // outstanding. Anything else is stale or invented.
+        //
+        // As offsets from the acknowledgement point, since comparing the
+        // sequence numbers themselves says nothing at these distances.
+        let outstanding = self.snd_curr_seq.offset_from(self.snd_last_ack);
+        for &(s, e) in &nak.0 {
+            let from = s.offset_from(self.snd_last_ack).max(0);
+            let to = e.offset_from(self.snd_last_ack).min(outstanding);
+            if to < from {
+                continue;
+            }
+            self.snd_loss.insert(self.snd_last_ack.shift(from), self.snd_last_ack.shift(to));
         }
         let ranges: Vec<_> = self.snd_loss.ranges_snapshot().to_vec();
         let ctx = self.cc_ctx(now_us);
@@ -1812,16 +1883,32 @@ mod tests {
         c.snd_last_ack = SeqNo::new(100);
         c.snd_curr_seq = SeqNo::new(200);
 
-        // Above anything sent, at or below the acknowledgement point, and
-        // running backwards.
+        // Wholly outside what is outstanding, either side of it, and running
+        // backwards. Nothing survives clamping, so nothing is credited.
         assert!(!c.apply_sack(&[(SeqNo::new(201), SeqNo::new(300))]));
-        assert!(!c.apply_sack(&[(SeqNo::new(150), SeqNo::new(201))]));
         assert!(!c.apply_sack(&[(SeqNo::new(50), SeqNo::new(99))]));
-        assert!(!c.apply_sack(&[(SeqNo::new(100), SeqNo::new(150))]));
         assert!(!c.apply_sack(&[(SeqNo::new(150), SeqNo::new(120))]));
         assert_eq!(c.snd_sacked.len(), 0, "a bogus range was credited");
 
-        // Wholly inside the window, so believed.
+        // Overrunning the window is clamped to the part that is real rather
+        // than thrown away whole, as in `recv_nak`: 150..=200 was sent, 201 was
+        // not.
+        assert!(c.apply_sack(&[(SeqNo::new(150), SeqNo::new(201))]));
+        assert_eq!(c.snd_sacked.len(), 51, "150..=200 is 51 sequences");
+
+        // Likewise at the bottom: the acknowledgement point itself is the first
+        // sequence *not* covered by the ACK, so a range reaching down to it
+        // starts at the one above.
+        let mut c = connected(1_000_000);
+        c.snd_last_ack = SeqNo::new(100);
+        c.snd_curr_seq = SeqNo::new(200);
+        assert!(c.apply_sack(&[(SeqNo::new(100), SeqNo::new(150))]));
+        assert_eq!(c.snd_sacked.len(), 50, "101..=150 is 50 sequences");
+
+        // Wholly inside the window, so taken as given.
+        let mut c = connected(1_000_000);
+        c.snd_last_ack = SeqNo::new(100);
+        c.snd_curr_seq = SeqNo::new(200);
         assert!(c.apply_sack(&[(SeqNo::new(120), SeqNo::new(150))]));
         assert_eq!(c.snd_sacked.len(), 31);
     }
@@ -1979,6 +2066,138 @@ mod tests {
         // ...but never tighter than the control interval, however fast the link.
         c.rtt_us = 1;
         assert_eq!(c.nak_int_us(), SYN_US as u64);
+    }
+
+    /// The receiver only records gaps above `rcv_curr_seq`, which is what keeps
+    /// its loss list free of overlaps — so the cursor must never move
+    /// backwards. It used to, at exactly one sequence: `recv_data` read a
+    /// cursor of zero as "nothing received yet" and let the next arrival win
+    /// whichever way it pointed, and the gap above then re-opened over one the
+    /// list already held. A peer picks the initial sequence number, so it can
+    /// put the wrap a hundred packets into the connection and reach that at
+    /// will.
+    #[test]
+    fn a_gap_re_opened_across_the_wrap_does_not_duplicate_a_loss_entry() {
+        let peer_isn = SeqNo::new(SEQ_MAX - 100);
+        let mut c = Connection::new_connected(
+            1,
+            2,
+            SeqNo::new(100),
+            peer_isn,
+            1500,
+            8192,
+            1_000_000,
+            CcKind::Udt.build(),
+        );
+        c.on_timer(1_000_000, &mut TransmitBuf::new(), &mut Vec::new());
+
+        // In order: the first packet; one that wraps past 0, leaving a gap of a
+        // hundred behind it; a retransmission inside that gap, which is where
+        // the cursor used to be dragged back; and one more above.
+        let mut highest = c.rcv_curr_seq;
+        for (i, seq) in [SEQ_MAX - 100, 0, SEQ_MAX - 50, 1].into_iter().enumerate() {
+            feed_one_packet(&mut c, seq, 1_000_000 + i as u64 * 1_000);
+            assert!(
+                c.rcv_curr_seq >= highest,
+                "the cursor went backwards over sequence {seq}, to {}",
+                c.rcv_curr_seq.raw()
+            );
+            highest = c.rcv_curr_seq;
+        }
+
+        let ranges = c.rcv_loss.ranges_snapshot().to_vec();
+        assert!(
+            crate::loss_list::is_sorted_disjoint(&ranges),
+            "the receiver is tracking the same sequence in two ranges: {ranges:?}"
+        );
+
+        // Nothing survives being received. With a duplicate entry the second
+        // copy outlives the packet's arrival, and the receiver goes on asking
+        // the sender for data it is already holding.
+        let mut now = 1_100_000;
+        for (start, end) in ranges {
+            let mut seq = start;
+            loop {
+                feed_one_packet(&mut c, seq.raw(), now);
+                now += 1_000;
+                if seq == end {
+                    break;
+                }
+                seq = seq.next();
+            }
+        }
+        assert!(
+            c.rcv_loss.is_empty(),
+            "sequences stayed lost after arriving: {:?}",
+            c.rcv_loss.ranges_snapshot()
+        );
+        assert_eq!(c.stats().rcv_loss_len, 0);
+    }
+
+    /// Found by the `connection` fuzz target, as a unit that took twenty
+    /// seconds. A NAK naming most of the sequence space is twenty bytes to
+    /// send, and `pack_data` walks the loss list one sequence at a time
+    /// looking for something to retransmit.
+    #[test]
+    fn a_nak_for_the_whole_sequence_space_is_not_a_billion_retransmissions() {
+        let mut c = connected(1_000_000);
+        let mut tx = TransmitBuf::new();
+        // Send something, so there is a window for a NAK to be about at all.
+        let sent = c.send_msg(Bytes::from(vec![0u8; 4000]), None, true, 1_000_000, &mut tx);
+        assert_eq!(sent, SendOutcome::Queued);
+        tx.clear();
+
+        // Three packets went out, from sequence 100. This asks for the repair
+        // of a billion, all but three of which were never sent.
+        let mut buf = BytesMut::new();
+        codec::encode_nak(
+            &[(SeqNo::new(1), SeqNo::new(1_000_000_000))],
+            0,
+            c.socket_id(),
+            &mut buf,
+        );
+        c.on_datagram(buf.freeze(), 1_001_000, &mut tx, &mut Vec::new());
+
+        // Only the overlap with what is outstanding is worth recording.
+        assert_eq!(
+            c.stats().snd_loss_len,
+            3,
+            "a NAK put {} sequences on the loss list; three packets were sent",
+            c.stats().snd_loss_len
+        );
+        // And the pacing loop gets through it rather than grinding.
+        c.on_timer(1_002_000, &mut tx, &mut Vec::new());
+    }
+
+    /// Found by the `connection` fuzz target. `remove_range`'s straddle case
+    /// splits the range it lands in; fed a backwards pair it split one range
+    /// into two overlapping halves, and the receiver then held the same
+    /// sequence twice over.
+    #[test]
+    fn a_message_drop_whose_range_runs_backwards_is_ignored() {
+        let mut c = connected(1_000_000);
+        // Open a gap of 500..=598 by skipping straight to 599.
+        feed_one_packet(&mut c, 500, 1_000_000);
+        feed_one_packet(&mut c, 599, 1_001_000);
+        let before = c.rcv_loss.ranges_snapshot().to_vec();
+        assert_eq!(before, [(SeqNo::new(501), SeqNo::new(598))]);
+
+        let mut buf = BytesMut::new();
+        codec::encode_msg_drop(
+            MsgNo::new(2),
+            SeqNo::new(580),
+            SeqNo::new(520),
+            0,
+            c.socket_id(),
+            &mut buf,
+        );
+        c.on_datagram(buf.freeze(), 1_002_000, &mut TransmitBuf::new(), &mut Vec::new());
+
+        assert_eq!(
+            c.rcv_loss.ranges_snapshot(),
+            before,
+            "a backwards range should be dropped, not acted on"
+        );
     }
 
     #[test]

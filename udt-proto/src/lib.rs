@@ -88,7 +88,47 @@ pub mod prelude;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub mod fuzz {
+    use bytes::{Bytes, BytesMut};
+
     pub use crate::codec::decode;
+    use crate::packet::MsgBoundary;
+    use crate::seq::{MsgNo, SeqNo};
+
+    /// Builds a well-formed data packet addressed to `dst_socket_id`.
+    ///
+    /// A target driving the receive path needs sequence numbers it chooses:
+    /// waiting for random bytes to land on a valid header and the right
+    /// destination socket spends the whole budget getting to the code that
+    /// matters.
+    pub fn data_packet(
+        dst_socket_id: u32,
+        seq_no: SeqNo,
+        msg_no: u32,
+        boundary_bits: u32,
+        in_order: bool,
+        payload: &[u8],
+    ) -> Bytes {
+        let header = crate::codec::encode_data_header(
+            seq_no,
+            MsgBoundary::from_bits(boundary_bits),
+            in_order,
+            MsgNo::new(msg_no),
+            0,
+            dst_socket_id,
+        );
+        let mut buf = BytesMut::with_capacity(header.len() + payload.len());
+        buf.extend_from_slice(&header);
+        buf.extend_from_slice(payload);
+        buf.freeze()
+    }
+
+    /// Builds a well-formed message-drop request, the other way a peer moves
+    /// the receiver's sequence bookkeeping.
+    pub fn msg_drop_packet(dst_socket_id: u32, msg_no: u32, first: SeqNo, last: SeqNo) -> Bytes {
+        let mut buf = BytesMut::new();
+        crate::codec::encode_msg_drop(MsgNo::new(msg_no), first, last, 0, dst_socket_id, &mut buf);
+        buf.freeze()
+    }
 }
 
 mod ack_window;

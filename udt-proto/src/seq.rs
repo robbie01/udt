@@ -73,6 +73,17 @@ impl SeqNo {
         SeqNo((self.0 + n) & SEQ_MAX)
     }
 
+    /// This sequence number shifted by `n`, which may be negative. Wraps.
+    ///
+    /// The inverse of [`offset_from`](Self::offset_from), and the way back
+    /// from an offset that has been clamped or compared as an integer — which
+    /// is the only sound way to bound a sequence number that came off the
+    /// wire, since ordering here means nothing across half the space.
+    #[inline]
+    pub fn shift(self, n: i32) -> Self {
+        SeqNo(self.0.wrapping_add(n as u32) & SEQ_MAX)
+    }
+
     /// How far `self` is ahead of `base`, negative if behind.
     ///
     /// A difference of more than half the sequence space is read as the short
@@ -215,6 +226,17 @@ mod tests {
         let b = SeqNo::new(20);
         assert_eq!(a.len_to(b), 11);
         assert_eq!(a.len_to(a), 1);
+    }
+
+    #[test]
+    fn seq_shift_is_the_inverse_of_offset_from() {
+        let base = SeqNo::new(1000);
+        for n in [-2000, -1, 0, 1, 2000, 1 << 29] {
+            assert_eq!(base.shift(n).offset_from(base), n, "shift by {n}");
+        }
+        // Wrapping both ways, not saturating.
+        assert_eq!(SeqNo::new(2).shift(-5), SeqNo::new(SEQ_MAX - 2));
+        assert_eq!(SeqNo::new(SEQ_MAX - 2).shift(5), SeqNo::new(2));
     }
 
     #[test]
