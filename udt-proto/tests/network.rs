@@ -764,6 +764,37 @@ fn loss_recovery_is_not_catastrophic() {
     assert!(mean < 5.0, "5% burst loss cost {mean:.1}x on average -- a stall is back");
 }
 
+/// The retransmission fraction must track the loss the path is actually
+/// inflicting, since it is what an application reads to decide whether the
+/// default controller suits its paths.
+#[test]
+fn the_retransmit_fraction_reflects_the_path() {
+    let mut clean = Sim::new(LinkConfig::bottleneck(100, 10, 50), 42);
+    clean.connect();
+    clean.transfer(200, 8192, SendOpts::ordered());
+    let clean_frac = clean.a.stats().retransmit_fraction();
+
+    let mut lossy = Sim::new(
+        LinkConfig { loss: 0.05, loss_burst: 10.0, ..LinkConfig::bottleneck(100, 10, 50) },
+        42,
+    );
+    lossy.connect();
+    lossy.transfer(200, 8192, SendOpts::ordered());
+    let lossy_frac = lossy.a.stats().retransmit_fraction();
+
+    assert!(clean.a.stats().snd_pkts_total > 100, "nothing was sent");
+    assert!(
+        lossy_frac > clean_frac * 3.0,
+        "5% loss reported {:.3} against a clean path's {:.3}",
+        lossy_frac,
+        clean_frac
+    );
+    assert!(
+        lossy_frac < 0.5,
+        "reported {lossy_frac:.3}, which is more retransmission than sending"
+    );
+}
+
 /// The burst-loss model must actually produce the rate and the bursts asked
 /// for.
 ///

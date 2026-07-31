@@ -134,7 +134,10 @@ pub enum CcKind {
     ///
     /// Pick this for a path that is clean or whose loss comes in bursts, which
     /// is most real paths. Keep the default where loss is frequent and
-    /// scattered, and measure rather than guessing which one you have.
+    /// scattered, and measure rather than guessing which one you have:
+    /// [`ConnectionStats::retransmit_fraction`] is what to measure it with.
+    ///
+    /// [`ConnectionStats::retransmit_fraction`]: crate::ConnectionStats::retransmit_fraction
     #[default]
     Cubic,
     /// A delay-based controller that treats growing queues as a signal to back

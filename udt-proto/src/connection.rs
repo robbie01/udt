@@ -289,6 +289,31 @@ pub struct ConnectionStats {
     /// Consecutive expiry-timer firings without a response from the peer;
     /// the connection gives up at 16.
     pub exp_count: u32,
+    /// Data packets put on the wire, retransmissions included.
+    pub snd_pkts_total: u64,
+    /// How many of those were retransmissions.
+    pub snd_pkts_retransmitted: u64,
+}
+
+impl ConnectionStats {
+    /// Fraction of transmitted data packets that were retransmissions.
+    ///
+    /// A rough read on how lossy the path is, and the number to look at when
+    /// deciding whether the default congestion controller suits it. CUBIC is
+    /// faster on a path that drops only when it is full and slower on one that
+    /// drops at random — measurably so past a percent or two, where
+    /// [`CcKind::Udt`] answers loss with a gentler reduction. See its
+    /// documentation for the measurements.
+    ///
+    /// Zero before anything has been sent.
+    ///
+    /// [`CcKind::Udt`]: crate::CcKind::Udt
+    pub fn retransmit_fraction(&self) -> f64 {
+        if self.snd_pkts_total == 0 {
+            return 0.0;
+        }
+        self.snd_pkts_retransmitted as f64 / self.snd_pkts_total as f64
+    }
 }
 
 /// IO-free per-socket UDT connection state machine.
@@ -377,6 +402,10 @@ pub struct Connection {
     /// per-ACK samples makes the rate estimate wildly noisy.
     delivery_rate_pps: u32,
     bandwidth_pps: u32,
+    /// Data packets transmitted, and how many were retransmissions. Reported
+    /// through [`ConnectionStats::retransmit_fraction`].
+    snd_pkts_total: u64,
+    snd_pkts_retransmitted: u64,
     /// One message to send with the handshake conclusion, a round trip before
     /// the connection is usable. See [`Connection::set_early_data`].
     early_data: Option<Bytes>,
@@ -541,6 +570,8 @@ impl Connection {
             // bandwidth estimate to 1 pkt/s before any samples arrive.
             delivery_rate_pps: 16,
             bandwidth_pps: 1,
+            snd_pkts_total: 0,
+            snd_pkts_retransmitted: 0,
             early_data: None,
             early_ready: false,
             rtt_us: 10_000,
@@ -1065,6 +1096,8 @@ impl Connection {
             snd_period_us: self.snd_period_us,
             rtt_us: self.rtt_us,
             exp_count: self.exp_count,
+            snd_pkts_total: self.snd_pkts_total,
+            snd_pkts_retransmitted: self.snd_pkts_retransmitted,
         }
     }
 
@@ -2036,6 +2069,7 @@ impl Connection {
             // and try the next entry rather than stalling the pacing loop.
         }
 
+        let was_retransmit = retransmit.is_some();
         let (hdr_bytes, payload_bytes) = match retransmit {
             Some(v) => v,
             None => {
@@ -2107,6 +2141,10 @@ impl Connection {
             dst.extend_from_slice(&hdr_bytes);
             dst.extend_from_slice(&payload_bytes);
         });
+        self.snd_pkts_total += 1;
+        if was_retransmit {
+            self.snd_pkts_retransmitted += 1;
+        }
 
         self.snd_tw.on_pkt_arrival(now_us);
         // Accumulate next_snd_us rather than resetting relative to now_us.
