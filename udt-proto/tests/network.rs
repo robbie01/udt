@@ -1352,7 +1352,13 @@ fn a_slow_lossy_path_is_not_mistaken_for_an_unusable_one() {
 /// across the same two links, so they contend for the same capacity and the
 /// same queue, and datagrams are routed by destination socket id the way an
 /// endpoint does it.
-fn contended_share(cfg: LinkConfig, seed: u64, cc: [CcKind; 2], until_us: u64) -> [usize; 2] {
+fn contended_share(
+    cfg: LinkConfig,
+    seed: u64,
+    cc: [CcKind; 2],
+    until_us: u64,
+    serialise_handshakes: bool,
+) -> [usize; 2] {
     const SIZE: usize = 8192;
     let mut a: Vec<Connection> = Vec::new();
     let mut b: Vec<Connection> = Vec::new();
@@ -1377,7 +1383,11 @@ fn contended_share(cfg: LinkConfig, seed: u64, cc: [CcKind; 2], until_us: u64) -
         // flight both peers answer the same one — the limitation
         // `connect_rendezvous` serialises around in `udt-async`.
         let handshaking = (0..2).find(|&i| !(a[i].is_connected() && b[i].is_connected()));
-        let waiting = |i: usize| handshaking.is_some_and(|h| h < i);
+        let waiting = |i: usize| serialise_handshakes && handshaking.is_some_and(|h| h < i);
+        // With serialisation off, an unaddressed handshake goes to every pair,
+        // which is what the endpoint does and where the ambiguity lives.
+        let takes_unaddressed =
+            |i: usize| if serialise_handshakes { handshaking == Some(i) } else { true };
 
         // A pair awaiting its turn is not driven, so its deadline must not be
         // counted either: it never moves, and the clock would pin itself to it.
@@ -1396,7 +1406,7 @@ fn contended_share(cfg: LinkConfig, seed: u64, cc: [CcKind; 2], until_us: u64) -
         for datagram in a_to_b.take_arrived(now) {
             let id = udt_proto::dst_socket_id(&datagram).unwrap_or(0);
             for (i, conn) in b.iter_mut().enumerate() {
-                if id == conn.socket_id() || (id == 0 && handshaking == Some(i)) {
+                if id == conn.socket_id() || (id == 0 && takes_unaddressed(i)) {
                     conn.on_datagram(datagram.clone(), now, &mut txs[2 + i], &mut events);
                 }
             }
@@ -1404,7 +1414,7 @@ fn contended_share(cfg: LinkConfig, seed: u64, cc: [CcKind; 2], until_us: u64) -
         for datagram in b_to_a.take_arrived(now) {
             let id = udt_proto::dst_socket_id(&datagram).unwrap_or(0);
             for (i, conn) in a.iter_mut().enumerate() {
-                if id == conn.socket_id() || (id == 0 && handshaking == Some(i)) {
+                if id == conn.socket_id() || (id == 0 && takes_unaddressed(i)) {
                     conn.on_datagram(datagram.clone(), now, &mut txs[i], &mut events);
                 }
             }
@@ -1455,7 +1465,7 @@ fn a_flow_gets_its_share_of_a_contended_link() {
     for pair in
         [[CcKind::Cubic, CcKind::Cubic], [CcKind::Udt, CcKind::Udt], [CcKind::Udt, CcKind::Cubic]]
     {
-        let got = contended_share(link, 42, pair, RUN_US);
+        let got = contended_share(link, 42, pair, RUN_US, true);
         let total = (got[0] + got[1]) as f64;
         assert!(total > 50.0, "{pair:?}: almost nothing was delivered ({got:?})");
         let first = got[0] as f64 / total;
@@ -1484,5 +1494,42 @@ fn a_flow_gets_its_share_of_a_contended_link() {
                 (1.0 - first) * 100.0
             );
         }
+    }
+}
+
+/// Two rendezvous pairs handshaking at once between one address pair lose one
+/// of the pairs.
+///
+/// A rendezvous handshake is addressed to socket 0, so nothing in it says which
+/// pending connection it belongs to, and an endpoint has to offer it to all of
+/// them. Every pending connection then sees every peer's handshake and latches
+/// the last one it processed, so all four converge on a single pairing and the
+/// other is orphaned: one pair carries everything, the other nothing.
+///
+/// Deterministic here, where the same situation on real sockets is a flake that
+/// reproduces about one run in three. `udt-async` avoids it by serialising
+/// rendezvous establishment per peer address, which is why this harness does
+/// the same by default; this pins the shape of what is being avoided.
+///
+/// Fixing rather than avoiding it means the endpoint assigning distinct peers to
+/// distinct pending connections — matching on the source socket id in the
+/// handshake body, first claim winning, later handshakes from a claimed peer
+/// going to whichever connection claimed it. That is real state in the endpoint,
+/// and it is why upstream declines to support this at all.
+#[test]
+fn concurrent_rendezvous_handshakes_orphan_a_pair() {
+    for seed in [1u64, 7, 42] {
+        let got = contended_share(
+            LinkConfig::bottleneck(50, 20, 50),
+            seed,
+            [CcKind::Cubic; 2],
+            4_000_000,
+            false,
+        );
+        assert!(
+            got[0] == 0 || got[1] == 0,
+            "seed {seed}: both pairs carried traffic ({got:?}) -- if this now works, \
+             the serialisation in `connect_rendezvous` may no longer be needed"
+        );
     }
 }
