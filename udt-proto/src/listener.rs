@@ -81,10 +81,39 @@ pub struct Listener {
     accepted_order: VecDeque<PeerAddr>,
     /// Secret for cookie generation (random at listener creation).
     secret: u64,
+    /// Counter behind [`Listener::mint_socket_id`].
+    next_id: u32,
     enc: BytesMut,
 }
 
 impl Listener {
+    /// A socket id for a newly accepted connection.
+    ///
+    /// Each accepted connection gets its own, which is what upstream does
+    /// (`api.cpp`, `hs->m_iID = ns->m_SocketID`) and what lets more than one
+    /// connection exist between the same pair of addresses. Upstream
+    /// demultiplexes on `(peer, client socket id, client ISN)`; reusing the
+    /// listener's id for every connection collapses that to one per address
+    /// pair, which is what this used to do.
+    ///
+    /// Derived from the listener's secret rather than drawn from a random
+    /// source, because this crate owns no clock and no entropy. Mixing the
+    /// counter through the secret keeps ids unguessable to an off-path
+    /// attacker, which the socket id is relied on for elsewhere — see the
+    /// blind-injection note in the README. Never returns 0, which is reserved
+    /// for a packet addressed to no connection in particular.
+    fn mint_socket_id(&mut self) -> u32 {
+        loop {
+            self.next_id = self.next_id.wrapping_add(1);
+            let mixed = (self.secret ^ ((self.next_id as u64) << 32 | self.next_id as u64))
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let id = ((mixed >> 32) ^ mixed) as u32;
+            if id != 0 && id != self.socket_id {
+                return id;
+            }
+        }
+    }
+
     /// Creates a listener.
     ///
     /// `socket_id` identifies the listening endpoint. `mss` is the path MTU
@@ -98,6 +127,7 @@ impl Listener {
             mss,
             cc,
             flight_flag_size: 25600,
+            next_id: 0,
             accepted: HashMap::new(),
             accepted_order: VecDeque::new(),
             secret,
@@ -186,6 +216,11 @@ impl Listener {
                 let neg_mss = (hs.mss as u32).min(self.mss);
                 let flow_wnd = hs.flight_flag_size as u32;
 
+                // One id per connection, so the peer can address this one apart from
+                // any other it has open to us. Minted before the response so both
+                // carry the same value, and only on first accept -- a retransmitted
+                // conclusion is answered from `accepted` with the id already sent.
+                let new_id = self.mint_socket_id();
                 let our_resp = Handshake {
                     version: UDT_VERSION,
                     sock_type: SOCK_DGRAM,
@@ -193,13 +228,13 @@ impl Listener {
                     mss: neg_mss as i32,
                     flight_flag_size: flow_wnd as i32,
                     req_type: req_type::RESPONSE,
-                    socket_id: self.socket_id as i32,
+                    socket_id: new_id as i32,
                     cookie: stored_cookie,
                     peer_ip: [0u32; 4],
                 };
 
                 let conn = Connection::new_connected(
-                    self.socket_id,
+                    new_id,
                     hs.socket_id as u32,
                     local_isn,
                     peer_isn,
