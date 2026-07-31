@@ -962,9 +962,12 @@ fn cost_on_a_bottleneck() {
         // A shallow buffer is where a line-rate opening burst has nowhere to go.
         ("100mbit 10ms 5ms buf", 100, 10, 5),
     ] {
-        for (loss_label, loss_pct, burst) in
-            [("clean", 0.0f64, 1.0f64), ("2% iid", 2.0, 1.0), ("2% burst", 2.0, 10.0)]
-        {
+        for (loss_label, loss_pct, burst) in [
+            ("clean", 0.0f64, 1.0f64),
+            ("2% iid", 2.0, 1.0),
+            ("2% burst", 2.0, 10.0),
+            ("5% burst", 5.0, 10.0),
+        ] {
             let (mut ratios, mut mbps_got, mut queues, mut drops) =
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             for seed in SEEDS {

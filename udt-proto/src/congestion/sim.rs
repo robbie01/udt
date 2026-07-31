@@ -373,6 +373,7 @@ mod tests {
             match name {
                 "udt" => Box::new(UdtCc::new()),
                 "cubic" => Box::new(Cubic::new()),
+                "ledbat" => Box::new(Ledbat::new()),
                 _ => Box::new(LossBased::new()),
             }
         }

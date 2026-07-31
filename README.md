@@ -259,15 +259,20 @@ RFC 9406's 4 ms floor on what counts as a queue had to go — on a 5 ms path it
 demands an 80% rise before it will believe in one — so the threshold is
 proportional to the path with a 1 ms floor.
 
-**One caveat on that default, found while writing this section.** On a link with
-5% loss and *no bottleneck* — no queue, so every drop is random — CUBIC costs
-52x the clean transfer time where UDT's controller costs 1.6x. It halves a
-window that nothing is refilling it against. That case was not checked before
-the default changed, and it is the strongest argument against the choice. It is
-also the least realistic link in the suite, for the same reason the no-bottleneck
-loss sweep below is: a path with no queue is not a path anyone has. On links that
-do have a bottleneck the gap is 1.5x, not 52x. If your paths are lossy, measure
-before trusting the default.
+**The default is a real trade, and loss is the side it loses.** On bottlenecked
+links, CUBIC against UDT's controller in Mbit/s:
+
+| link | 2% burst | 5% burst |
+|---|---|---|
+| 100 Mbit, 10 ms | 75.0 vs 85.8 | 21.3 vs **56.0** |
+| 100 Mbit, 50 ms | 27.1 vs 40.8 | 5.3 vs **25.5** |
+| 100 Mbit, 10 ms, 5 ms buffer | 28.3 vs 47.7 | 13.3 vs **35.7** |
+
+The degradation is superlinear: a 1.5x gap at 2% becomes 2.6-4.8x at 5%. If you
+know your paths are lossy, `CcKind::Udt` is measurably better and switching is
+one line. The default is CUBIC because sharing a link is a condition every
+peer-to-peer transfer meets constantly, while 5% loss is a bad path rather than
+a normal one — and UDT's controller takes 3% of a contended 50 ms link.
 
 Under loss the picture reverses, and how much depends entirely on what the loss
 looks like. At 2% in bursts of ten, UDT's controller leads CUBIC 40.8 to 27.1

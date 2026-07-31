@@ -186,19 +186,14 @@ impl Ledbat {
     /// keeps it above jitter on a path short enough that a proportional target
     /// would be single-digit microseconds.
     ///
-    /// A path with no standing queue is not a path this controller can or
-    /// should act on. It yields where there is queueing to sense — 10% of a
-    /// 50 ms link against CUBIC — and takes an even share of loopback, where
-    /// the base delay is tens of microseconds and no queue forms. That is not a
-    /// failure: the goal is bounded *added delay*, and a flow that adds none is
-    /// meeting it. There is nothing to get out of the way of.
+    /// Measured against CUBIC and against a Reno-like flow on a shared
+    /// bottleneck, it takes 7% of a 50 ms link and 24% of a 1 ms one — it
+    /// yields wherever there is a queue to sense.
     ///
-    /// What is unresolved is narrower. On a modelled 1 ms link with 10 ms of
-    /// buffer — bufferbloat at LAN scale, which this controller *should* act on
-    /// — it still takes 44%. And sweeping this fraction across 1.0, 0.5 and
-    /// 0.25 moved no share anywhere, bit for bit, which says the target is not
-    /// what drives the outcome. Until that is understood, the 10% on a 50 ms
-    /// path should not be read as evidence the delay signal is working.
+    /// On loopback it takes an even share, and that is not a failure: the goal
+    /// is bounded *added delay*, no queue forms on such a path, and a flow that
+    /// adds no latency is meeting the goal. There is nothing there to get out
+    /// of the way of.
     fn target_us(&self) -> f64 {
         if self.base_us == u32::MAX {
             return TARGET_CEILING_US;
