@@ -1,99 +1,175 @@
-# Data during the handshake
+# Data on the first packet
 
-UDT establishes in two round trips. The client sends `CONNECT`, the listener
+UDT establishes in two round trips: the client sends `CONNECT`, the listener
 answers with a cookie challenge, the client echoes the cookie in a `RESPONSE`,
 and the listener accepts. Application data goes out after all of that, so the
-first byte costs two round trips — 100 ms on a 50 ms path before anything
-useful moves.
+first byte costs two round trips — 100 ms on a 50 ms path before anything moves.
 
-Two things could be done about that, and they are not the same feature.
+The goal here is to carry opaque bytes on the *first* packet, so that whatever
+sits above the transport can start its own handshake immediately rather than
+waiting for this one to finish.
 
-## Data on the conclusion (safe, one round trip saved)
+## The transport does not know what the bytes are
 
-Attach data to the client's `RESPONSE`, the packet that echoes the cookie.
+The motivating case is a Noise handshake — `NK`/`IK`/`NX` for client-to-server,
+`XX` or `KK` for rendezvous. None of that belongs in this crate. The transport
+carries an opaque `&[u8]`, hands it to the application at accept time, and has
+no opinion about its contents.
 
-The cookie is already proof that the client received the listener's challenge,
-so the source address is verified by that point. A listener acting on this data
-is not acting for an unverified peer, and the amplification and state-exhaustion
-properties the cookie exists to provide are untouched.
+That matters for more than tidiness: the replay and forward-secrecy properties
+below depend on which pattern is chosen, and the transport cannot reason about
+them. It can only state what it guarantees and let the layer above decide
+whether that is enough.
 
-This is the one worth doing first. It saves one of the two round trips and costs
-nothing that is currently guaranteed.
+## Budget
 
-## Data on the initial `CONNECT` (true 0-RTT, and it breaks something)
+At a 1500-byte MTU, after 28 bytes of IP/UDP, a 16-byte UDT control header and
+the 48-byte handshake body, **1408 bytes** remain. Every Noise handshake message
+fits with room to spare — `IK` message 1 with a static key and a short payload is
+under 150 bytes.
 
-Attach data to the very first packet.
+A cap well under the MTU is the right call. One packet, never fragmented, never
+a second datagram before the connection exists.
 
-The README currently promises: *"The handshake is stateless behind a cookie, so
-an unverified peer cannot make a listener allocate anything, and the reply is no
-larger than the request."* Carrying data on the first packet contradicts that
-directly — a spoofed source could make a listener buffer and deliver payload it
-never verified anyone asked for.
+## The tension this feature turns on
 
-TLS 1.3 has the same exposure and lives with it by restricting 0-RTT to
-idempotent requests and adding anti-replay machinery. Doing this here means
-accepting the same restriction and saying so in the security section, not
-quietly widening what the transport promises.
+The listener is allocation-free against an unverified peer, and that is
+deliberate: the cookie is stateless, derived from the peer address, a listener
+secret and a coarse clock, with nothing recorded. The README promises it.
 
-**Recommendation: do the conclusion version, and treat the initial-packet
-version as a separate decision with a security cost attached.**
+0-RTT data arrives on the first packet, before the cookie has come back. So a
+stateless listener has nowhere to put it. Three ways out, and only one works:
+
+**Client repeats the payload in the conclusion.** Listener stays stateless,
+discards the first copy, reads the second. But then the first copy bought
+nothing — this is data-on-the-conclusion with a wasted transmission. It saves
+one round trip relative to today, not two, and does not need first-packet data
+at all.
+
+**Encode it into the cookie.** The cookie is a single `i32` field. Not remotely
+enough for a Noise message. Dead.
+
+**The listener holds bounded state.** The only option that delivers actual
+0-RTT. It trades "allocates nothing" for "allocates a bounded, configurable
+amount, and stops when pressed" — which is the trade QUIC makes for address
+validation, where a server is stateful when it can afford to be and falls back
+to a stateless Retry under load.
+
+**Recommendation: bounded state, with the fallback.** Concretely:
+
+- a fixed-capacity pool of pending 0-RTT payloads, sized at listener creation;
+- one entry per peer address, so a single source cannot fill it;
+- entries expire on the cookie's own lifetime, since a conclusion arriving after
+  that is refused anyway;
+- when the pool is full, fall back to today's behaviour — answer with the cookie
+  challenge and drop the payload. The client then either resends its data after
+  the handshake or, if the extension is negotiated, on the conclusion. Never
+  fail the connection over it.
+
+Under attack this degrades to exactly the current guarantee. That is the
+property worth preserving, and it is stronger than "we allocate a bit".
+
+## Amplification
+
+An unverified peer must not be able to make the listener send more than it
+received. Today that holds trivially: the challenge is no larger than the
+request.
+
+With a payload in flight the listener may want to answer with one — a Noise
+`msg2` in the challenge would save the second round trip too. That is only safe
+if the request was at least as large, so borrow QUIC's rule directly:
+
+- **a `CONNECT` carrying 0-RTT data must be padded to a fixed minimum** (QUIC
+  uses 1200 bytes for its Initial packets; the same number is a reasonable
+  starting point here);
+- the listener's reply to an unvalidated peer may not exceed what it received.
+
+Padding costs a full-MTU packet on a path where a 76-byte one would have done.
+That is the price of a response before address validation, and it should be the
+application's choice, not a default.
 
 ## Replay
 
-Both versions are replayable. An attacker who captures a conclusion packet can
-send it again, and the listener will accept the data a second time unless the
-cookie is single-use.
+The cookie is stateless, so it is not single-use: a captured first packet can be
+replayed for as long as the cookie remains valid, and the listener will accept
+the payload again.
 
-**Checked: it is not single-use.** The cookie is stateless by design — derived
-from the peer address, a listener secret and a coarse clock, with nothing
-recorded (`listener.rs`, "Nothing is recorded here on purpose"). That is what
-makes the handshake allocation-free against an unverified peer, and it is a
-property worth keeping.
+For a Noise handshake this is milder than it sounds but not nothing:
 
-It also means a captured conclusion packet can be replayed for as long as the
-cookie stays valid, and the listener will accept the data again. Statelessness
-and replay protection pull in opposite directions here: anything that remembers
-which cookies have been used reintroduces the per-peer state the design
-deliberately avoids.
+- The responder generates a fresh ephemeral per handshake, so a replayed message
+  1 does not produce a duplicate session — it produces a *new* one that the
+  original client cannot complete.
+- What it does buy an attacker is work: each replay costs the responder a DH
+  operation and a pool entry. The per-address cap above bounds that.
+- For patterns where message 1 carries an encrypted payload under a static key —
+  `IK`, `KK` — that payload is replayable and has no forward secrecy. The Noise
+  specification says so directly about first-message payloads. An application
+  putting anything non-idempotent there is making a mistake the transport cannot
+  catch.
 
-Options, none free:
-
-- Accept replay and restrict this to idempotent payloads, as TLS 1.3 does. Needs
-  saying plainly in the API and the security section.
-- Keep a small window of recently-used cookies. Bounded state, so bounded
-  exposure, but no longer strictly allocation-free.
-- Bind the cookie to something the replayer cannot reproduce. Nothing obvious
-  is available without encryption, which the protocol does not have.
-
-This is the decision the feature turns on, and it should be made before any code
-is written.
+The transport's obligation is to document that a 0-RTT payload may be delivered
+more than once, and to bound the work a replay costs. It cannot provide
+exactly-once for a payload that arrives before any state exists.
 
 ## Wire compatibility
 
-The handshake is a fixed-layout control packet. The extension is the selective
-ACK trick again: append the payload after the documented body, so a peer that
-does not know about it reads the fields it expects and ignores the rest.
+The handshake is a fixed-layout control packet. The intended trick is the one
+selective ACK used: append the payload after the documented 48-byte body, so a
+peer that does not know about it reads the fields it expects and ignores the
+rest.
 
-**Unverified, and it is the first thing to establish:** whether the C++ fork and
-pristine upstream both tolerate trailing bytes on a handshake packet. Selective
-ACK proved they tolerate it on an ACK; nothing has tested it here, and a
-handshake is parsed by different code. If either implementation rejects an
-over-long handshake, this feature cannot be a compatible extension and the
-design has to change — probably to a negotiated capability flag in the
-handshake's spare fields, with data only after both sides confirm.
+**This is unverified and is the first thing to establish.** Selective ACK proved
+both C++ implementations tolerate trailing bytes on an *ACK*; a handshake is
+parsed by different code, and `CHandShake::deserialize` may or may not care.
+Test it against the fork and pristine upstream before anything else — if either
+rejects an over-long handshake, the payload cannot ride along transparently and
+the design changes to a capability flag negotiated in the handshake's spare
+fields, with data only once both ends have agreed.
+
+That test is cheap and the harness already exists.
 
 ## Sequencing
 
-The data needs a sequence number the receiver can place. The client's initial
-sequence number is already in the handshake, so payload on the conclusion is
-naturally the first packet of the stream. The receive buffer has to exist before
-the accepted `Connection` is handed to the application, which it does, but the
-listener path currently builds the connection *after* the handshake completes —
-so the data has to be held across that boundary.
+The payload is not stream data and must not consume a sequence number — the
+connection's first data packet should still be the ISN. It is delivered
+out-of-band, once, at accept time.
+
+The listener currently builds its `Connection` *after* the handshake completes,
+so a payload accepted on the first packet has to be held across that boundary
+and attached to the connection when it is created.
+
+## API shape
+
+```rust
+// client
+let socket = endpoint.connect_with_data(peer, &noise_msg1).await?;
+
+// server
+let (socket, early) = listener.accept_with_data().await?;
+```
+
+`early` is `Option<Bytes>` — `None` when the peer sent nothing, or when the
+listener was under pressure and dropped it. An application must handle `None` by
+falling back to its normal handshake, because it will happen.
+
+The existing `connect` and `accept` keep their signatures and behaviour.
 
 ## Rendezvous
 
-Both peers send handshakes simultaneously and there is no listener. Which side's
-data is "first" is not defined the way it is for connect/accept, and both could
-carry payload. Worth deciding whether rendezvous supports this at all in the
-first version; saying no is defensible.
+Both peers send handshakes simultaneously and neither is a listener, so there is
+no cookie challenge and no unverified-peer problem in the same shape — but also
+no obvious "first" side. Both payloads would be carried, and an upper layer doing
+`XX` or `KK` has to resolve which role each end takes.
+
+Supporting it in the first version is optional and saying no is defensible. The
+connect/accept path is where the round trips actually hurt.
+
+## Order of work
+
+1. Test whether both C++ implementations tolerate trailing bytes on a handshake.
+   Everything below depends on the answer.
+2. Decide the pool budget and whether the padding requirement is on by default.
+3. Wire format and codec, with a fuzz target, since this parses attacker-supplied
+   bytes before any validation has happened.
+4. Listener state and the pressure fallback.
+5. API, then rendezvous if wanted.
