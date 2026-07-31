@@ -229,8 +229,15 @@ impl Sim {
         let now = 1_000_000;
         // Rendezvous on both sides: it needs no listener, so the whole
         // handshake runs through the same two objects under test.
-        let a = Connection::new_rendezvous(1, SeqNo::new(1000), 1500, now, CcKind::Udt);
-        let b = Connection::new_rendezvous(2, SeqNo::new(9000), 1500, now, CcKind::Udt);
+        // `UDT_CC=cubic` reruns any of these measurements against the other
+        // controller, which is the only way to compare growth laws on the same
+        // link, seed and workload.
+        let cc = match std::env::var("UDT_CC").as_deref() {
+            Ok("cubic") => CcKind::Cubic,
+            _ => CcKind::Udt,
+        };
+        let a = Connection::new_rendezvous(1, SeqNo::new(1000), 1500, now, cc);
+        let b = Connection::new_rendezvous(2, SeqNo::new(9000), 1500, now, cc);
         Sim {
             now,
             a,

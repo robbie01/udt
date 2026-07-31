@@ -8,6 +8,8 @@
 //! Implementing the trait yourself is supported but the interface is not
 //! stable — see the crate-level stability note.
 
+pub mod cubic;
+mod hystart;
 pub mod ledbat;
 #[cfg(test)]
 mod sim;
@@ -69,6 +71,33 @@ pub enum CcKind {
     /// TCP and is the right default for a transfer that should go fast.
     #[default]
     Udt,
+    /// CUBIC (RFC 9438): one window, grown as a cubic function of the time
+    /// since the last congestion event, with the send rate derived from it.
+    /// What the rest of the internet runs, so its fairness is a known
+    /// quantity. See [`cubic`].
+    ///
+    /// **Faster than [`Udt`](Self::Udt) on a link that only drops when it is
+    /// full, and far slower on one that drops at random.** Measured over 5 MB
+    /// on a bottleneck, six seeds, CUBIC against `Udt`:
+    ///
+    /// | link | clean | 2% random loss |
+    /// |---|---|---|
+    /// | 100 Mbit, 50 ms | 72.0 vs 58.0 Mbit/s | 2.0 vs 18.6 Mbit/s |
+    /// | 100 Mbit, 10 ms, 5 ms buffer | 65.1 vs 51.4, and 31 drops against 1413 | 8.1 vs 39.4 Mbit/s |
+    /// | 10 Mbit, 50 ms | 9.7 vs 7.2 Mbit/s | 1.9 vs 4.8 Mbit/s |
+    ///
+    /// The collapse is not a defect in the implementation; it is what a
+    /// loss-based controller does when loss does not mean congestion. Backing
+    /// off 30% per event puts it on the Mathis limit, about 4 Mbit/s at 2% loss
+    /// and a 25 ms round trip. `Udt` survives that because its response is a
+    /// 12.5% nudge to a rate rather than a cut to a window — which is the same
+    /// choice that leaves it at 62% of a clean long fat pipe.
+    ///
+    /// Pick this for a path whose loss is congestion: a wired link, a
+    /// datacentre, anywhere a drop means a full buffer. Keep the default for a
+    /// path that loses packets for its own reasons, such as wifi or a marginal
+    /// last mile.
+    Cubic,
     /// A delay-based controller that treats growing queues as a signal to back
     /// off, so a transfer using it gets out of the way of interactive traffic
     /// on the same link and uses only what is left over. Suits backups,
@@ -81,6 +110,7 @@ impl CcKind {
     pub fn build(self) -> Box<dyn CongestionControl> {
         match self {
             CcKind::Udt => Box::new(udt_cc::UdtCc::new()),
+            CcKind::Cubic => Box::new(cubic::Cubic::new()),
             CcKind::LedbatPlusPlus => Box::new(ledbat::Ledbat::new()),
         }
     }
