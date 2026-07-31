@@ -356,29 +356,73 @@ same as `connect` today. `send_early` queues one message to travel with the
 conclusion; calling it after the conclusion has gone out is an error rather than
 a silent normal send.
 
-### Did it land
+### Sharing the ordinary data path
 
-A peer that does not know the extension drops the payload, and nothing on the
-wire says so. The client needs to find out, or a Noise handshake waits forever
-for a `msg2` that is never coming.
+The early payload should not be a parallel delivery mechanism. It should be an
+**early transmission of a packet that also lives in the normal send buffer**.
 
-```rust
-if !socket.early_data_accepted() {
-    socket.send(&noise_msg1).await?;   // peer ignored it; send it normally
-}
-```
+The client enqueues the message the way it enqueues any message: into `snd_buf`,
+as message 0, at sequence `ISN`. It then *additionally* emits it beside the
+conclusion. Nothing about the send buffer's view changes — as far as it is
+concerned the packet has been sent and is unacknowledged, exactly like any other.
 
-Two ways to implement that, and this is the open choice:
+Everything then falls out of machinery that already exists:
 
-1. **Have the listener acknowledge.** A Rust listener answers the early payload
-   with a small control packet; a C++ one sends nothing. Costs one packet and a
-   bounded wait. Explicit, and the client learns before it sends anything else.
-2. **Infer from the peer's handshake.** Cheaper, but there is no spare field
-   that a C++ implementation is guaranteed to leave alone, and inventing one
-   risks the compatibility this whole design was rearranged to protect.
+| | comes from |
+|---|---|
+| acknowledgement | the ordinary ACK. If the peer acks `ISN`, it arrived. |
+| loss recovery | the ordinary NAK and RTO paths. `snd_buf` still holds it. |
+| duplicate suppression | the receiver already discards a sequence it has. |
+| ordering | it *is* sequence `ISN`; the receive buffer places it. |
 
-(1) is the safer default. It should be resolved before the wire format is fixed,
-since it decides whether a second control type is needed.
+The receiver's side needs nothing special either: its `rcv_buf` is created at
+`peer_isn`, taken from the handshake, and the early packet carries exactly that
+sequence number. It lands where the first data packet was always going to land.
+
+### What this removes
+
+**The acknowledgement question disappears.** There is no need for a listener to
+confirm receipt, and no need for `early_data_accepted()`:
+
+- peer received it → it acks `ISN` like anything else;
+- packet lost → the ordinary retransmission timer resends it after the handshake
+  completes, as an ordinary data packet;
+- peer is a C++ implementation that dropped it → indistinguishable from loss, and
+  handled by the same path.
+
+That third case is the one worth pausing on. A peer that does not know the
+extension is not a special case at all — it is loss, and loss is already solved.
+The cost of talking to one is a single wasted packet and one retransmission
+timeout, and no application code changes.
+
+**`send_early` may not need to exist.** If any message queued before the
+handshake completes is opportunistically sent early, the API reduces to
+`connect_early` plus ordinary `send`. Worth deciding: an explicit call is clearer
+about what rides along and bounds it to one message, while implicit means an
+application that happens to send early gets the benefit for free.
+
+### What still has to change
+
+Sharing the data path is not free — it moves two things earlier:
+
+- **The send buffer must exist before the handshake completes**, so the message
+  has somewhere to live. It is created in `post_connect` today.
+- **The listener must accept a data packet for a connection that does not exist
+  yet**, hold it against the pending handshake, and feed it to the receive buffer
+  at accept. Handshake packets are already demultiplexed by address, so the
+  routing exists; what is new is holding a payload across the boundary.
+
+Both are real, and both are smaller than reimplementing acknowledgement,
+retransmission and duplicate suppression alongside the versions that already
+work.
+
+There is one wrinkle to check: at the point the conclusion goes out, the client
+has not yet learned the listener's socket id — the challenge echoes the client's
+own handshake with only the cookie filled in. Handshake packets already go out
+with a destination socket id of 0 and are matched by address, so the early data
+packet can do the same, but that means it cannot be an entirely ordinary data
+packet on the wire. Whether that costs a distinct type or a reserved id is the
+first thing to settle in the wire format.
 
 ### Server
 
