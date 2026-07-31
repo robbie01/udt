@@ -229,7 +229,7 @@ mod tests {
     /// other test; what is unreliable is rendezvous establishment, not routing.
     /// Run it with `--ignored` when working on that.
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "concurrent rendezvous to one address still races; run with --ignored"]
+    #[ignore = "concurrent rendezvous to one address races; cause not understood"]
     async fn two_connections_can_share_one_address_pair() {
         let ep_a = Arc::new(Endpoint::bind("127.0.0.1:0").await.unwrap());
         let ep_b = Arc::new(Endpoint::bind("127.0.0.1:0").await.unwrap());
