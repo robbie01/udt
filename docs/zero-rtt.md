@@ -217,6 +217,42 @@ For a rendezvous pair there is no listener and no challenge, so both sides are
 at 0.0 and both may send a payload immediately. Which is the other reason that
 path is the one to build first.
 
+## Why the conclusion-phase variant is the one to build
+
+A two-message Noise pattern — `NK`, `IK`, `KK`, `NX` — completes in one round
+trip. Carried on the conclusion, that fits entirely inside the transport
+handshake:
+
+```
+1.0  →  RESPONSE (cookie) + noise msg1 [+ payload]
+1.5  ←  accept + noise msg2 [+ payload].   client data has arrived
+2.0     server data arrives, session established both ways
+```
+
+The transport handshake finishes at 2.0 either way. The Noise handshake finishes
+at 2.0 too. **Encryption costs zero additional round trips** — it is entirely
+hidden inside establishment, and the first application bytes land at 1.5 and 2.0
+where today they land at 2.5 and 3.0.
+
+The first-packet variant would complete Noise at 1.0, which is genuinely earlier
+but buys a round trip the transport cannot use for free: it costs speculative
+allocation for unverified peers, a padding requirement, and a listener doing
+Diffie-Hellman before it has validated an address. That is a lot of exposure to
+finish a handshake ahead of the connection it belongs to.
+
+So: **build the conclusion-phase variant.** It is the point where the security
+handshake becomes free, and everything past it is paid for in attack surface.
+
+Two consequences for pattern choice, which belong to the layer above but are
+worth stating here:
+
+- A payload in Noise message 1 — `IK` and `KK` carry one under a static key — is
+  replayable and has no forward secrecy, as the Noise specification says. That
+  is fine for a handshake message and not fine for application data that matters.
+- `XX` is three messages, so it does not fit this shape: message 3 lands after
+  the transport handshake is over. It still works, it just does not get the free
+  ride.
+
 ## Ordering
 
 The payload is now a separate datagram, so it can arrive before the `CONNECT`
