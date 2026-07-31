@@ -309,6 +309,50 @@ impl Endpoint {
     ///
     /// [`ErrorKind::TimedOut`]: std::io::ErrorKind::TimedOut
     pub async fn connect(&self, peer: impl ToSocketAddrs) -> io::Result<Socket> {
+        self.connect_inner(peer, None).await
+    }
+
+    /// Connects, sending one message with the handshake.
+    ///
+    /// UDT establishes in two round trips, so the first byte of data normally
+    /// costs both. `early` travels with the handshake's final packet and
+    /// reaches the peer a round trip sooner — it arrives as the connection's
+    /// first message, so a server reads it from [`Socket::recv`] exactly as it
+    /// would read anything else and needs no special handling.
+    ///
+    /// The motivating case is starting a cryptographic handshake, where this
+    /// makes a two-message exchange such as Noise `IK` fit inside connection
+    /// establishment instead of following it.
+    ///
+    /// This is an *extra* transmission of an ordinary message, not a separate
+    /// channel. It is acknowledged, retransmitted and de-duplicated by the same
+    /// machinery as anything else, so a peer that ignores it — an
+    /// implementation not expecting data before the handshake ends — costs one
+    /// wasted packet and a retransmission, and nothing above notices.
+    ///
+    /// `early` must fit in a single packet; anything larger is rejected with
+    /// [`ErrorKind::InvalidInput`]. It is delivered at most once despite the
+    /// duplicate transmission.
+    ///
+    /// # Errors
+    ///
+    /// As [`connect`](Self::connect), plus [`ErrorKind::InvalidInput`] if
+    /// `early` is empty or too large for one packet.
+    ///
+    /// [`ErrorKind::InvalidInput`]: std::io::ErrorKind::InvalidInput
+    pub async fn connect_with_early_data(
+        &self,
+        peer: impl ToSocketAddrs,
+        early: &[u8],
+    ) -> io::Result<Socket> {
+        self.connect_inner(peer, Some(Bytes::copy_from_slice(early))).await
+    }
+
+    async fn connect_inner(
+        &self,
+        peer: impl ToSocketAddrs,
+        early: Option<Bytes>,
+    ) -> io::Result<Socket> {
         let peer = resolve(peer).await?;
         let std_sock = std::net::UdpSocket::bind(outgoing_bind_addr(self.inner.local_addr, peer))?;
         std_sock.set_nonblocking(true)?;
@@ -316,13 +360,21 @@ impl Endpoint {
         let socket = Arc::new(UdpSocket::from_std(std_sock)?);
         let local_addr = socket.local_addr()?;
 
-        let conn = Connection::new_active(
+        let mut conn = Connection::new_active(
             next_socket_id(),
             random_isn(),
             self.inner.cfg.mss,
             now_us(),
             self.inner.cfg.congestion,
         );
+        if let Some(bytes) = early
+            && !conn.set_early_data(bytes)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "early data must be non-empty and fit in one packet",
+            ));
+        }
         let (send_tx, send_rx) = mpsc::channel::<SendReq>(SEND_BACKLOG);
         let (recv_tx, recv_rx) = flume::bounded::<Bytes>(RECV_BACKLOG);
         let (connected_tx, connected) = oneshot::channel::<()>();

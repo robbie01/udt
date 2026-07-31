@@ -204,6 +204,54 @@ mod tests {
     // Verifies that concurrent connect_rendezvous() calls on the same Endpoint
     // all go through the single endpoint mux without racing on recv_from.
 
+    /// Data handed to `connect_with_early_data` must arrive as the
+    /// connection's first message, with no special handling on the server.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn early_data_arrives_as_the_first_message() {
+        const MSG: &[u8] = b"noise handshake message one";
+
+        let server_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+        let addr = server_ep.local_addr();
+        let listener = server_ep.listen(4).unwrap();
+
+        let client_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+        let (server, client) = tokio::join!(async { listener.accept().await.unwrap() }, async {
+            client_ep.connect_with_early_data(addr, MSG).await.unwrap()
+        });
+
+        // An ordinary recv, exactly as a server that knows nothing about this
+        // would write it.
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(10), server.recv(&mut buf))
+            .await
+            .expect("early data never arrived")
+            .unwrap();
+        assert_eq!(&buf[..n], MSG);
+
+        // And it must not be delivered a second time by the ordinary path.
+        client.send(b"second").await.unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(10), server.recv(&mut buf))
+            .await
+            .expect("follow-up never arrived")
+            .unwrap();
+        assert_eq!(&buf[..n], b"second", "early data was delivered twice");
+    }
+
+    /// Rejected rather than silently dropped when it cannot travel.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn oversized_early_data_is_refused() {
+        let server_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+        let addr = server_ep.local_addr();
+        let _listener = server_ep.listen(4).unwrap();
+        let client_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+
+        let kind = match client_ep.connect_with_early_data(addr, &vec![0u8; 64 * 1024]).await {
+            Ok(_) => panic!("oversized early data was accepted"),
+            Err(e) => e.kind(),
+        };
+        assert_eq!(kind, std::io::ErrorKind::InvalidInput);
+    }
+
     /// Two connections between the *same* pair of addresses must both work.
     ///
     /// Upstream demultiplexes on peer address, client socket id and ISN together,

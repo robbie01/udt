@@ -98,6 +98,20 @@ Serving is the mirror image — `endpoint.listen(backlog)?` then
 `listener.accept().await`. Two peers behind firewalls can also reach each other
 directly with `connect_rendezvous`, no listener on either side.
 
+A connection can carry one message with its handshake, which arrives a round
+trip before the connection is otherwise usable:
+
+```rust
+let socket = endpoint.connect_with_early_data(peer, &noise_msg1).await?;
+```
+
+It arrives as the connection's first `recv`, so a server needs no special
+handling and cannot tell the difference. That is enough to fit a two-message
+cryptographic handshake — Noise `IK`, `NK`, `KK` — inside establishment rather
+than after it. It is an extra transmission of an ordinary message, so
+acknowledgement, retransmission and de-duplication are the usual ones, and a
+peer that ignores it costs one wasted packet.
+
 Every method takes `&self`, so a socket is shared between tasks with an `Arc`:
 one sending while another receives is the expected pattern.
 
