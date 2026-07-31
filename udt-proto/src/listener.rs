@@ -10,6 +10,13 @@ use std::collections::{HashMap, VecDeque};
 
 /// How long a completed handshake is remembered.
 ///
+/// How many peers may have early data held for them at once.
+///
+/// Each entry is one packet, and a peer that never completes its handshake
+/// costs one until it is evicted. Bounded rather than absent because this is
+/// reachable by an unverified peer.
+const EARLY_DATA_SLOTS: usize = 256;
+
 /// Long enough to outlive any cookie a peer could still be echoing, which is
 /// what stops a retransmitted handshake being mistaken for a new one.
 const ACCEPT_MEMORY_US: u64 = 150_000_000;
@@ -79,6 +86,9 @@ pub struct Listener {
     accepted: HashMap<PeerAddr, (u64, Handshake)>,
     /// Insertion order for `accepted`, for eviction.
     accepted_order: VecDeque<PeerAddr>,
+    /// Data received from a peer whose handshake has not completed yet, keyed
+    /// by address, with the sequence number it claimed and when it arrived.
+    early: HashMap<PeerAddr, (u64, SeqNo, Bytes)>,
     /// Secret for cookie generation (random at listener creation).
     secret: u64,
     /// Counter behind [`Listener::mint_socket_id`].
@@ -130,6 +140,7 @@ impl Listener {
             next_id: 0,
             accepted: HashMap::new(),
             accepted_order: VecDeque::new(),
+            early: HashMap::new(),
             secret,
             enc: BytesMut::with_capacity(mss as usize),
         }
@@ -156,6 +167,21 @@ impl Listener {
                 header,
                 body: crate::packet::ControlBody::Handshake(hs),
             } => (hs, header.timestamp_us),
+            // Data arriving before a connection exists is early data: a client
+            // sending its first message beside the handshake conclusion, a
+            // round trip before the connection is usable. Hold it against the
+            // address and hand it over at accept.
+            //
+            // Held, not acted on. It is unverified at this point -- no cookie
+            // has come back -- so it buys a slot and nothing else, and the slot
+            // is bounded and evicted oldest-first like `accepted`. A conclusion
+            // that never arrives costs one entry until it ages out.
+            crate::packet::Packet::Data { header, payload } => {
+                if !payload.is_empty() && self.early.len() < EARLY_DATA_SLOTS {
+                    self.early.insert(addr, (now_us, header.seq_no, payload));
+                }
+                return;
+            }
             _ => return,
         };
         if hs.version != UDT_VERSION || hs.sock_type != SOCK_DGRAM {
@@ -233,7 +259,7 @@ impl Listener {
                     peer_ip: [0u32; 4],
                 };
 
-                let conn = Connection::new_connected(
+                let mut conn = Connection::new_connected(
                     new_id,
                     hs.socket_id as u32,
                     local_isn,
@@ -243,6 +269,13 @@ impl Listener {
                     now_us,
                     self.cc.build(),
                 );
+
+                // Hand over anything that arrived beside the conclusion. Done
+                // before the connection leaves here, since afterwards there is
+                // no way to reach it.
+                if let Some((_, seq, payload)) = self.early.remove(&addr) {
+                    conn.inject_early_data(seq, &payload, now_us);
+                }
 
                 self.remember_accepted(addr.clone(), our_resp.clone(), now_us);
 

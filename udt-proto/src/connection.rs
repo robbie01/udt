@@ -8,13 +8,13 @@ use crate::codec;
 use crate::congestion::{CcContext, CcKind, CcOutput, CongestionControl};
 use crate::handshake::{Handshake, SOCK_DGRAM, UDT_VERSION, req_type};
 use crate::loss_list::{RcvLossList, SndLossList};
-use crate::packet::{AckFull, ControlBody, Packet};
+use crate::packet::{AckFull, ControlBody, MsgBoundary, Packet};
 use crate::recv_buffer::{AddResult, RecvBuffer};
 use crate::send_buffer::SendBuffer;
-use crate::seq::{AckSeqNo, SEQ_MAX, SeqNo};
+use crate::seq::{AckSeqNo, MsgNo, SEQ_MAX, SeqNo};
 use crate::time_window::PktTimeWindow;
 use crate::transmit::TransmitBuf;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 /// Size of the fixed UDT packet header (4 × u32) that precedes every payload.
 pub const UDT_HEADER_SIZE: usize = 16;
@@ -377,6 +377,12 @@ pub struct Connection {
     /// per-ACK samples makes the rate estimate wildly noisy.
     delivery_rate_pps: u32,
     bandwidth_pps: u32,
+    /// One message to send with the handshake conclusion, a round trip before
+    /// the connection is usable. See [`Connection::set_early_data`].
+    early_data: Option<Bytes>,
+    /// Set when early data was injected at accept and its `DataReady` has not
+    /// been handed to the application yet.
+    early_ready: bool,
 
     rtt_us: i32,
     rtt_var_us: i32,
@@ -535,6 +541,8 @@ impl Connection {
             // bandwidth estimate to 1 pkt/s before any samples arrive.
             delivery_rate_pps: 16,
             bandwidth_pps: 1,
+            early_data: None,
+            early_ready: false,
             rtt_us: 10_000,
             rtt_var_us: 0,
             rtt_sampled: false,
@@ -573,6 +581,17 @@ impl Connection {
         self.snd_loss = SndLossList::new(LOSS_LIST_RESERVE);
         self.snd_sacked = SndLossList::new(LOSS_LIST_RESERVE);
         self.rcv_loss = RcvLossList::new(LOSS_LIST_RESERVE);
+        // Whatever went out early is queued here as an ordinary message, so
+        // the send buffer owns it and the usual acknowledgement and
+        // retransmission apply. On the happy path the receiver has it already
+        // and discards this copy by sequence number, which costs one packet;
+        // if the early copy was lost or ignored, this is what delivers it.
+        if let Some(payload) = self.early_data.take()
+            && let Some(buf) = self.snd_buf.as_mut()
+        {
+            let _ = buf.add(payload, None, true, now_us);
+        }
+
         let ctx = self.cc_ctx(now_us);
         let out = self.cc.init(ctx);
         self.apply_cc(out);
@@ -625,6 +644,12 @@ impl Connection {
     /// again after every change to the connection, since sending or receiving
     /// can move that deadline. Calling it early is harmless.
     pub fn on_timer(&mut self, now_us: u64, tx: &mut TransmitBuf, out: &mut Vec<Event>) {
+        // Early data was placed before anyone held this connection, so its
+        // readiness had nowhere to go. Deliver it now.
+        if self.early_ready {
+            self.early_ready = false;
+            out.push(Event::DataReady);
+        }
         match &self.state {
             ConnState::Closed => return,
             ConnState::Connecting { deadline_us, last_req_us, conn_req, attempts, .. } => {
@@ -832,6 +857,71 @@ impl Connection {
             // Reset last_rsp_us so this EXP interval does not re-fire immediately
             // on the next on_timer call (C++: `m_ullLastRspTime = currtime`).
             self.last_rsp_us = now_us;
+        }
+    }
+
+    /// Queues one message to travel with the handshake conclusion.
+    ///
+    /// UDT establishes in two round trips, so the first byte of data normally
+    /// costs both. The conclusion — the packet echoing the listener's cookie —
+    /// is address-validated and already on its way, so a data packet emitted
+    /// beside it arrives a full round trip before the connection is usable.
+    ///
+    /// This is not a separate delivery mechanism. The message is an ordinary
+    /// one, at sequence `ISN`, and it is placed in the send buffer like any
+    /// other the moment there is one; the early copy is an *extra* transmission
+    /// of it. So acknowledgement, loss recovery, duplicate suppression and
+    /// ordering are the paths that already exist, and a peer that ignores the
+    /// early copy — an implementation that does not expect data before the
+    /// handshake finishes — is indistinguishable from loss and recovered the
+    /// same way.
+    ///
+    /// Must be called before the handshake completes; afterwards there is no
+    /// conclusion left to ride and it is refused. Only the active
+    /// (`connect`-side) role sends a conclusion, so it does nothing for a
+    /// rendezvous or listener connection.
+    ///
+    /// Payload must fit one packet.
+    pub fn set_early_data(&mut self, payload: Bytes) -> bool {
+        if !matches!(self.state, ConnState::Connecting { mode: ConnMode::Active, .. })
+            || payload.len() > self.payload_size as usize
+            || payload.is_empty()
+        {
+            return false;
+        }
+        self.early_data = Some(payload);
+        true
+    }
+
+    /// Places data a peer sent before this connection existed.
+    ///
+    /// The listener holds a data packet that arrived beside a handshake
+    /// conclusion and hands it over here once the connection is built. It goes
+    /// through the ordinary receive path rather than around it, so the sequence
+    /// number places it, and the copy the peer will send again from its send
+    /// buffer is discarded as the duplicate it is.
+    ///
+    /// Any `DataReady` this produces cannot be delivered yet — there is nobody
+    /// holding the connection at this point — so it is remembered and emitted
+    /// from the next [`Connection::on_timer`].
+    pub fn inject_early_data(&mut self, seq: SeqNo, payload: &[u8], now_us: u64) {
+        let hdr = codec::encode_data_header(
+            seq,
+            MsgBoundary::Solo,
+            true,
+            MsgNo::new(0),
+            self.ts(now_us),
+            self.socket_id,
+        );
+        let mut d = BytesMut::with_capacity(16 + payload.len());
+        d.extend_from_slice(&hdr);
+        d.extend_from_slice(payload);
+
+        let mut scratch_tx = TransmitBuf::new();
+        let mut scratch_events = Vec::new();
+        self.on_datagram(d.freeze(), now_us, &mut scratch_tx, &mut scratch_events);
+        if scratch_events.iter().any(|e| matches!(e, Event::DataReady)) {
+            self.early_ready = true;
         }
     }
 
@@ -1349,6 +1439,38 @@ impl Connection {
                         *conn_req = new_req.clone();
                         *last_req_us = 0; // resend immediately
                         *attempts = 0;
+                    }
+                    // Early data goes out *before* the conclusion, not after.
+                    //
+                    // The conclusion is what completes the handshake, and the
+                    // listener hands the connection away the instant it
+                    // processes one. A data packet behind it arrives to find
+                    // the connection gone from the listener and no route to it
+                    // yet. Ahead of it, the listener holds it and attaches it
+                    // as it accepts, which needs no timing luck.
+                    //
+                    // See `set_early_data`: this is an extra transmission of a
+                    // message that is also queued normally once there is a send
+                    // buffer, so nothing here owns its delivery.
+                    //
+                    // Addressed to the listener's socket id, which the challenge
+                    // just supplied — the connection's own does not exist yet.
+                    // The sequence number is the ISN, where the receiver's
+                    // buffer starts, so it lands where the first data packet was
+                    // always going to.
+                    if let Some(payload) = self.early_data.clone() {
+                        let hdr = codec::encode_data_header(
+                            self.local_isn,
+                            MsgBoundary::Solo,
+                            true,
+                            MsgNo::new(0),
+                            self.ts(now_us),
+                            hs.socket_id as u32,
+                        );
+                        tx.push(|dst| {
+                            dst.extend_from_slice(&hdr);
+                            dst.extend_from_slice(&payload);
+                        });
                     }
                     tx.push(|dst| codec::encode_handshake(&new_req, self.ts(now_us), 0, dst));
                 } else if hs.req_type == req_type::RESPONSE {
@@ -2135,7 +2257,6 @@ impl Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packet::MsgBoundary;
     use crate::seq::MsgNo;
     use bytes::BytesMut;
 
