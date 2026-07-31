@@ -18,7 +18,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 /// The destination socket id in a datagram's header, without decoding the rest.
 ///
 /// A demultiplexer needs this and nothing else, and it runs per datagram on the
-/// receive path, so it is worth not building a [`Packet`] to get it. `None`
+/// receive path, so it is worth not decoding a whole packet to get it. `None`
 /// means the datagram is too short to have a header at all.
 ///
 /// Zero is a real value here and means "no particular connection" — a handshake
