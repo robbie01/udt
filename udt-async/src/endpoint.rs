@@ -1,6 +1,9 @@
 //! The bound local address, and the reader tasks that serve it.
 
 use std::collections::HashMap;
+
+/// One connection reachable at a peer address: its socket id and its inbox.
+type AddrRoute = (u32, mpsc::Sender<Inbound>);
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -149,7 +152,14 @@ struct EndpointInner {
     /// So this is the handshake-time index and `routes` is the steady-state
     /// one. Only `routes` can distinguish two connections sharing an address,
     /// which is why it is the one consulted first.
-    by_addr: RwLock<HashMap<SocketAddr, mpsc::Sender<Inbound>>>,
+    ///
+    /// A list, not a single entry: several connections can share an address,
+    /// and a handshake addressed to 0 has nothing to pick between them with.
+    /// It goes to all of them, and only one can act on it — a connection past
+    /// its handshake ignores handshakes, so at most the one still negotiating
+    /// responds. That is what makes serialising rendezvous establishment
+    /// sufficient rather than merely narrowing.
+    by_addr: RwLock<HashMap<SocketAddr, Vec<AddrRoute>>>,
     listener: Mutex<Option<ListenerSlot>>,
     /// False once the `Endpoint` handle is dropped. Readers keep serving
     /// existing connections after that, and stop when the last one goes.
@@ -173,8 +183,13 @@ impl EndpointInner {
         if let Ok(mut routes) = self.routes.write() {
             routes.remove(&socket_id);
         }
-        if let Ok(mut by_addr) = self.by_addr.write() {
-            by_addr.remove(&peer);
+        if let Ok(mut by_addr) = self.by_addr.write()
+            && let Some(list) = by_addr.get_mut(&peer)
+        {
+            list.retain(|(id, _)| *id != socket_id);
+            if list.is_empty() {
+                by_addr.remove(&peer);
+            }
         }
         self.wind_down.notify_waiters();
     }
@@ -480,7 +495,7 @@ fn spawn_shared(
         routes.insert(socket_id, datagram_tx.clone());
     }
     if let Ok(mut by_addr) = ep.by_addr.write() {
-        by_addr.insert(peer, datagram_tx);
+        by_addr.entry(peer).or_default().push((socket_id, datagram_tx));
     }
 
     let udp = Arc::clone(&ep.socket);
@@ -582,13 +597,24 @@ async fn run_reader(ep: Arc<EndpointInner>) {
                         }
                     }
                 };
+                let mut fanout: Vec<mpsc::Sender<Inbound>> = Vec::new();
                 if route.is_none() {
                     // Either a handshake, which carries destination 0, or a
-                    // peer still using an id we have since retired. Both can
-                    // only be matched by address.
-                    route = ep.by_addr.read().ok().and_then(|r| r.get(&from).cloned());
+                    // peer still using an id we have since retired. Neither
+                    // names a connection, so it goes to every connection on
+                    // this address and they decide: anything past its handshake
+                    // ignores a handshake, so at most one acts on it.
+                    if let Ok(map) = ep.by_addr.read()
+                        && let Some(list) = map.get(&from)
+                    {
+                        fanout.extend(list.iter().map(|(_, tx)| tx.clone()));
+                    }
+                    route = fanout.pop();
                 }
 
+                for extra in &fanout {
+                    let _ = extra.try_send(datagram.clone());
+                }
                 match route {
                     Some(tx) => {
                         // Wait rather than drop when a connection's queue is

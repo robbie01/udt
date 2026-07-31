@@ -229,7 +229,7 @@ mod tests {
     /// other test; what is unreliable is rendezvous establishment, not routing.
     /// Run it with `--ignored` when working on that.
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "racy: rendezvous cannot name which attempt a handshake belongs to"]
+    #[ignore = "concurrent rendezvous to one address still races; run with --ignored"]
     async fn two_connections_can_share_one_address_pair() {
         let ep_a = Arc::new(Endpoint::bind("127.0.0.1:0").await.unwrap());
         let ep_b = Arc::new(Endpoint::bind("127.0.0.1:0").await.unwrap());
@@ -237,7 +237,7 @@ mod tests {
 
         // Both pairs run between the same two addresses, so only the socket id
         // tells them apart.
-        let mut pairs = Vec::new();
+        let mut tasks = Vec::new();
         for _ in 0..2u8 {
             let (a, b) = (Arc::clone(&ep_a), Arc::clone(&ep_b));
             let ta = tokio::spawn(async move {
@@ -252,6 +252,10 @@ mod tests {
                     .expect("B timed out")
                     .expect("B failed")
             });
+            tasks.push((ta, tb));
+        }
+        let mut pairs = Vec::new();
+        for (ta, tb) in tasks {
             pairs.push((ta.await.unwrap(), tb.await.unwrap()));
         }
 

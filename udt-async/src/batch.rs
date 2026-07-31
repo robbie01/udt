@@ -192,6 +192,7 @@ impl BatchIo {
 /// travel with the datagram because connections sharing an endpoint's port
 /// receive over a channel, and the metadata would otherwise be dropped at the
 /// reader.
+#[derive(Clone)]
 pub(crate) struct Inbound {
     pub(crate) bytes: Bytes,
     pub(crate) ce: bool,
