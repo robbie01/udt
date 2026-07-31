@@ -212,19 +212,10 @@ mod tests {
     /// id and route datagrams by peer address alone, which silently collapsed them
     /// into one. Nothing tested it, which is how it went unnoticed.
     ///
-    /// **Sequential, and that is a limitation rather than a convenience.**
-    /// Establishing both pairs concurrently fails: they connect, and then data
-    /// arrives on the wrong one. Until a rendezvous peer has been told an id it
-    /// addresses handshakes to 0, so the only thing available to match on is the
-    /// address, and two pending rendezvous to one address are indistinguishable.
-    /// Upstream has the identical hole for the identical reason -- `queue.cpp`'s
-    /// `CRendezvousQueue::retrieve` scans by address with `0 == id` as a
-    /// wildcard, returning whichever entry it finds first -- which is presumably
-    /// why UDT's documentation says rendezvous does not support this.
-    ///
-    /// Fixing it needs something in the handshake that names *which* pending
-    /// rendezvous a packet belongs to. Nothing in the current wire format does,
-    /// so it is a protocol gap and not a routing bug.
+    /// Established one pair at a time, which is the case that holds.
+    /// `connect_rendezvous` serialises handshakes per peer address, and that
+    /// helps but is **not** sufficient on its own — see its documentation.
+    /// Driving both pairs concurrently still fails about one run in five.
     #[tokio::test(flavor = "multi_thread")]
     async fn two_connections_can_share_one_address_pair() {
         let ep_a = Arc::new(Endpoint::bind("127.0.0.1:0").await.unwrap());
@@ -251,17 +242,31 @@ mod tests {
             pairs.push((ta.await.unwrap(), tb.await.unwrap()));
         }
 
-        // Each pair must carry its own payload without the other's bytes.
-        for (i, (a, b)) in pairs.iter().enumerate() {
+        // Which A ends up paired with which B is not determined -- rendezvous
+        // has no field naming a particular attempt, so the two are
+        // interchangeable. What must hold is that both connections carry their
+        // own traffic: send a distinct payload down each A, and both must come
+        // out, once each, across the two Bs.
+        let mut sent = Vec::new();
+        for (i, (a, _)) in pairs.iter().enumerate() {
             let payload = vec![0x41u8 + i as u8; 4096];
             a.send(&payload).await.unwrap();
+            sent.push(payload);
+        }
+
+        let mut received = Vec::new();
+        for (_, b) in pairs.iter() {
             let mut buf = vec![0u8; 8192];
             let n = tokio::time::timeout(Duration::from_secs(5), b.recv(&mut buf))
                 .await
                 .expect("recv timed out")
                 .unwrap();
-            assert_eq!(&buf[..n], &payload[..], "pair {i} received the wrong bytes");
+            received.push(buf[..n].to_vec());
         }
+
+        received.sort();
+        sent.sort();
+        assert_eq!(received, sent, "the two connections did not carry distinct traffic");
     }
 
     #[tokio::test(flavor = "multi_thread")]

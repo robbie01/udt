@@ -156,6 +156,9 @@ struct EndpointInner {
     handle_alive: AtomicBool,
     /// Poked whenever something that could end the readers changes.
     wind_down: Notify,
+    /// One lock per peer address, held for the length of a rendezvous
+    /// handshake. See [`Endpoint::connect_rendezvous`].
+    rendezvous_locks: Mutex<HashMap<SocketAddr, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl EndpointInner {
@@ -273,6 +276,7 @@ impl Endpoint {
             listener: Mutex::new(None),
             handle_alive: AtomicBool::new(true),
             wind_down: Notify::new(),
+            rendezvous_locks: Mutex::new(HashMap::new()),
         });
 
         tokio::spawn(run_reader(Arc::clone(&inner)));
@@ -345,6 +349,35 @@ impl Endpoint {
     /// [`ErrorKind::TimedOut`]: std::io::ErrorKind::TimedOut
     pub async fn connect_rendezvous(&self, peer: impl ToSocketAddrs) -> io::Result<Socket> {
         let peer = resolve(peer).await?;
+
+        // One rendezvous handshake to a given peer at a time.
+        //
+        // Until a rendezvous peer has been told a socket id it addresses
+        // handshakes to 0, so the only thing available to match one against is
+        // the peer address. Two handshakes to the same address at the same time
+        // are therefore indistinguishable, and both ends pair up wrongly: they
+        // connect, and then data arrives on the wrong connection. Upstream has
+        // the same hole -- `CRendezvousQueue::retrieve` scans by address with
+        // `0 == id` as a wildcard -- and answers it by not supporting this.
+        //
+        // **This reduces the race but does not close it.** The two ends do not
+        // finish together: if the local side completes and releases while the
+        // peer is still finishing, the next handshake goes out and reaches a
+        // peer whose address still maps to the connection just completed.
+        // Driving two rendezvous pairs concurrently between one address pair
+        // still fails roughly one run in five.
+        //
+        // Closing it properly needs the handshake to name which attempt it
+        // belongs to, which the wire format has no field for. Until then,
+        // establish rendezvous connections to a given peer one at a time.
+        // Once established they carry real socket ids and route by them, so any
+        // number can coexist on one address pair.
+        let gate = {
+            let mut locks = lock(&self.inner.rendezvous_locks);
+            Arc::clone(locks.entry(peer).or_default())
+        };
+        let _held = gate.lock().await;
+
         let conn = Connection::new_rendezvous(
             next_socket_id(),
             random_isn(),
@@ -353,9 +386,26 @@ impl Endpoint {
             self.inner.cfg.congestion,
         );
         let (socket, connected) = spawn_shared(&self.inner, conn, peer);
-        connected
+        let outcome = connected
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "rendezvous timed out"))?;
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "rendezvous timed out"));
+
+        // Release before checking, or our own two references keep the count
+        // above one and the entry is never collected.
+        drop(_held);
+        drop(gate);
+
+        // Drop the entry once nobody else is waiting, so a long-lived endpoint
+        // does not keep one per address it has ever dialled. Anyone already
+        // queued holds an `Arc`, which keeps the count above one and leaves it
+        // in place for them.
+        {
+            let mut locks = lock(&self.inner.rendezvous_locks);
+            if locks.get(&peer).is_some_and(|g| Arc::strong_count(g) == 1) {
+                locks.remove(&peer);
+            }
+        }
+        outcome?;
         Ok(socket)
     }
 
