@@ -247,10 +247,36 @@ transfers):
 | 10 Mbit, 50 ms, 100 ms buffer | 1.51x | 5 Mbit/s | 77 ms | 86 |
 
 Loss costs less than the no-bottleneck sweep suggests, because the link is
-already the limit. The real problems that table shows are elsewhere: **a 100
-Mbit, 50 ms path yields only about half its capacity**, and **slow start
-overshoots the buffer on every link measured**, causing 594 to 1006 drops per
-transfer on links dropping nothing of their own. Both are unfinished.
+already the limit. The real problems that table shows are elsewhere.
+
+Slow start used to overshoot the buffer on every link measured, because with
+only loss to go on the thing that ended it *was* the buffer overflowing. It now
+leaves on a delay signal instead — HyStart++, RFC 9406 — and on a link losing
+nothing of its own:
+
+| link | goodput | self-inflicted drops | peak queue |
+|---|---|---|---|
+| 100 Mbit, 10 ms, 50 ms buffer | 75 → **94** Mbit/s | 594 → **86** | 50 ms |
+| 100 Mbit, 50 ms, 50 ms buffer | 51 → **58** Mbit/s | 1006 → **0** | 50 → **15** ms |
+| 10 Mbit, 50 ms, 100 ms buffer | 7.2 Mbit/s | 154 → **136** | 100 ms |
+
+RFC 9406's 4 ms floor on what counts as a queue had to go: on a 5 ms path it
+demands an 80% rise before it will believe in one, which is a whole extra
+doubling. The threshold is proportional to the path's own round trip, as it is
+in the RFC, but the floor under it is 1 ms.
+
+The 10 Mbit link barely moves because its problem is upstream of slow start —
+its bandwidth-delay product is 42 packets and the initial window is 64, so the
+opening burst alone overfills it. Nothing that governs *growth* can fix a first
+send that is already too large.
+
+Still unfinished: **a 100 Mbit, 50 ms path yields well under its capacity**, and
+under loss the picture is unchanged, because slow start there ends on a drop
+before any delay signal arrives. Both come back to the same thing — the rate
+slow start hands over is, in practice, the rate for the whole transfer, since
+DAIMD's increase works out to about 1000 pkt/s per second whatever the path.
+Taking a 100 Mbit link from half capacity to 95% takes 7.5 seconds; a 5 MB
+transfer lasts under one.
 
 None of that came from congestion control, which is where it looked like it
 would. Four explanations were measured and discarded — pacing, the congestion
