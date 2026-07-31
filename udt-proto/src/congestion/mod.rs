@@ -71,18 +71,25 @@ pub enum CcKind {
     /// UDT's own rate-based controller, which paces sends to a measured
     /// estimate of the path's capacity.
     ///
-    /// **Only for a link you are not sharing.** It keeps a rate and a window
-    /// and neither converges, so what share of a contended bottleneck it takes
-    /// depends on the path rather than on the competition. Against a CUBIC flow
-    /// it gets 3% of a 50 ms link and 85% of a 1 ms one; against a Reno-like
-    /// flow, 8% and 93%.
+    /// **Kept because it is UDT's own algorithm, not because it is a good
+    /// choice.** A reimplementation of a protocol should be able to run that
+    /// protocol's controller, and it is what to reach for when asking whether
+    /// some behaviour is this crate's or the protocol's.
     ///
-    /// What it is genuinely good at is loss. Answering a drop with a 12.5%
-    /// nudge to a rate rather than a 30% cut to a window, it leads
-    /// [`Cubic`](Self::Cubic) on every lossy row measured alone on a link --
-    /// 40.8 against 27.1 Mbit/s at 2% burst loss on 100 Mbit/50 ms. That is a
-    /// real advantage on a private link that drops packets, and it is the same
-    /// property that leaves it unable to reclaim capacity a competitor takes.
+    /// It keeps a rate and a window and neither converges, so the share it
+    /// takes of a contended bottleneck depends on the path rather than on the
+    /// competition. Against a [`Cubic`](Self::Cubic) flow it gets 3% of a 50 ms
+    /// link and 85% of a 1 ms one; against a Reno-like flow, 8% and 93%.
+    ///
+    /// It does lead `Cubic` on a lossy link with nothing else on it -- 40.8
+    /// against 27.1 Mbit/s at 2% burst loss over 100 Mbit/50 ms -- because
+    /// answering a drop with a 12.5% nudge to a rate recovers more gently than
+    /// cutting a window by 30%. That is a narrow case to build on. Loss and an
+    /// idle link rarely coincide: the paths that drop packets mostly drop them
+    /// because something else is using them. And "nothing else is using this
+    /// link" is not a property anyone can check and hold -- one competing
+    /// download turns that 40.8 into a 3% share, quietly, with the transfer
+    /// merely getting slow.
     Udt,
     /// CUBIC (RFC 9438): one window, grown as a cubic function of the time
     /// since the last congestion event, with the send rate derived from it.
