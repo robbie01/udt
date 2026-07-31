@@ -162,6 +162,61 @@ minimum — and every byte of it is attacker-controlled. It parses before
 validation, so it wants a fuzz target from the first commit rather than a later
 one.
 
+## Who speaks first, and when
+
+Time in round trips from the client's first packet. `→` is client to listener.
+
+**Today**
+
+```
+0.0  →  CONNECT
+0.5  ←  cookie challenge
+1.0  →  RESPONSE (cookie)
+1.5  ←  accept.                    listener may now send
+2.0     client established.        client may now send
+2.5  →  first client data arrives
+3.0  ←  first listener data arrives
+```
+
+**Conclusion-phase variant** — payload rides with the `RESPONSE`
+
+```
+0.0  →  CONNECT
+0.5  ←  cookie challenge
+1.0  →  RESPONSE (cookie) + client payload
+1.5  ←  accept + listener payload.  client payload has arrived
+2.0     listener payload arrives
+```
+
+**First-packet variant** — payload rides with the `CONNECT`
+
+```
+0.0  →  CONNECT + client payload
+0.5  ←  cookie challenge + listener payload.  client payload has arrived
+1.0     listener payload arrives
+```
+
+The client is first in every variant. It has to be: the listener has nothing to
+say until it has heard something, and at 0.5 in the conclusion variant it has
+neither a validated peer nor any application data to respond to.
+
+What changes between the variants is **when the listener can answer**, and that
+is the whole difference:
+
+- conclusion-phase saves one round trip in each direction — a two-message Noise
+  pattern like `NK` or `IK` completes at 2.0 instead of 3.0;
+- first-packet saves two — the same pattern completes at 1.0.
+
+The listener answering at 0.5 is what makes the first-packet variant worth its
+difficulty, and it is also exactly the moment the peer is unverified. That is
+where the padding requirement earns its cost: without it, a listener replying at
+0.5 is an amplifier. With it, the client has already paid for the bytes it is
+about to receive.
+
+For a rendezvous pair there is no listener and no challenge, so both sides are
+at 0.0 and both may send a payload immediately. Which is the other reason that
+path is the one to build first.
+
 ## Ordering
 
 The payload is now a separate datagram, so it can arrive before the `CONNECT`
