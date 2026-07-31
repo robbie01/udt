@@ -416,13 +416,18 @@ Both are real, and both are smaller than reimplementing acknowledgement,
 retransmission and duplicate suppression alongside the versions that already
 work.
 
-There is one wrinkle to check: at the point the conclusion goes out, the client
-has not yet learned the listener's socket id — the challenge echoes the client's
-own handshake with only the cookie filled in. Handshake packets already go out
-with a destination socket id of 0 and are matched by address, so the early data
-packet can do the same, but that means it cannot be an entirely ordinary data
-packet on the wire. Whether that costs a distinct type or a reserved id is the
-first thing to settle in the wire format.
+An earlier draft claimed a wrinkle here that does not exist: that the client
+could not address the packet, because it had not yet learned the listener's
+socket id. It has. The challenge at 0.5 carries `socket_id: self.socket_id`, and
+the accepted connection reuses that same id rather than minting a new one —
+`Connection::new_connected(self.socket_id, ...)` in `listener.rs`. So the client
+holds the correct destination id a full round trip before it needs it, and it is
+the same id every later packet will use.
+
+Which means the early packet is an **ordinary data packet in every respect**: real
+sequence number, real destination, real header. It is sent earlier than usual and
+that is the whole of the difference. No distinct control type, no reserved id,
+nothing for a decoder to special-case.
 
 ### Server
 
