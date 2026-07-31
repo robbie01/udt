@@ -654,7 +654,10 @@ mod tests {
         let udt_bytes = Arc::new(AtomicUsize::new(0));
         let led_bytes = Arc::new(AtomicUsize::new(0));
 
-        let a = tokio::spawn(spawn_flow(CcKind::Udt, Arc::clone(&udt_bytes), Arc::clone(&stop)));
+        // Against the default, which is now CUBIC. Measured against UdtCc this
+        // said nothing: that controller does not converge to a share, so
+        // "ledbat took less than it" was a fact about UdtCc.
+        let a = tokio::spawn(spawn_flow(CcKind::Cubic, Arc::clone(&udt_bytes), Arc::clone(&stop)));
         let b = tokio::spawn(spawn_flow(
             CcKind::LedbatPlusPlus,
             Arc::clone(&led_bytes),
@@ -669,7 +672,7 @@ mod tests {
         let udt = udt_bytes.load(Ordering::Relaxed);
         let led = led_bytes.load(Ordering::Relaxed);
         println!(
-            "[ledbat-yield] udt={:.1} MB  ledbat={:.1} MB  (ledbat took {:.0}% of the pair)",
+            "[ledbat-yield] cubic={:.1} MB  ledbat={:.1} MB  (ledbat took {:.0}% of the pair)",
             udt as f64 / 1e6,
             led as f64 / 1e6,
             100.0 * led as f64 / (udt + led).max(1) as f64,

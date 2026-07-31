@@ -185,6 +185,17 @@ impl Ledbat {
     /// already has, no more, and never more than LEDBAT++ allows. The floor
     /// keeps it above jitter on a path short enough that a proportional target
     /// would be single-digit microseconds.
+    ///
+    /// **The floor is still too coarse for a very short path, and this is not
+    /// solved.** On loopback the base delay is tens of microseconds, so the
+    /// floor is what binds and the controller needs a millisecond of queueing
+    /// before it will yield -- more queue than such a path ever builds. Against
+    /// CUBIC it takes 44% of a 1 ms link in the fluid model and 49% on real
+    /// sockets, which is an even split rather than scavenging. It yields
+    /// properly where there is a queue to sense: 10% of a 50 ms path.
+    ///
+    /// An earlier reading of this as fixed was taken against `UdtCc`, which
+    /// takes 85-93% of a short link and so makes anything look restrained.
     fn target_us(&self) -> f64 {
         if self.base_us == u32::MAX {
             return TARGET_CEILING_US;

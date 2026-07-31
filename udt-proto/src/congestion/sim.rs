@@ -380,8 +380,14 @@ mod tests {
             ("wan", wan()),
             ("lan", Link { capacity_pps: 80_000.0, base_rtt_us: 1_000.0, buffer_pkts: 800.0 }),
         ] {
-            for (a, b) in [("udt", "cubic"), ("udt", "reno"), ("cubic", "cubic"), ("cubic", "reno")]
-            {
+            for (a, b) in [
+                ("udt", "cubic"),
+                ("udt", "reno"),
+                ("cubic", "cubic"),
+                ("cubic", "reno"),
+                ("ledbat", "cubic"),
+                ("ledbat", "reno"),
+            ] {
                 let mut flows = vec![Flow::new(build(a)), Flow::new(build(b))];
                 run(&link, &mut flows, 4_000);
                 let (x, y) = (flows[0].delivered, flows[1].delivered);
