@@ -45,6 +45,19 @@ impl Rng {
 struct LinkConfig {
     /// Fraction of packets dropped outright.
     loss: f64,
+    /// Mean length of a loss burst, in packets. `1.0` is the independent
+    /// per-packet coin flip; anything larger is Gilbert-Elliott, where the link
+    /// moves between a good state that drops nothing and a bad state that drops
+    /// everything.
+    ///
+    /// Independent loss is the least realistic model there is and it flatters
+    /// exactly the wrong things. Real loss arrives in bursts, usually *because*
+    /// a queue filled, so it correlates with queueing delay; a controller that
+    /// decides a drop was not congestion because the path looked idle is right
+    /// about independent loss and wrong about the real kind. Any result that
+    /// turns on telling the two apart has to be checked here before it is
+    /// believed.
+    loss_burst: f64,
     /// Fraction delivered twice.
     duplicate: f64,
     /// One-way delay, microseconds.
@@ -76,6 +89,7 @@ impl LinkConfig {
     fn perfect() -> Self {
         LinkConfig {
             loss: 0.0,
+            loss_burst: 1.0,
             duplicate: 0.0,
             delay_us: 100,
             jitter_us: 0,
@@ -98,6 +112,12 @@ impl LinkConfig {
 
     fn lossy(loss: f64) -> Self {
         LinkConfig { loss, ..Self::perfect() }
+    }
+
+    /// Loss that arrives in bursts of `mean_len` packets on average, at the
+    /// same overall rate as [`lossy`](Self::lossy).
+    fn bursty(loss: f64, mean_len: f64) -> Self {
+        LinkConfig { loss, loss_burst: mean_len.max(1.0), ..Self::perfect() }
     }
 
     fn reordering(jitter_us: u64) -> Self {
@@ -124,6 +144,8 @@ struct Link {
     busy_until_us: u64,
     /// Largest queue seen, as drain time.
     peak_queue_us: u64,
+    /// Gilbert-Elliott: whether the link is currently in its dropping state.
+    in_loss_burst: bool,
 }
 
 impl Link {
@@ -136,7 +158,38 @@ impl Link {
             dropped: 0,
             busy_until_us: 0,
             peak_queue_us: 0,
+            in_loss_burst: false,
         }
+    }
+
+    /// Whether this packet is lost.
+    ///
+    /// At `loss_burst == 1.0` this is the independent coin flip. Above it, a
+    /// two-state Gilbert-Elliott chain: the bad state drops everything and
+    /// lasts `loss_burst` packets on average, so `r = 1 / loss_burst`, and the
+    /// good state's exit probability is set so the long-run share of time spent
+    /// bad equals the requested loss rate.
+    fn drops_this_packet(&mut self) -> bool {
+        if self.cfg.loss <= 0.0 {
+            return false;
+        }
+        if self.cfg.loss_burst <= 1.0 {
+            return self.rng.chance(self.cfg.loss);
+        }
+        let r = 1.0 / self.cfg.loss_burst;
+        if self.in_loss_burst {
+            if self.rng.chance(r) {
+                self.in_loss_burst = false;
+            }
+            return true;
+        }
+        // p / (p + r) = loss  =>  p = loss * r / (1 - loss)
+        let p = (self.cfg.loss * r / (1.0 - self.cfg.loss)).clamp(0.0, 1.0);
+        if self.rng.chance(p) {
+            self.in_loss_burst = true;
+            return true;
+        }
+        false
     }
 
     fn send(&mut self, now: u64, datagram: bytes::Bytes) {
@@ -145,7 +198,7 @@ impl Link {
             self.dropped += 1;
             return;
         }
-        if self.rng.chance(self.cfg.loss) {
+        if self.drops_this_packet() {
             self.dropped += 1;
             return;
         }
@@ -675,6 +728,43 @@ fn loss_recovery_is_not_catastrophic() {
     assert!(mean < 4.0, "5% loss cost {mean:.1}x on average -- recovery is not proportional");
 }
 
+/// The burst-loss model must actually produce the rate and the bursts asked
+/// for.
+///
+/// Conclusions now rest on the difference between independent and bursty loss —
+/// it is what decides whether a controller's behaviour under loss is real or an
+/// artifact of the model — so the model itself needs checking.
+#[test]
+fn burst_loss_delivers_the_rate_and_the_bursts_requested() {
+    for mean_len in [1.0f64, 10.0] {
+        let mut link = Link::new(LinkConfig::bursty(0.02, mean_len), 42);
+        let (mut runs, mut lost, mut in_run) = (0u64, 0u64, false);
+        const N: u64 = 200_000;
+        for _ in 0..N {
+            if link.drops_this_packet() {
+                lost += 1;
+                if !in_run {
+                    runs += 1;
+                    in_run = true;
+                }
+            } else {
+                in_run = false;
+            }
+        }
+        let rate = lost as f64 / N as f64;
+        assert!(
+            (rate - 0.02).abs() < 0.005,
+            "mean_len {mean_len}: asked for 2% loss, got {:.3}%",
+            rate * 100.0
+        );
+        let observed = lost as f64 / runs.max(1) as f64;
+        assert!(
+            (observed - mean_len).abs() < mean_len * 0.25,
+            "mean_len {mean_len}: bursts averaged {observed:.1} packets"
+        );
+    }
+}
+
 /// What loss actually costs, across a range of drop rates.
 ///
 /// A measurement rather than an assertion — it prints a table and checks
@@ -841,7 +931,7 @@ fn cost_on_a_bottleneck() {
     const SIZE: usize = 8192;
 
     println!(
-        "\n  link                    loss   ratio  goodput_mbps  queue_ms  drops  ({} seeds)",
+        "\n  link                        loss   ratio  goodput_mbps  queue_ms  drops  ({} seeds)",
         SEEDS.len()
     );
     for (label, mbps, rtt_ms, buf_ms) in [
@@ -851,7 +941,9 @@ fn cost_on_a_bottleneck() {
         // A shallow buffer is where a line-rate opening burst has nowhere to go.
         ("100mbit 10ms 5ms buf", 100, 10, 5),
     ] {
-        for loss_pct in [0.0f64, 2.0] {
+        for (loss_label, loss_pct, burst) in
+            [("clean", 0.0f64, 1.0f64), ("2% iid", 2.0, 1.0), ("2% burst", 2.0, 10.0)]
+        {
             let (mut ratios, mut mbps_got, mut queues, mut drops) =
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             for seed in SEEDS {
@@ -860,7 +952,10 @@ fn cost_on_a_bottleneck() {
                 clean.connect();
                 let clean_us = clean.transfer(MSGS, SIZE, SendOpts::ordered());
 
-                let mut sim = Sim::new(LinkConfig { loss: loss_pct / 100.0, ..base }, seed);
+                let mut sim = Sim::new(
+                    LinkConfig { loss: loss_pct / 100.0, loss_burst: burst, ..base },
+                    seed,
+                );
                 sim.connect();
                 let us = sim.transfer(MSGS, SIZE, SendOpts::ordered());
 
@@ -871,7 +966,7 @@ fn cost_on_a_bottleneck() {
             }
             let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
             println!(
-                "  {label:<22}  {loss_pct:>4.1}%  {:>6.2}  {:>12.1}  {:>8.1}  {:>5.0}",
+                "  {label:<22}  {loss_label:>8}  {:>6.2}  {:>12.1}  {:>8.1}  {:>5.0}",
                 mean(&ratios),
                 mean(&mbps_got),
                 mean(&queues),

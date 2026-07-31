@@ -76,27 +76,40 @@ pub enum CcKind {
     /// What the rest of the internet runs, so its fairness is a known
     /// quantity. See [`cubic`].
     ///
-    /// **Faster than [`Udt`](Self::Udt) on a link that only drops when it is
-    /// full, and far slower on one that drops at random.** Measured over 5 MB
-    /// on a bottleneck, six seeds, CUBIC against `Udt`:
+    /// **Faster than [`Udt`](Self::Udt) on a clean link, slower on a lossy
+    /// one, and how much slower depends heavily on what the loss looks like.**
+    /// Measured over 5 MB on a bottleneck, six seeds, CUBIC against `Udt` in
+    /// Mbit/s:
     ///
-    /// | link | clean | 2% random loss |
-    /// |---|---|---|
-    /// | 100 Mbit, 50 ms | 72.0 vs 58.0 Mbit/s | 2.0 vs 18.6 Mbit/s |
-    /// | 100 Mbit, 10 ms, 5 ms buffer | 65.1 vs 51.4, and 31 drops against 1413 | 8.1 vs 39.4 Mbit/s |
-    /// | 10 Mbit, 50 ms | 9.7 vs 7.2 Mbit/s | 1.9 vs 4.8 Mbit/s |
+    /// | link | clean | 2% independent | 2% in bursts of 10 |
+    /// |---|---|---|---|
+    /// | 100 Mbit, 10 ms | 94.5 vs 93.9 | 8.2 vs 59.1 | 75.1 vs 85.8 |
+    /// | 100 Mbit, 50 ms | 72.0 vs 58.0 | 2.0 vs 18.6 | 27.1 vs 40.8 |
+    /// | 10 Mbit, 50 ms | 9.7 vs 7.2 | 1.9 vs 4.8 | **7.7 vs 6.2** |
+    /// | 100 Mbit, 10 ms, 5 ms buffer | 65.1 vs 51.4 | 8.1 vs 39.4 | 29.0 vs 47.7 |
     ///
-    /// The collapse is not a defect in the implementation; it is what a
-    /// loss-based controller does when loss does not mean congestion. Backing
-    /// off 30% per event puts it on the Mathis limit, about 4 Mbit/s at 2% loss
-    /// and a 25 ms round trip. `Udt` survives that because its response is a
-    /// 12.5% nudge to a rate rather than a cut to a window — which is the same
-    /// choice that leaves it at 62% of a clean long fat pipe.
+    /// The middle column is the one to distrust. Independent per-packet loss is
+    /// the standard way to simulate a lossy link and it is close to the worst
+    /// possible case for any loss-based controller, because it manufactures a
+    /// separate congestion event out of every dropped packet. CUBIC reduces
+    /// once per event; at 2% independent loss that is an event nearly every
+    /// round trip, which puts it on the Mathis limit — about 4 Mbit/s at a
+    /// 25 ms round trip, so the 2.0 there is the law being obeyed rather than
+    /// broken.
     ///
-    /// Pick this for a path whose loss is congestion: a wired link, a
-    /// datacentre, anywhere a drop means a full buffer. Keep the default for a
-    /// path that loses packets for its own reasons, such as wifi or a marginal
-    /// last mile.
+    /// Real loss arrives in bursts. At the same 2% overall rate but in runs of
+    /// ten, one burst is one congestion event, and most of the gap closes:
+    /// nine times worse becomes one and a half times worse, and on the 10 Mbit
+    /// link CUBIC comes out ahead.
+    ///
+    /// `Udt` still leads under loss because its response is a 12.5% nudge to a
+    /// rate rather than a 30% cut to a window — the same choice that leaves it
+    /// at 62% of a clean long fat pipe, and the reason it trails on every clean
+    /// row above.
+    ///
+    /// Pick this for a path that is clean or whose loss comes in bursts, which
+    /// is most real paths. Keep the default where loss is frequent and
+    /// scattered, and measure rather than guessing which one you have.
     Cubic,
     /// A delay-based controller that treats growing queues as a signal to back
     /// off, so a transfer using it gets out of the way of interactive traffic
