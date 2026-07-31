@@ -171,6 +171,7 @@ pub fn run(link: &Link, flows: &mut [Flow], rounds: usize) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::congestion::cubic::Cubic;
     use crate::congestion::{ledbat::Ledbat, udt_cc::UdtCc};
 
     /// A plain loss-based controller, for LEDBAT to be measured against.
@@ -351,6 +352,66 @@ mod tests {
             "one flow took {:.0}% of the bottleneck ({a:.0} against {b:.0})",
             (1.0 - share) * 100.0,
         );
+    }
+
+    /// How each controller fares sharing a bottleneck with what the internet
+    /// actually runs.
+    ///
+    /// This is the measurement that decides which one should be the default,
+    /// and single-flow throughput cannot substitute for it. A controller that
+    /// declines to back off looks identical to one that recovers well when it
+    /// is alone on a link; only competition tells them apart.
+    ///
+    /// The result was the opposite of what the single-flow numbers suggested.
+    /// UdtCc leads every lossy row measured against CUBIC alone on a link, and
+    /// it is not winning by being greedy — put next to any flow that answers
+    /// loss by halving, it is the one that gets starved. Its 12.5% nudge to a
+    /// rate simply cannot reclaim capacity a competitor takes.
+    #[test]
+    fn a_flow_gets_a_share_of_a_contended_link() {
+        fn build(name: &str) -> Box<dyn CongestionControl> {
+            match name {
+                "udt" => Box::new(UdtCc::new()),
+                "cubic" => Box::new(Cubic::new()),
+                _ => Box::new(LossBased::new()),
+            }
+        }
+        for (label, link) in [
+            ("wan", wan()),
+            ("lan", Link { capacity_pps: 80_000.0, base_rtt_us: 1_000.0, buffer_pkts: 800.0 }),
+        ] {
+            for (a, b) in [("udt", "cubic"), ("udt", "reno"), ("cubic", "cubic"), ("cubic", "reno")]
+            {
+                let mut flows = vec![Flow::new(build(a)), Flow::new(build(b))];
+                run(&link, &mut flows, 4_000);
+                let (x, y) = (flows[0].delivered, flows[1].delivered);
+                let share = x / (x + y).max(1.0);
+                println!("  {label:<4} {a:<6} vs {b:<6}  {a} took {:>3.0}%", share * 100.0);
+            }
+        }
+    }
+
+    /// Two flows of the same controller must split a link roughly evenly.
+    ///
+    /// Unlike the cross-controller shares above, this one has a right answer:
+    /// whatever a controller does, it should do it to itself fairly.
+    #[test]
+    fn cubic_shares_evenly_with_itself() {
+        for (label, link) in [
+            ("wan", wan()),
+            ("lan", Link { capacity_pps: 80_000.0, base_rtt_us: 1_000.0, buffer_pkts: 800.0 }),
+        ] {
+            let mut flows =
+                vec![Flow::new(Box::new(Cubic::new())), Flow::new(Box::new(Cubic::new()))];
+            run(&link, &mut flows, 4_000);
+            let (a, b) = (flows[0].delivered, flows[1].delivered);
+            let weaker = a.min(b) / (a + b).max(1.0);
+            assert!(
+                weaker > 0.3,
+                "{label}: one CUBIC flow took {:.0}% from another",
+                (1.0 - weaker) * 100.0
+            );
+        }
     }
 
     /// Prints the model's numbers, for when the assertions above need context.

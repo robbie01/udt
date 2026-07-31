@@ -1,9 +1,11 @@
 //! Congestion control.
 //!
 //! Every connection is paced by an implementation of [`CongestionControl`].
-//! Pick one with [`CcKind`]; the default, [`CcKind::Udt`], is UDT's own
-//! rate-based algorithm and is what you want unless the transfer should get
-//! out of other traffic's way, in which case use [`CcKind::LedbatPlusPlus`].
+//! Pick one with [`CcKind`]. The default, [`CcKind::Cubic`], is what the rest
+//! of the internet runs and shares a link predictably with it. Use
+//! [`CcKind::LedbatPlusPlus`] for a transfer that should get out of other
+//! traffic's way, and [`CcKind::Udt`] only where loss is frequent and the link
+//! is not shared -- see its own note.
 //!
 //! Implementing the trait yourself is supported but the interface is not
 //! stable — see the crate-level stability note.
@@ -67,14 +69,30 @@ pub struct CcOutput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CcKind {
     /// UDT's own rate-based controller, which paces sends to a measured
-    /// estimate of the path's capacity. Competes on roughly even terms with
-    /// TCP and is the right default for a transfer that should go fast.
-    #[default]
+    /// estimate of the path's capacity.
+    ///
+    /// **Only for a link you are not sharing.** It keeps a rate and a window
+    /// and neither converges, so what share of a contended bottleneck it takes
+    /// depends on the path rather than on the competition. Against a CUBIC flow
+    /// it gets 3% of a 50 ms link and 85% of a 1 ms one; against a Reno-like
+    /// flow, 8% and 93%.
+    ///
+    /// What it is genuinely good at is loss. Answering a drop with a 12.5%
+    /// nudge to a rate rather than a 30% cut to a window, it leads
+    /// [`Cubic`](Self::Cubic) on every lossy row measured alone on a link --
+    /// 40.8 against 27.1 Mbit/s at 2% burst loss on 100 Mbit/50 ms. That is a
+    /// real advantage on a private link that drops packets, and it is the same
+    /// property that leaves it unable to reclaim capacity a competitor takes.
     Udt,
     /// CUBIC (RFC 9438): one window, grown as a cubic function of the time
     /// since the last congestion event, with the send rate derived from it.
     /// What the rest of the internet runs, so its fairness is a known
     /// quantity. See [`cubic`].
+    ///
+    /// **The default.** It is the only controller here that converges to a
+    /// share of a contended link: two CUBIC flows split a bottleneck evenly on
+    /// every link modelled, where [`Udt`](Self::Udt) takes 3% of a 50 ms path
+    /// against a CUBIC competitor and 85% of a 1 ms one.
     ///
     /// **Faster than [`Udt`](Self::Udt) on a clean link, slower on a lossy
     /// one, and how much slower depends heavily on what the loss looks like.**
@@ -110,6 +128,7 @@ pub enum CcKind {
     /// Pick this for a path that is clean or whose loss comes in bursts, which
     /// is most real paths. Keep the default where loss is frequent and
     /// scattered, and measure rather than guessing which one you have.
+    #[default]
     Cubic,
     /// A delay-based controller that treats growing queues as a signal to back
     /// off, so a transfer using it gets out of the way of interactive traffic
