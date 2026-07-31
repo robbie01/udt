@@ -416,18 +416,47 @@ Both are real, and both are smaller than reimplementing acknowledgement,
 retransmission and duplicate suppression alongside the versions that already
 work.
 
-An earlier draft claimed a wrinkle here that does not exist: that the client
-could not address the packet, because it had not yet learned the listener's
-socket id. It has. The challenge at 0.5 carries `socket_id: self.socket_id`, and
-the accepted connection reuses that same id rather than minting a new one —
-`Connection::new_connected(self.socket_id, ...)` in `listener.rs`. So the client
-holds the correct destination id a full round trip before it needs it, and it is
-the same id every later packet will use.
+### Addressing, and leaving room for several connections per address pair
 
-Which means the early packet is an **ordinary data packet in every respect**: real
-sequence number, real destination, real header. It is sent earlier than usual and
-that is the whole of the difference. No distinct control type, no reserved id,
-nothing for a decoder to special-case.
+Two earlier drafts got this wrong in opposite directions, so the facts first.
+
+The challenge at 0.5 carries `socket_id: self.socket_id` — the listener's own id
+— so the client does hold a usable destination a full round trip before it sends
+the conclusion. That much stands.
+
+But this implementation then *reuses* the listener's id for the accepted
+connection (`Connection::new_connected(self.socket_id, ...)`), and that is a
+divergence from upstream, not a design. Upstream mints a fresh socket id per
+accepted connection and returns it in the accept — `hs->m_iID = ns->m_SocketID`
+in `api.cpp` — and demultiplexes incoming packets with
+`locate(peer, hs->m_iID, hs->m_iISN)`: peer address, *client socket id* and
+*client ISN* together. UDT was designed for several connections between one pair
+of addresses. We collapsed that by accident.
+
+Early data does not depend on the collapse, and should not assume it:
+
+- **The early packet is addressed to the listener's socket id**, which is what
+  the client knows at 1.0 and is semantically right — at that moment the listener
+  is who it is talking to. Every packet after the accept uses the connection's
+  own id, whatever the listener minted.
+- **It is matched by `(peer address, sequence number)`.** The sequence number of
+  the early packet *is* the client's ISN, which is already one of the three
+  things upstream keys on. So two clients behind one NAT, or one client opening
+  two connections, are distinguished by exactly the field UDT uses for it.
+- **If it arrives before the conclusion, drop it.** The listener holds no state
+  at that point, and inventing some would reintroduce the speculative allocation
+  this design was rearranged to avoid. Retransmission covers it, which is the
+  same path a peer that ignores the extension takes.
+
+So the early packet is an ordinary data packet with an ordinary sequence number,
+addressed to the listener rather than to a connection that does not exist yet.
+That is the only thing distinguishing it, and it costs no new wire type.
+
+**Restoring per-connection socket ids is separable from this feature** and worth
+doing on its own — it is what upstream does, it is presumably required for a C++
+peer that opens two connections from one address, and nothing here depends on it
+staying broken. It does mean `udt-async`'s route table, currently keyed on
+`SocketAddr` alone, has to key on the socket id as well.
 
 ### Server
 
