@@ -111,6 +111,15 @@ congestion-control work of note was invisible until `LinkConfig::bottleneck`
 existed, and `LinkConfig::lossy` (no capacity, no queue, random drops) has
 produced a wrong conclusion every time it has been used as evidence.
 
+## Platform facts worth not re-deriving
+
+- **macOS does not load-balance `SO_REUSEPORT` for UDP at all.** Four sockets on
+  one port, 400 datagrams from 400 distinct source ports, and every one landed
+  on the last socket bound: `[0, 0, 0, 400]`. So the one-reader-task receive
+  funnel cannot be widened that way there, which is the direction that matters
+  for a macOS client. Multiple sockets sharing a source port would still
+  parallelise `sendmsg`, and that half is unexplored.
+
 ## The C++ references
 
 They live on the `harness` branch, which references this one **by path**, so it
