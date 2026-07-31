@@ -327,6 +327,121 @@ The listener currently builds its `Connection` *after* the handshake completes,
 so a payload accepted on the first packet has to be held across that boundary
 and attached to the connection when it is created.
 
+## API
+
+Modelled on quinn's, with the parts that do not apply removed.
+
+Quinn splits connecting into a `Connecting` future that can be converted into an
+early `Connection`, because QUIC 0-RTT depends on a resumption ticket and may be
+refused — hence a fallible `into_0rtt()` that hands back the original, and a
+`ZeroRttAccepted` future to learn the answer later. Neither applies here. There
+is no ticket, nothing to resume, and no negotiation: a client can always attach a
+payload, and the only question is whether the peer understood it.
+
+### Client
+
+```rust
+// unchanged
+let socket = endpoint.connect(peer).await?;
+
+// new: start the handshake, attach bytes to it, then await as before
+let mut connecting = endpoint.connect_early(peer)?;
+connecting.send_early(&noise_msg1)?;
+let socket = connecting.await?;
+```
+
+`connect_early` returns immediately — the handshake runs in the background, and
+`Connecting` is a `Future<Output = io::Result<Socket>>`, so awaiting it is the
+same as `connect` today. `send_early` queues one message to travel with the
+conclusion; calling it after the conclusion has gone out is an error rather than
+a silent normal send.
+
+### Did it land
+
+A peer that does not know the extension drops the payload, and nothing on the
+wire says so. The client needs to find out, or a Noise handshake waits forever
+for a `msg2` that is never coming.
+
+```rust
+if !socket.early_data_accepted() {
+    socket.send(&noise_msg1).await?;   // peer ignored it; send it normally
+}
+```
+
+Two ways to implement that, and this is the open choice:
+
+1. **Have the listener acknowledge.** A Rust listener answers the early payload
+   with a small control packet; a C++ one sends nothing. Costs one packet and a
+   bounded wait. Explicit, and the client learns before it sends anything else.
+2. **Infer from the peer's handshake.** Cheaper, but there is no spare field
+   that a C++ implementation is guaranteed to leave alone, and inventing one
+   risks the compatibility this whole design was rearranged to protect.
+
+(1) is the safer default. It should be resolved before the wire format is fixed,
+since it decides whether a second control type is needed.
+
+### Server
+
+**Nothing changes.** The payload is delivered as the connection's first message:
+
+```rust
+let socket = listener.accept().await?;
+let n = socket.recv(&mut buf).await?;   // noise msg1, early or not
+```
+
+This falls out of the transport being message-oriented, and it is the best part
+of the design. Server code is byte-identical whether the client used early data
+or not — the message simply arrives a round trip sooner. Nothing to branch on,
+no `Option`, no second accept path, and an application that never opts in cannot
+be broken by a peer that does.
+
+It also means the feature is testable without any API at all on one side.
+
+### What is deliberately not offered
+
+- **A stream of early data.** One message, because one message is what fits
+  beside a handshake. Anything larger belongs after establishment.
+- **Early data on `accept`.** The listener cannot speak before it has heard, so
+  there is nothing for it to send early. Its reply rides the accept regardless.
+
+## Rendezvous is the easy case, not the hard one
+
+The doc above treated rendezvous as an afterthought. It is the opposite, and for
+a peer-to-peer system it is probably the path that matters.
+
+Rendezvous sends `cookie: 0` — there is no challenge, and no address validation
+of any kind. That sounds worse and is better, because of what it replaces:
+**a rendezvous peer already holds state for the address it is connecting to.**
+The application called `connect_rendezvous(peer)`, so a `Connection` exists,
+pending, before anything is sent.
+
+A payload arriving from that address is matched against state the local
+application deliberately created. There is no pool, no speculative allocation,
+and no new exposure — the number of pending rendezvous connections is bounded by
+the local application's own behaviour, not by an attacker's. Reordering is a
+non-issue for the same reason: the state to match against exists before either
+datagram is sent.
+
+So rendezvous gets true 0-RTT essentially for free, while connect/accept is
+where all the difficulty lives. If the motivating use is peer-to-peer with a
+Noise handshake over rendezvous, **that is the version to build first**, and it
+can ship without resolving the pool question at all.
+
+The remaining wrinkle is symmetry: both peers are initiators and both may send a
+payload. A pattern like `XX` has to decide which end takes which role, and that
+belongs above this layer — the transport delivers both and says nothing about
+them.
+
+## Sequencing## Sequencing
+
+The payload is not stream data and must not consume a sequence number — the
+connection's first data packet should still be the ISN. It is delivered
+out-of-band, once, at accept time.
+
+The listener currently builds its `Connection` *after* the handshake completes,
+so a payload accepted on the first packet has to be held across that boundary
+and attached to the connection when it is created.
+
 ## API shape
 
 ```rust
