@@ -7,9 +7,9 @@
 //! That was supposed to be what holds high throughput on a long fat link where
 //! TCP's window growth is the limit. Measured, it is not: it keeps a rate *and*
 //! a window and neither converges, so it reaches 62% of a clean 100 Mbit/50 ms
-//! path against CUBIC's 72%, and takes 3% of that path when a CUBIC flow is
-//! sharing it. It is no longer the default. See [`CcKind::Udt`] for what it is
-//! still here for.
+//! path against CUBIC's 72%, and cannot divide a bottleneck evenly even with a
+//! copy of itself -- 77/23, against CUBIC's 53/47. It is no longer the default.
+//! See [`CcKind::Udt`] for what it is still here for.
 //!
 //! [`CcKind::Udt`]: crate::CcKind::Udt
 

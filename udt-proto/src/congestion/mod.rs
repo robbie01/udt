@@ -76,10 +76,11 @@ pub enum CcKind {
     /// protocol's controller, and it is what to reach for when asking whether
     /// some behaviour is this crate's or the protocol's.
     ///
-    /// It keeps a rate and a window and neither converges, so the share it
-    /// takes of a contended bottleneck depends on the path rather than on the
-    /// competition. Against a [`Cubic`](Self::Cubic) flow it gets 3% of a 50 ms
-    /// link and 85% of a 1 ms one; against a Reno-like flow, 8% and 93%.
+    /// It keeps a rate and a window and neither converges, and the clearest
+    /// sign of that is what it does against a copy of itself: two `Udt` flows
+    /// on one bottleneck split it **77/23**, measured on packets. Two `Cubic`
+    /// flows split the same link 53/47. A controller that cannot share evenly
+    /// with itself has no share to predict.
     ///
     /// It does lead `Cubic` on a lossy link with nothing else on it -- 40.8
     /// against 27.1 Mbit/s at 2% burst loss over 100 Mbit/50 ms -- because
@@ -88,8 +89,8 @@ pub enum CcKind {
     /// idle link rarely coincide: the paths that drop packets mostly drop them
     /// because something else is using them. And "nothing else is using this
     /// link" is not a property anyone can check and hold -- one competing
-    /// download turns that 40.8 into a 3% share, quietly, with the transfer
-    /// merely getting slow.
+    /// download turns a link it had to itself into one it must share, and this
+    /// controller has no defined answer to that.
     Udt,
     /// CUBIC (RFC 9438): one window, grown as a cubic function of the time
     /// since the last congestion event, with the send rate derived from it.
@@ -97,9 +98,9 @@ pub enum CcKind {
     /// quantity. See [`cubic`].
     ///
     /// **The default.** It is the only controller here that converges to a
-    /// share of a contended link: two CUBIC flows split a bottleneck evenly on
-    /// every link modelled, where [`Udt`](Self::Udt) takes 3% of a 50 ms path
-    /// against a CUBIC competitor and 85% of a 1 ms one.
+    /// share of a contended link: two CUBIC flows split a bottleneck 53/47 on
+    /// real packets, where two [`Udt`](Self::Udt) flows split the same link
+    /// 77/23.
     ///
     /// **Faster than [`Udt`](Self::Udt) on a clean link, slower on a lossy
     /// one, and how much slower depends heavily on what the loss looks like.**

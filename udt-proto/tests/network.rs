@@ -1336,3 +1336,153 @@ fn a_slow_lossy_path_is_not_mistaken_for_an_unusable_one() {
     assert_eq!(sim.b_got.len(), 20);
     assert!(sim.a.stats().connected, "a working connection was declared unusable");
 }
+
+// ── Contended-link fairness ─────────────────────────────────────────────────
+
+/// Runs two connection pairs across one shared bottleneck and returns how many
+/// messages each pair delivered.
+///
+/// The share a controller takes of a contended link is what decided the
+/// default, and that number came only from the fluid model in
+/// `congestion/sim.rs`. That model has been wrong before — it is what made
+/// pacing the opening window look like an improvement when it was a regression
+/// — so the figure the decision rests on wants confirming against real packets.
+///
+/// `Sim` drives a single pair, so this keeps its own loop. Both pairs send
+/// across the same two links, so they contend for the same capacity and the
+/// same queue, and datagrams are routed by destination socket id the way an
+/// endpoint does it.
+fn contended_share(cfg: LinkConfig, seed: u64, cc: [CcKind; 2], until_us: u64) -> [usize; 2] {
+    const SIZE: usize = 8192;
+    let mut a: Vec<Connection> = Vec::new();
+    let mut b: Vec<Connection> = Vec::new();
+    for (i, kind) in cc.iter().enumerate() {
+        let (ida, idb) = (10 + i as u32 * 2, 11 + i as u32 * 2);
+        a.push(Connection::new_rendezvous(ida, SeqNo::new(1000), 1500, 0, *kind));
+        b.push(Connection::new_rendezvous(idb, SeqNo::new(9000), 1500, 0, *kind));
+    }
+    let mut a_to_b = Link::new(cfg, seed);
+    let mut b_to_a = Link::new(cfg, seed ^ 0x5DEE_CE66);
+
+    let mut now = 0u64;
+    let mut txs: Vec<TransmitBuf> = (0..4).map(|_| TransmitBuf::new()).collect();
+    let mut events = Vec::new();
+    let mut delivered = [0usize; 2];
+    let mut queued = [0usize; 2];
+    let payload = bytes::Bytes::from(vec![0x5Au8; SIZE]);
+
+    for _ in 0..MAX_STEPS {
+        // One pair handshakes at a time. A rendezvous handshake is addressed to
+        // socket 0 until each end has learned the other's id, so with two in
+        // flight both peers answer the same one — the limitation
+        // `connect_rendezvous` serialises around in `udt-async`.
+        let handshaking = (0..2).find(|&i| !(a[i].is_connected() && b[i].is_connected()));
+        let waiting = |i: usize| handshaking.is_some_and(|h| h < i);
+
+        // A pair awaiting its turn is not driven, so its deadline must not be
+        // counted either: it never moves, and the clock would pin itself to it.
+        let next = [a_to_b.next_arrival(), b_to_a.next_arrival()]
+            .into_iter()
+            .flatten()
+            .chain((0..2).filter(|&i| !waiting(i)).filter_map(|i| a[i].next_deadline_us()))
+            .chain((0..2).filter(|&i| !waiting(i)).filter_map(|i| b[i].next_deadline_us()))
+            .min();
+        let Some(next) = next else { break };
+        now = now.max(next);
+        if now > until_us {
+            break;
+        }
+
+        for datagram in a_to_b.take_arrived(now) {
+            let id = udt_proto::dst_socket_id(&datagram).unwrap_or(0);
+            for (i, conn) in b.iter_mut().enumerate() {
+                if id == conn.socket_id() || (id == 0 && handshaking == Some(i)) {
+                    conn.on_datagram(datagram.clone(), now, &mut txs[2 + i], &mut events);
+                }
+            }
+        }
+        for datagram in b_to_a.take_arrived(now) {
+            let id = udt_proto::dst_socket_id(&datagram).unwrap_or(0);
+            for (i, conn) in a.iter_mut().enumerate() {
+                if id == conn.socket_id() || (id == 0 && handshaking == Some(i)) {
+                    conn.on_datagram(datagram.clone(), now, &mut txs[i], &mut events);
+                }
+            }
+        }
+
+        for i in 0..2 {
+            if waiting(i) {
+                continue;
+            }
+            // Keep each sender offering more than it can send, so what it
+            // achieves is the link's answer and not the application's.
+            while a[i].is_connected() && queued[i] < delivered[i] + 64 {
+                match a[i].send_msg(payload.clone(), None, true, now, &mut txs[i]) {
+                    SendOutcome::Queued => queued[i] += 1,
+                    _ => break,
+                }
+            }
+            a[i].on_timer(now, &mut txs[i], &mut events);
+            b[i].on_timer(now, &mut txs[2 + i], &mut events);
+            while b[i].recv_msg().is_some() {
+                delivered[i] += 1;
+            }
+            while a[i].recv_msg().is_some() {}
+        }
+
+        for (i, tx) in txs.iter_mut().enumerate() {
+            let link = if i < 2 { &mut a_to_b } else { &mut b_to_a };
+            for datagram in tx.datagrams() {
+                link.send(now, bytes::Bytes::copy_from_slice(datagram));
+            }
+            tx.clear();
+        }
+        events.clear();
+    }
+    delivered
+}
+
+/// What each controller takes of a contended bottleneck, on real packets.
+///
+/// Both flows send as fast as they are allowed for a fixed stretch of virtual
+/// time, so this measures rate rather than which one finished a fixed quota
+/// first.
+#[test]
+fn a_flow_gets_its_share_of_a_contended_link() {
+    const RUN_US: u64 = 8_000_000;
+    let link = LinkConfig::bottleneck(50, 50, 50);
+
+    for pair in
+        [[CcKind::Cubic, CcKind::Cubic], [CcKind::Udt, CcKind::Udt], [CcKind::Udt, CcKind::Cubic]]
+    {
+        let got = contended_share(link, 42, pair, RUN_US);
+        let total = (got[0] + got[1]) as f64;
+        assert!(total > 50.0, "{pair:?}: almost nothing was delivered ({got:?})");
+        let first = got[0] as f64 / total;
+        println!(
+            "  {:?} vs {:?}: {} against {}, first took {:.0}%",
+            pair[0],
+            pair[1],
+            got[0],
+            got[1],
+            first * 100.0
+        );
+
+        // The default is the one that has to be fair, because it is what most
+        // flows on a link will be running and what they will be sharing with.
+        //
+        // `Udt` is *not*, and against a copy of itself: 77/23 here, where the
+        // fluid model suggested nearer 70/30. It is the same defect as
+        // everywhere else in that controller -- a rate and a window, neither
+        // closing a loop -- and it is measured rather than asserted, since
+        // pinning a number this arbitrary would only produce a brittle test.
+        if pair[0] == CcKind::Cubic && pair[1] == CcKind::Cubic {
+            assert!(
+                first > 0.3 && first < 0.7,
+                "the default split a link {:.0}/{:.0} with itself",
+                first * 100.0,
+                (1.0 - first) * 100.0
+            );
+        }
+    }
+}

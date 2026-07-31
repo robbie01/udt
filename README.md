@@ -234,13 +234,15 @@ controller keeps a rate *and* a window and neither converges, so what it takes
 of a contended bottleneck depends on the path rather than on the competition.
 Two flows, one link:
 
-| | 50 ms path | 1 ms path |
-|---|---|---|
-| UDT's controller against CUBIC | 3% | 85% |
-| CUBIC against CUBIC | 50% | 50% |
+| two flows sharing one 50 Mbit, 50 ms bottleneck | split |
+|---|---|
+| CUBIC against CUBIC | **53/47** |
+| UDT's controller against itself | **77/23** |
+| UDT's controller against CUBIC | 46/54 |
 
-Three percent of a path against one competing download is not a usable default
-for something peer-to-peer, where sharing a link is the normal condition.
+A controller that cannot divide a link evenly with a copy of itself has no
+share to predict, and sharing a link is the normal condition for something
+peer-to-peer.
 
 On the link itself, 5 MB over a bottleneck, six seeds, against the same
 measurement before any of this work:
@@ -274,7 +276,8 @@ one line. In absolute terms CUBIC still costs only 1.9x the clean transfer time
 at 5% burst loss — the gap is UDT's controller doing unusually well there, not
 CUBIC falling over. The default is CUBIC because sharing a link is a condition every
 peer-to-peer transfer meets constantly, while 5% loss is a bad path rather than
-a normal one — and UDT's controller takes 3% of a contended 50 ms link.
+a normal one — and UDT's controller cannot divide a contended link evenly even
+with itself.
 
 Under loss the picture reverses, and how much depends entirely on what the loss
 looks like. At 2% in bursts of ten, UDT's controller leads CUBIC 40.8 to 27.1
