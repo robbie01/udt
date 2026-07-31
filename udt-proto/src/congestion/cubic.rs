@@ -159,9 +159,12 @@ impl CongestionControl for Cubic {
         }
 
         if self.slow_start {
+            // Slow start doubles per round trip, so growth is capped at the
+            // window itself however much one acknowledgement happens to cover.
+            let grow = acked.min(self.cwnd);
             match self.hystart.on_ack(ack, ctx.snd_curr_seq, ctx.rtt_us as u64) {
-                HyStartVerdict::Grow => self.cwnd += acked,
-                HyStartVerdict::Conservative => self.cwnd += acked / CSS_GROWTH_DIVISOR,
+                HyStartVerdict::Grow => self.cwnd += grow,
+                HyStartVerdict::Conservative => self.cwnd += grow / CSS_GROWTH_DIVISOR,
                 HyStartVerdict::Exit => {
                     // Left on a delay signal, not a drop, so there is no
                     // congestion event to back off from — only a window that
@@ -192,7 +195,15 @@ impl CongestionControl for Cubic {
         let target = self.w_max + C * (t + rtt_s - self.k).powi(3);
 
         if target > self.cwnd {
-            self.cwnd += (target - self.cwnd) / self.cwnd * acked;
+            // Never past the target the curve names for this instant. The
+            // per-acknowledgement form in RFC 9438 §4.2 assumes each one covers
+            // about a segment; a cumulative acknowledgement covering a whole
+            // window -- after a stall, or the first one on a connection --
+            // multiplies the increment by that whole window and steps clean
+            // over the curve. Measured before this clamp: a window of 700 with
+            // a target of 749 went to 1396 on a single acknowledgement.
+            let inc = ((target - self.cwnd) / self.cwnd * acked).min(target - self.cwnd);
+            self.cwnd += inc;
         } else {
             // Below the curve: creep, do not stall.
             self.cwnd += 0.01 / self.cwnd * acked;
@@ -201,7 +212,9 @@ impl CongestionControl for Cubic {
         // Reno-equivalent window, run in parallel. On a short round trip this
         // is the faster of the two and is what keeps CUBIC from being slower
         // than plain Reno on the paths it was not tuned for.
-        self.w_est += ALPHA * acked / self.cwnd.max(1.0);
+        // Bounded for the same reason: one acknowledgement may not advance the
+        // Reno-equivalent window by more than a round trip's worth of growth.
+        self.w_est += (ALPHA * acked / self.cwnd.max(1.0)).min(ALPHA);
         if self.w_est > self.cwnd {
             self.cwnd = self.w_est;
         }
@@ -311,6 +324,99 @@ mod tests {
             cc.on_ack(SeqNo::new(seq), ctx(1_000_000 + i as u64 * 20_000, seq + 100));
         }
         assert!(cc.cwnd > low, "window did not recover: {} vs {low}", cc.cwnd);
+    }
+
+    /// The window must follow RFC 9438 §4.2's actual curve, not merely grow.
+    ///
+    /// This is the check that says the implementation is CUBIC rather than
+    /// something cubic-shaped: after a congestion event at `W`, the window is
+    /// `βW`, the time to climb back is `K = cbrt(W(1−β)/C)`, and at any point
+    /// in between it sits on `W_cubic(t) = C(t−K)³ + W_max`. Every constant
+    /// here comes from the RFC, not from this implementation.
+    #[test]
+    fn the_window_follows_the_cubic_curve_from_the_rfc() {
+        const W: f64 = 1_000.0;
+        const RTT_US: u64 = 20_000;
+
+        let mut cc = Cubic::new();
+        cc.init(ctx(0, 0));
+        cc.slow_start = false;
+        cc.cwnd = W;
+        cc.rtt_us = RTT_US as f64;
+
+        cc.on_loss(&[(SeqNo::new(500), SeqNo::new(500))], ctx(1_000_000, 600));
+        assert!((cc.cwnd - W * BETA).abs() < 0.5, "β: expected {}, got {}", W * BETA, cc.cwnd);
+        assert!((cc.w_max - W).abs() < 0.5, "W_max should be the window at the event");
+
+        let k_expected = (W * (1.0 - BETA) / C).cbrt();
+        assert!((cc.k - k_expected).abs() < 0.01, "K: expected {k_expected}, got {}", cc.k);
+
+        // Walk the curve. The window is evaluated one round trip ahead, per
+        // §4.2, so the reference value uses that too.
+        //
+        // Acknowledgements have to arrive at a realistic density. The RFC's
+        // per-acknowledgement form converges on the curve only if a window's
+        // worth of them arrives each round trip; feeding a handful per half
+        // second makes the window lag by a tenth and says nothing about whether
+        // the law is right.
+        let epoch = 1_000_000u64;
+        let rtt_s = RTT_US as f64 / 1e6;
+        let mut seq = 600u32;
+        cc.last_ack = SeqNo::new(seq);
+        let mut worst = 0.0f64;
+        for round in 1..=600u64 {
+            let now = epoch + round * RTT_US;
+            let per_round = cc.cwnd.round() as u32;
+            let mut sent = 0u32;
+            while sent < per_round {
+                let chunk = 8.min(per_round - sent);
+                seq += chunk;
+                sent += chunk;
+                cc.on_ack(SeqNo::new(seq), ctx(now, seq + 2_000));
+            }
+            let t = (now - epoch) as f64 / 1e6;
+            if t < k_expected {
+                let want = W + C * (t + rtt_s - k_expected).powi(3);
+                worst = worst.max((cc.cwnd - want).abs() / want.max(1.0));
+            }
+        }
+        assert!(worst < 0.05, "window strayed {:.1}% from the RFC curve at worst", worst * 100.0);
+
+        // Past K the window must have climbed back to roughly where it was.
+        assert!(cc.cwnd > W * 0.95, "never recovered to W_max: {:.0} vs {W}", cc.cwnd);
+    }
+
+    /// On a short round trip the Reno-equivalent window is the faster of the
+    /// two and must be what drives growth (RFC 9438 §4.3). Without it CUBIC is
+    /// slower than plain Reno on exactly the paths this protocol targets.
+    #[test]
+    fn the_reno_friendly_region_leads_on_a_short_path() {
+        let mut cc = Cubic::new();
+        cc.init(ctx(0, 0));
+        cc.slow_start = false;
+        cc.cwnd = 100.0;
+        cc.rtt_us = 2_000.0;
+        cc.on_loss(&[(SeqNo::new(500), SeqNo::new(500))], ctx(1_000_000, 600));
+
+        let after_cut = cc.cwnd;
+        let mut seq = 600u32;
+        cc.last_ack = SeqNo::new(seq);
+        // One second of a 2 ms path is 500 round trips; the cubic term over
+        // that span is negligible next to Reno's one-per-round-trip.
+        for step in 1..=500u64 {
+            let now = 1_000_000 + step * 2_000;
+            seq += 70;
+            cc.on_ack(SeqNo::new(seq), ctx(now, seq + 200));
+        }
+        let t = 1.0;
+        let cubic_only = cc.w_max + C * (t - cc.k).powi(3);
+        assert!(
+            cc.cwnd > cubic_only,
+            "Reno-equivalent window is not leading: {:.0} vs cubic-only {:.0}",
+            cc.cwnd,
+            cubic_only
+        );
+        assert!(cc.cwnd > after_cut, "window did not grow at all");
     }
 
     #[test]
