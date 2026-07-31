@@ -270,7 +270,9 @@ links, CUBIC against UDT's controller in Mbit/s:
 
 The degradation is superlinear: a 1.5x gap at 2% becomes 2.6-4.8x at 5%. If you
 know your paths are lossy, `CcKind::Udt` is measurably better and switching is
-one line. The default is CUBIC because sharing a link is a condition every
+one line. In absolute terms CUBIC still costs only 1.9x the clean transfer time
+at 5% burst loss — the gap is UDT's controller doing unusually well there, not
+CUBIC falling over. The default is CUBIC because sharing a link is a condition every
 peer-to-peer transfer meets constantly, while 5% loss is a bad path rather than
 a normal one — and UDT's controller takes 3% of a contended 50 ms link.
 
@@ -295,7 +297,12 @@ it did. As a multiple of the clean transfer time, over sixteen simulator seeds
 | 5% loss | 28.03x | 1.88x |
 | 10% loss | 49.98x | 5.26x |
 
-**Those are local-network numbers.** Lengthening the round trip alone
+**Those are local-network numbers, and on a link with no bottleneck.** A path
+with no rate limit has no queue, so nothing there can overflow and every drop is
+independent of what the sender does. That is useful for asking whether recovery
+works and useless for asking what it costs — the figures below are kept for the
+timer bugs they tracked, not as performance guidance. The bottleneck table above
+is the one to read. Lengthening the round trip alone
 (`loss_cost_by_round_trip`) puts 2% loss at 7.2x and 5% at 8.3x, flat from 10 ms
 out to 200 ms — which at least says the recovery timers scale with the path
 rather than falling apart on a long one.

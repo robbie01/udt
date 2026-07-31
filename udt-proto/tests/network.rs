@@ -110,6 +110,19 @@ impl LinkConfig {
         }
     }
 
+    /// A link that drops packets and has no rate limit.
+    ///
+    /// **For correctness tests only. Never use it as evidence about
+    /// performance.** No capacity means no queue, so nothing here can overflow
+    /// and every drop is independent of what the sender is doing — which is not
+    /// a link that can exist, since loss is either buffer overflow or medium
+    /// corruption and both require a rate. It is useful for "does the transfer
+    /// still complete", which is what most callers want.
+    ///
+    /// Used as a benchmark it has produced a wrong answer every time: the
+    /// original 7-8x loss figures, and a 52x reading for CUBIC that is 2.6-4.8x
+    /// on a link with a bottleneck. Measurements belong on
+    /// [`bottleneck`](Self::bottleneck).
     fn lossy(loss: f64) -> Self {
         LinkConfig { loss, ..Self::perfect() }
     }
@@ -712,16 +725,20 @@ fn loss_recovery_is_not_catastrophic() {
     let mut total_iid = 0.0;
 
     for seed in SEEDS {
-        let mut clean = Sim::new(LinkConfig::perfect(), seed);
+        let mut clean = Sim::new(LinkConfig::bottleneck(100, 10, 50), seed);
         clean.connect();
         let clean_us = clean.transfer(150, 8192, SendOpts::ordered());
 
-        let mut lossy = Sim::new(LinkConfig::bursty(0.05, 10.0), seed);
+        let mut lossy = Sim::new(
+            LinkConfig { loss: 0.05, loss_burst: 10.0, ..LinkConfig::bottleneck(100, 10, 50) },
+            seed,
+        );
         lossy.connect();
         let lossy_us = lossy.transfer(150, 8192, SendOpts::ordered());
         total += lossy_us as f64 / clean_us as f64;
 
-        let mut iid = Sim::new(LinkConfig::lossy(0.05), seed);
+        let mut iid =
+            Sim::new(LinkConfig { loss: 0.05, ..LinkConfig::bottleneck(100, 10, 50) }, seed);
         iid.connect();
         total_iid += iid.transfer(150, 8192, SendOpts::ordered()) as f64 / clean_us as f64;
     }
@@ -735,18 +752,16 @@ fn loss_recovery_is_not_catastrophic() {
         CcKind::default(),
     );
 
-    // This link has no bottleneck, so there is no queue and every drop is
-    // random. That is the worst case a loss-based controller can be handed, and
-    // the default is loss-based: CUBIC pays 52x here where UDT's own controller
-    // pays 1.6x, because it answers each burst by halving a window that nothing
-    // is refilling it against.
+    // On a link that can exist -- 100 Mbit, 10 ms, 50 ms of buffer -- 5% burst
+    // loss costs 1.9x the clean transfer. It used to read 52x here, and that
+    // was the measurement, not the controller: the old link had no capacity, so
+    // no queue could form, every drop was independent of anything the sender
+    // did, and a loss-based controller halved a window nothing was refilling.
     //
-    // The bound is generous on purpose. It is here to catch a *returning stall*
-    // -- the recovery-timer bugs this test was written for, which cost 30x when
-    // it was new -- not to police the choice of controller, which is measured
-    // properly in `cost_on_a_bottleneck` on links that have one. Tightening it
-    // means fixing CUBIC's behaviour at high loss first.
-    assert!(mean < 80.0, "5% burst loss cost {mean:.1}x on average -- a stall is back");
+    // Independent loss still reads 16.6x even with a bottleneck, because it
+    // manufactures a congestion event per drop. Bursts are what real links
+    // produce, so that is what the bound is set against.
+    assert!(mean < 5.0, "5% burst loss cost {mean:.1}x on average -- a stall is back");
 }
 
 /// The burst-loss model must actually produce the rate and the bursts asked
