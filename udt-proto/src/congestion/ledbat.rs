@@ -46,7 +46,14 @@ use super::{CcContext, CcOutput, CongestionControl};
 use crate::seq::SeqNo;
 
 /// Target queuing delay above the base, in µs. LEDBAT++ §3.1 (RFC 6817: 100 ms).
-const TARGET_US: f64 = 60_000.0;
+/// Ceiling on the queueing delay this controller will tolerate, per LEDBAT++
+/// §3.1. See [`Ledbat::target_us`] for why it is a ceiling and not the target.
+const TARGET_CEILING_US: f64 = 60_000.0;
+/// Floor, so the target stays above ordinary jitter on a very short path.
+const TARGET_FLOOR_US: f64 = 1_000.0;
+/// How much queueing the target allows, as a multiple of the path's own base
+/// delay. One means "do not more than double what the path already costs".
+const TARGET_RTT_FRACTION: f64 = 1.0;
 /// Cap on the dynamic gain divisor.
 const GAIN_CAP: f64 = 16.0;
 /// Multiplicative-decrease constant; the draft recommends 1.
@@ -162,13 +169,37 @@ impl Ledbat {
         f.saturating_sub(self.base_us) as f64
     }
 
+    /// Queueing delay this controller aims to keep the path at, in µs.
+    ///
+    /// LEDBAT++ §3.1 specifies a flat 60 ms, calibrated for internet paths. Used
+    /// literally it makes the controller meaningless on a short one: on a 60 µs
+    /// link 60 ms is a thousand times the path's own delay, so no queue this
+    /// side of catastrophic ever reaches the target, nothing ever triggers the
+    /// decrease term, and the "scavenger" behaves like a plain loss-based flow.
+    /// That is not a hypothetical — after slow start was fixed, this controller
+    /// was measurably *greedier* than the default one it is supposed to yield
+    /// to.
+    ///
+    /// So 60 ms is treated as a ceiling and the target proper is a multiple of
+    /// the base delay: a flow gets to add about as much latency as the path
+    /// already has, no more, and never more than LEDBAT++ allows. The floor
+    /// keeps it above jitter on a path short enough that a proportional target
+    /// would be single-digit microseconds.
+    fn target_us(&self) -> f64 {
+        if self.base_us == u32::MAX {
+            return TARGET_CEILING_US;
+        }
+        (self.base_us as f64 * TARGET_RTT_FRACTION).clamp(TARGET_FLOOR_US, TARGET_CEILING_US)
+    }
+
     /// `GAIN = 1 / min(16, ceil(2·TARGET / base))` — LEDBAT++ §3.2.
     ///
     /// Scaling by the base delay keeps the ramp gentle on short paths, where a
     /// constant gain would overshoot the target within a single RTT.
     fn gain(&self) -> f64 {
-        let base = if self.base_us == u32::MAX { TARGET_US } else { self.base_us as f64 };
-        let divisor = (2.0 * TARGET_US / base.max(1.0)).ceil().clamp(1.0, GAIN_CAP);
+        let target = self.target_us();
+        let base = if self.base_us == u32::MAX { target } else { self.base_us as f64 };
+        let divisor = (2.0 * target / base.max(1.0)).ceil().clamp(1.0, GAIN_CAP);
         1.0 / divisor
     }
 
@@ -247,7 +278,7 @@ impl CongestionControl for Ledbat {
                 self.cwnd += acked * gain;
                 // "If the queuing delay is larger than 3/4ths of the target
                 // delay, exit slow start" — LEDBAT++ §3.4.
-                if queuing > 0.75 * TARGET_US || self.cwnd >= ctx.flow_wnd {
+                if queuing > 0.75 * self.target_us() || self.cwnd >= ctx.flow_wnd {
                     self.phase = Phase::Steady;
                     self.phase_started_us = ctx.now_us;
                     // First slowdown two RTTs after slow start completes.
@@ -255,7 +286,7 @@ impl CongestionControl for Ledbat {
                 }
             }
             Phase::Steady => {
-                if queuing <= TARGET_US {
+                if queuing <= self.target_us() {
                     // Linear increase, apportioned across the window so one
                     // window of ACKs adds GAIN. An earlier version fixed the
                     // acked amount at one packet regardless of what the
@@ -264,7 +295,7 @@ impl CongestionControl for Ledbat {
                     self.cwnd += gain * acked / self.cwnd.max(1.0);
                 } else {
                     // W += max(GAIN − C·W·(delay/target − 1), −W/2)
-                    let over = queuing / TARGET_US - 1.0;
+                    let over = queuing / self.target_us() - 1.0;
                     let delta = (gain - DECREASE_C * self.cwnd * over).max(-self.cwnd / 2.0);
                     self.cwnd += delta * (acked / self.cwnd.max(1.0)).min(1.0);
                 }
