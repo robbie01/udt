@@ -162,6 +162,70 @@ minimum — and every byte of it is attacker-controlled. It parses before
 validation, so it wants a fuzz target from the first commit rather than a later
 one.
 
+## Ordering
+
+The payload is now a separate datagram, so it can arrive before the `CONNECT`
+it belongs to. Nothing about UDP prevents that and reordering is common.
+
+It must therefore be **self-describing**: the client's socket id and ISN travel
+in the payload datagram itself, and the listener never needs the handshake to
+have arrived first in order to interpret it. Pool entries are keyed on
+`(peer address, socket id)`, filled by whichever datagram lands first, and read
+at accept time. Both orders then work, and the loss of either datagram costs
+only the 0-RTT payload.
+
+That fixes interpretation. It does not fix the exposure, and the exposure is
+worse than the section above admits.
+
+**Requiring the `CONNECT` to have been seen first buys nothing**, because the
+listener holds no state at induction — that is the whole point of the stateless
+cookie. There is nothing to check a payload against. So a payload arriving first
+means allocating a pool entry for a peer that has not sent a handshake, has not
+answered a challenge, and may not exist. One spoofed datagram, one entry.
+
+For the conclusion-phase variant there is a clean answer: **put the cookie in
+the payload datagram**. The listener can then verify it statelessly on arrival,
+in any order, and only allocate for a peer that has demonstrably received a
+challenge at that address. Spoofing stops working. The cost is that this is no
+longer 0-RTT — it saves one round trip, not two.
+
+For true first-packet 0-RTT there is no cookie yet, so no stateless check is
+possible, and speculative allocation for unverified peers is not a detail of the
+design but the whole of it. The bounded pool, per-address cap, expiry and
+pressure fallback are the mitigations, and they are what makes it survivable
+rather than what makes it safe.
+
+**That argues for the feature being off by default**, with the conclusion-phase
+variant as the one enabled without ceremony.
+
+## Rendezvous is the easy case, not the hard one
+
+The doc above treated rendezvous as an afterthought. It is the opposite, and for
+a peer-to-peer system it is probably the path that matters.
+
+Rendezvous sends `cookie: 0` — there is no challenge, and no address validation
+of any kind. That sounds worse and is better, because of what it replaces:
+**a rendezvous peer already holds state for the address it is connecting to.**
+The application called `connect_rendezvous(peer)`, so a `Connection` exists,
+pending, before anything is sent.
+
+A payload arriving from that address is matched against state the local
+application deliberately created. There is no pool, no speculative allocation,
+and no new exposure — the number of pending rendezvous connections is bounded by
+the local application's own behaviour, not by an attacker's. Reordering is a
+non-issue for the same reason: the state to match against exists before either
+datagram is sent.
+
+So rendezvous gets true 0-RTT essentially for free, while connect/accept is
+where all the difficulty lives. If the motivating use is peer-to-peer with a
+Noise handshake over rendezvous, **that is the version to build first**, and it
+can ship without resolving the pool question at all.
+
+The remaining wrinkle is symmetry: both peers are initiators and both may send a
+payload. A pattern like `XX` has to decide which end takes which role, and that
+belongs above this layer — the transport delivers both and says nothing about
+them.
+
 ## Sequencing## Sequencing
 
 The payload is not stream data and must not consume a sequence number — the
