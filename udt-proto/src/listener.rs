@@ -8,15 +8,23 @@ use crate::seq::SeqNo;
 use bytes::{Bytes, BytesMut};
 use std::collections::{HashMap, VecDeque};
 
-/// How long a completed handshake is remembered.
-///
 /// How many peers may have early data held for them at once.
 ///
 /// Each entry is one packet, and a peer that never completes its handshake
-/// costs one until it is evicted. Bounded rather than absent because this is
-/// reachable by an unverified peer.
+/// holds one until it expires. Bounded rather than absent because an
+/// unverified peer can reach it.
 const EARLY_DATA_SLOTS: usize = 256;
 
+/// How long early data waits for the handshake it belongs to.
+///
+/// A conclusion arriving later than this is refused anyway, so anything still
+/// held by then is never going to be claimed. Without an expiry the table fills
+/// permanently and the feature stops working for everyone, which 256 packets
+/// from an unverified peer would be enough to arrange.
+const EARLY_DATA_TTL_US: u64 = 30_000_000;
+
+/// How long a completed handshake is remembered.
+///
 /// Long enough to outlive any cookie a peer could still be echoing, which is
 /// what stops a retransmitted handshake being mistaken for a new one.
 const ACCEPT_MEMORY_US: u64 = 150_000_000;
@@ -173,11 +181,19 @@ impl Listener {
             // address and hand it over at accept.
             //
             // Held, not acted on. It is unverified at this point -- no cookie
-            // has come back -- so it buys a slot and nothing else, and the slot
-            // is bounded and evicted oldest-first like `accepted`. A conclusion
-            // that never arrives costs one entry until it ages out.
+            // has come back -- so it buys a slot and nothing else.
             crate::packet::Packet::Data { header, payload } => {
-                if !payload.is_empty() && self.early.len() < EARLY_DATA_SLOTS {
+                if payload.is_empty() {
+                    return;
+                }
+                // Expire before deciding there is no room. A peer that goes
+                // quiet after sending early data must not hold a slot for ever,
+                // or the table fills and stays full.
+                if self.early.len() >= EARLY_DATA_SLOTS {
+                    self.early
+                        .retain(|_, (at, _, _)| now_us.saturating_sub(*at) < EARLY_DATA_TTL_US);
+                }
+                if self.early.len() < EARLY_DATA_SLOTS {
                     self.early.insert(addr, (now_us, header.seq_no, payload));
                 }
                 return;

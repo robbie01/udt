@@ -18,7 +18,7 @@ fn peer() -> PeerAddr {
 
 /// Runs the handshake to completion, returning the accepted connection and
 /// every datagram the client sent along the way.
-fn handshake(early: Option<&[u8]>) -> (Connection, Connection, usize) {
+fn handshake(early: Option<&[u8]>) -> (Connection, Connection, Vec<Bytes>) {
     let mut listener = Listener::new(LISTENER_ID, MSS, 0, 0xABCD_EF01_2345_6789, CcKind::default());
     let mut client = Connection::new_active(CLIENT_ID, SeqNo::new(1000), MSS, 0, CcKind::default());
     if let Some(bytes) = early {
@@ -29,7 +29,7 @@ fn handshake(early: Option<&[u8]>) -> (Connection, Connection, usize) {
     let mut tx = TransmitBuf::new();
     let mut events = Vec::new();
     let mut accepted = None;
-    let mut client_datagrams = 0usize;
+    let mut client_datagrams: Vec<Bytes> = Vec::new();
 
     for _ in 0..40 {
         now += 1_000;
@@ -43,7 +43,7 @@ fn handshake(early: Option<&[u8]>) -> (Connection, Connection, usize) {
                 to_listener.push(Bytes::copy_from_slice(chunk));
             }
         }
-        client_datagrams += to_listener.len();
+        client_datagrams.extend(to_listener.iter().cloned());
 
         let mut listener_out = Vec::new();
         for datagram in to_listener {
@@ -64,7 +64,7 @@ fn handshake(early: Option<&[u8]>) -> (Connection, Connection, usize) {
                             replies.push(Bytes::copy_from_slice(chunk));
                         }
                     }
-                    client_datagrams += replies.len();
+                    client_datagrams.extend(replies.iter().cloned());
                     let mut more = Vec::new();
                     for reply in replies {
                         listener.on_datagram(peer(), reply, now, &mut more);
@@ -172,5 +172,100 @@ fn early_data_is_refused_when_it_cannot_be_sent() {
     assert!(
         !connected.set_early_data(Bytes::from_static(b"too late")),
         "an established connection has no conclusion left to carry it"
+    );
+}
+
+/// A peer that sends early data and then goes quiet must not hold its slot for
+/// ever.
+///
+/// The table is bounded and an unverified peer can reach it, so without expiry
+/// a few hundred packets would disable the feature permanently for everyone.
+#[test]
+fn abandoned_early_data_does_not_hold_the_table() {
+    const MSG: &[u8] = b"noise handshake message one";
+
+    // A genuine early-data packet, taken from a real handshake.
+    let (_c, _s, sent) = handshake(Some(MSG));
+    let early_pkt = sent
+        .iter()
+        .find(|d| d.len() > 16 && udt_proto::dst_socket_id(d).is_some_and(|id| id != 0))
+        .expect("no early data packet was sent")
+        .clone();
+
+    let mut listener = Listener::new(LISTENER_ID, MSS, 0, 0x1234_5678_9ABC_DEF0, CcKind::default());
+    let mut out = Vec::new();
+
+    // Far past capacity, from peers that never say anything else.
+    for i in 0..600u32 {
+        let mut addr = [0u8; 20];
+        addr[..4].copy_from_slice(&i.to_be_bytes());
+        listener.on_datagram(PeerAddr(addr), early_pkt.clone(), 1_000, &mut out);
+    }
+
+    // Well past the expiry, a peer that does complete must still be served.
+    let mut now = 90_000_000u64;
+    let mut client =
+        Connection::new_active(CLIENT_ID, SeqNo::new(1000), MSS, now, CcKind::default());
+    assert!(client.set_early_data(Bytes::from_static(MSG)));
+    let mut tx = TransmitBuf::new();
+    let mut events = Vec::new();
+    let mut accepted = None;
+
+    for _ in 0..40 {
+        now += 1_000;
+        tx.clear();
+        client.on_timer(now, &mut tx, &mut events);
+        let mut batch: Vec<Bytes> = Vec::new();
+        for (bytes, seg) in tx.runs() {
+            for chunk in bytes.chunks(seg.max(1)) {
+                batch.push(Bytes::copy_from_slice(chunk));
+            }
+        }
+        let mut evs = Vec::new();
+        for d in batch {
+            listener.on_datagram(peer(), d, now, &mut evs);
+        }
+        for ev in evs {
+            match ev {
+                ListenerEvent::SendTo { data, .. } => {
+                    let mut ctx = TransmitBuf::new();
+                    client.on_datagram(data, now, &mut ctx, &mut events);
+                    let mut more = Vec::new();
+                    for (bytes, seg) in ctx.runs() {
+                        for chunk in bytes.chunks(seg.max(1)) {
+                            listener.on_datagram(
+                                peer(),
+                                Bytes::copy_from_slice(chunk),
+                                now,
+                                &mut more,
+                            );
+                        }
+                    }
+                    for ev in more {
+                        match ev {
+                            ListenerEvent::SendTo { data, .. } => {
+                                let mut c2 = TransmitBuf::new();
+                                client.on_datagram(data, now, &mut c2, &mut events);
+                            }
+                            ListenerEvent::Accept(conn, _) => accepted = Some(*conn),
+                        }
+                    }
+                }
+                ListenerEvent::Accept(conn, _) => accepted = Some(*conn),
+            }
+        }
+        if accepted.is_some() {
+            break;
+        }
+    }
+
+    let mut server = accepted.expect("handshake never completed");
+    let mut out2 = Vec::new();
+    let mut tx2 = TransmitBuf::new();
+    server.on_timer(now + 1_000, &mut tx2, &mut out2);
+    assert_eq!(
+        server.recv_msg().as_deref(),
+        Some(MSG),
+        "early data was dropped because abandoned entries never expired"
     );
 }
