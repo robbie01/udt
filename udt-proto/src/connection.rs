@@ -1459,10 +1459,14 @@ impl Connection {
             _ => None,
         };
         self.state = ConnState::Connected;
-        self.post_connect(peer_isn, mss, flow_wnd, now_us);
+        // Before `post_connect`, not after. That is where congestion control is
+        // initialised and where the first NAK timer is armed, and both read
+        // `rtt_us`. Feeding the measurement afterwards left them opening with
+        // the 10 ms guess on a path that had already told us what it was.
         if let Some(rtt) = handshake_rtt {
             self.feed_rtt(rtt, now_us);
         }
+        self.post_connect(peer_isn, mss, flow_wnd, now_us);
         out.push(Event::Connected);
     }
 

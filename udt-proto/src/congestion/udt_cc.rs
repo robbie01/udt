@@ -332,6 +332,18 @@ impl CongestionControl for UdtCc {
         self.nak_count = 0;
         self.dec_random = 1;
         self.cwnd = INIT_CWND;
+        // Not paced. Spreading the opening window over the handshake round
+        // trip looks obviously right and is a trap here: this controller only
+        // recomputes `pkt_snd_period_us` when slow start *ends*, so a period
+        // set at init pins the send rate for the whole of slow start and cwnd
+        // growth stops meaning anything. The fluid model showed it plainly --
+        // peak queueing fell to 12 ms, not because the controller got gentler
+        // but because it never ramped -- while the packet-level harness showed
+        // no difference at all, bit for bit, because `transfer` feeds messages
+        // in as they drain and neither limit ever binds.
+        //
+        // Pacing the opening window is still the right thing to do; it needs
+        // the period to track the window during slow start first.
         self.pkt_snd_period_us = 1.0;
         self.min_rtt_us = None;
         self.hystart = HyStart::new(ctx.snd_curr_seq);

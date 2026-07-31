@@ -841,6 +841,8 @@ fn cost_on_a_bottleneck() {
         ("100mbit 10ms 50ms buf", 100u64, 10u64, 50u64),
         ("100mbit 50ms 50ms buf", 100, 50, 50),
         ("10mbit 50ms 100ms buf", 10, 50, 100),
+        // A shallow buffer is where a line-rate opening burst has nowhere to go.
+        ("100mbit 10ms 5ms buf", 100, 10, 5),
     ] {
         for loss_pct in [0.0f64, 2.0] {
             let (mut ratios, mut mbps_got, mut queues, mut drops) =
