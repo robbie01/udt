@@ -29,7 +29,7 @@
 //!
 //! # fn now_us() -> u64 { 0 }
 //! # fn write_to_peer(_: &[u8], _segment_size: usize) {}
-//! let mut conn = Connection::new_active(1, SeqNo::new(0), 1500, now_us(), CcKind::Udt);
+//! let mut conn = Connection::new_active(1, SeqNo::new(0), 1500, now_us(), CcKind::default());
 //! let mut transmit = TransmitBuf::new();
 //! let mut events = Vec::new();
 //!

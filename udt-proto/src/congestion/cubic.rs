@@ -11,9 +11,9 @@
 //!
 //! CUBIC has one control. The window grows as a cubic function of the time
 //! since the last congestion event, and the pacing period is whatever empties
-//! that window over a round trip. Slow start is [`HyStart`], which is specified
-//! for exactly this family — using it with UDT's native law was half of a
-//! matched pair.
+//! that window over a round trip. Slow start is HyStart++ (RFC 9406), which is
+//! specified for exactly this family — using it with UDT's native law was half
+//! of a matched pair.
 
 use super::hystart::{CSS_GROWTH_DIVISOR, HyStart, HyStartVerdict};
 use super::{CcContext, CcOutput, CongestionControl};

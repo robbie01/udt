@@ -2,8 +2,16 @@
 //!
 //! Rate-based rather than window-based: the controller estimates the path's
 //! capacity from packet-pair timing and paces sends to match, rather than
-//! filling a window until something drops. This is what makes UDT hold high
-//! throughput on long fat links where TCP's window growth is the limit.
+//! filling a window until something drops.
+//!
+//! That was supposed to be what holds high throughput on a long fat link where
+//! TCP's window growth is the limit. Measured, it is not: it keeps a rate *and*
+//! a window and neither converges, so it reaches 62% of a clean 100 Mbit/50 ms
+//! path against CUBIC's 72%, and takes 3% of that path when a CUBIC flow is
+//! sharing it. It is no longer the default. See [`CcKind::Udt`] for what it is
+//! still here for.
+//!
+//! [`CcKind::Udt`]: crate::CcKind::Udt
 
 use super::hystart::{CSS_GROWTH_DIVISOR, HyStart, HyStartVerdict};
 use super::{CcContext, CcOutput, CongestionControl};
@@ -19,7 +27,7 @@ use crate::seq::SeqNo;
 ///
 /// 64 packets is 92 KB. That is a large opening burst by TCP's standards, where
 /// 10 is usual, but it is in line with what content networks run on QUIC, and
-/// UDT is explicitly for links where TCP's caution is the bottleneck. Loss
+/// UDT was built for links where TCP's caution is the bottleneck. Loss
 /// during slow start still halves the window as usual, so the exposure is one
 /// burst.
 const INIT_CWND: f64 = 64.0;

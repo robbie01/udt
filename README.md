@@ -5,9 +5,15 @@ state machine plus a Tokio driver. It speaks the wire format of the original C++
 implementation, so the two interoperate.
 
 UDT is reliable and message-oriented: every `send` arrives as exactly one `recv`
-of the same length, in order, with congestion control. It is built for links
-where TCP's window growth is the bottleneck rather than the network — long fat
-pipes, high-latency paths, bulk transfer.
+of the same length, in order, with congestion control.
+
+Its original pitch was beating TCP's window growth on long fat pipes. That was a
+claim about Reno-era TCP, and it does not survive contact with CUBIC — which is
+now the default here, precisely because measurement said so. What is still worth
+having is the rest of it: UDP underneath, so IPv6 firewall traversal is trivial
+and a userspace deployment needs no privileges; a rendezvous connect, so two
+peers behind NATs reach each other with no listener on either side; and message
+framing rather than a byte stream.
 
 **Status: pre-release.** Nothing is published to crates.io and the version is
 `0.0.0`; `udt-proto`'s API is explicitly not stable yet. Dual-licensed
@@ -221,8 +227,61 @@ the ranges go after the documented ACK body, and both the C++ fork and pristine
 upstream keep working against it, tested with a lossy relay and a count of
 extended ACKs on the wire.
 
-Loss costs much less than it did. As a multiple of the clean transfer time,
-over sixteen simulator seeds **on a 200 µs path**:
+Congestion control is where most of the recent work went, and the default
+changed as a result. It is now CUBIC (RFC 9438), with UDT's own rate-based
+controller still available. The reason is not throughput but sharing: UDT's
+controller keeps a rate *and* a window and neither converges, so what it takes
+of a contended bottleneck depends on the path rather than on the competition.
+Two flows, one link:
+
+| | 50 ms path | 1 ms path |
+|---|---|---|
+| UDT's controller against CUBIC | 3% | 85% |
+| CUBIC against CUBIC | 50% | 50% |
+
+Three percent of a path against one competing download is not a usable default
+for something peer-to-peer, where sharing a link is the normal condition.
+
+On the link itself, 5 MB over a bottleneck, six seeds, against the same
+measurement before any of this work:
+
+| link | goodput | self-inflicted drops |
+|---|---|---|
+| 100 Mbit, 10 ms, 50 ms buffer | 75.4 → **94.5** Mbit/s | 594 → **137** |
+| 100 Mbit, 50 ms, 50 ms buffer | 51.4 → **72.0** Mbit/s | 1006 → **0** |
+| 10 Mbit, 50 ms, 100 ms buffer | 7.2 → **9.7** Mbit/s | 154 → **234** |
+| 100 Mbit, 10 ms, 5 ms buffer | 51.4 → **65.1** Mbit/s | 1413 → **31** |
+
+Slow start is the other half of it. It used to end only when the bottleneck
+buffer overflowed, because loss was the only signal it had; it now leaves on a
+delay signal (HyStart++, RFC 9406), which is what took those drop counts down.
+RFC 9406's 4 ms floor on what counts as a queue had to go — on a 5 ms path it
+demands an 80% rise before it will believe in one — so the threshold is
+proportional to the path with a 1 ms floor.
+
+**One caveat on that default, found while writing this section.** On a link with
+5% loss and *no bottleneck* — no queue, so every drop is random — CUBIC costs
+52x the clean transfer time where UDT's controller costs 1.6x. It halves a
+window that nothing is refilling it against. That case was not checked before
+the default changed, and it is the strongest argument against the choice. It is
+also the least realistic link in the suite, for the same reason the no-bottleneck
+loss sweep below is: a path with no queue is not a path anyone has. On links that
+do have a bottleneck the gap is 1.5x, not 52x. If your paths are lossy, measure
+before trusting the default.
+
+Under loss the picture reverses, and how much depends entirely on what the loss
+looks like. At 2% in bursts of ten, UDT's controller leads CUBIC 40.8 to 27.1
+Mbit/s on the 50 ms path: answering a drop with a 12.5% nudge to a rate recovers
+more gently than cutting a window by 30%. At 2% *independent* loss it looks far
+worse than that — 18.6 against 2.0 — but that is mostly the model. Independent
+per-packet loss manufactures a separate congestion event out of every drop,
+which is close to the worst case for anything loss-based and nothing like a real
+path. Both figures are in `CcKind`'s documentation, with the untrustworthy one
+marked.
+
+Loss recovery itself, separately from congestion control, costs much less than
+it did. As a multiple of the clean transfer time, over sixteen simulator seeds
+**on a 200 µs path**:
 
 | | at the start | now |
 |---|---|---|
