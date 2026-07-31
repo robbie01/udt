@@ -140,6 +140,9 @@ pub mod fuzz {
 
 mod ack_window;
 mod codec;
+
+/// The destination socket id in a datagram, for demultiplexing before decode.
+pub use codec::dst_socket_id;
 mod connection;
 mod handshake;
 mod listener;

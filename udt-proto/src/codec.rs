@@ -15,6 +15,18 @@ use bytes::{BufMut, Bytes, BytesMut};
 /// Decode a single UDT packet from a datagram.
 /// The returned `Bytes` for data payloads slices into the provided `datagram`
 /// (zero-copy via ref-count bump).
+/// The destination socket id in a datagram's header, without decoding the rest.
+///
+/// A demultiplexer needs this and nothing else, and it runs per datagram on the
+/// receive path, so it is worth not building a [`Packet`] to get it. `None`
+/// means the datagram is too short to have a header at all.
+///
+/// Zero is a real value here and means "no particular connection" — a handshake
+/// from a peer that does not yet know what id to use.
+pub fn dst_socket_id(datagram: &[u8]) -> Option<u32> {
+    datagram.get(12..16).map(read_be_u32)
+}
+
 pub fn decode(datagram: Bytes) -> Option<Packet> {
     if datagram.len() < 16 {
         return None;
@@ -359,6 +371,20 @@ fn read_be_i32(b: &[u8]) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    /// The cheap accessor must agree with a full decode, and must not panic on
+    /// a runt. It reads attacker-supplied bytes before anything is validated.
+    #[test]
+    fn dst_socket_id_matches_a_full_decode() {
+        let mut buf = BytesMut::new();
+        encode_keepalive(1234, 0xDEAD_BEEF, &mut buf);
+        let bytes = buf.freeze();
+        assert_eq!(dst_socket_id(&bytes), Some(0xDEAD_BEEF));
+
+        for n in 0..16 {
+            assert_eq!(dst_socket_id(&bytes[..n]), None, "len {n} should have no header");
+        }
+    }
+
     use super::*;
     use crate::handshake::{SOCK_DGRAM, UDT_VERSION, req_type};
     use bytes::Bytes;

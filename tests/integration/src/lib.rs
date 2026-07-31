@@ -204,6 +204,52 @@ mod tests {
     // Verifies that concurrent connect_rendezvous() calls on the same Endpoint
     // all go through the single endpoint mux without racing on recv_from.
 
+    /// Two connections between the *same* pair of addresses must both work.
+    ///
+    /// Upstream demultiplexes on peer address, client socket id and ISN together,
+    /// so more than one connection per address pair is expected. This
+    /// implementation used to give every accepted connection the listener's socket
+    /// id and route datagrams by peer address alone, which silently collapsed them
+    /// into one. Nothing tested it, which is how it went unnoticed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_connections_can_share_one_address_pair() {
+        let ep_a = Arc::new(Endpoint::bind("127.0.0.1:0").await.unwrap());
+        let ep_b = Arc::new(Endpoint::bind("127.0.0.1:0").await.unwrap());
+        let (addr_a, addr_b) = (ep_a.local_addr(), ep_b.local_addr());
+
+        // Both pairs run between the same two addresses, so only the socket id
+        // tells them apart.
+        let mut pairs = Vec::new();
+        for _ in 0..2u8 {
+            let (a, b) = (Arc::clone(&ep_a), Arc::clone(&ep_b));
+            let ta = tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(10), a.connect_rendezvous(addr_b))
+                    .await
+                    .expect("A timed out")
+                    .expect("A failed")
+            });
+            let tb = tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(10), b.connect_rendezvous(addr_a))
+                    .await
+                    .expect("B timed out")
+                    .expect("B failed")
+            });
+            pairs.push((ta.await.unwrap(), tb.await.unwrap()));
+        }
+
+        // Each pair must carry its own payload without the other's bytes.
+        for (i, (a, b)) in pairs.iter().enumerate() {
+            let payload = vec![0x41u8 + i as u8; 4096];
+            a.send(&payload).await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = tokio::time::timeout(Duration::from_secs(5), b.recv(&mut buf))
+                .await
+                .expect("recv timed out")
+                .unwrap();
+            assert_eq!(&buf[..n], &payload[..], "pair {i} received the wrong bytes");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn s7_multi_rendezvous_same_endpoint() {
         const N: usize = 3;

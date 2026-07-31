@@ -126,13 +126,30 @@ struct EndpointInner {
     socket: Arc<UdpSocket>,
     local_addr: SocketAddr,
     cfg: EndpointConfig,
-    /// Peer address to connection, for everything sharing the bound port.
+    /// Our socket id to connection, for everything sharing the bound port.
+    ///
+    /// Keyed on the id rather than the peer address because a peer may hold
+    /// more than one connection to us — upstream demultiplexes on address,
+    /// client socket id and ISN together, and keying on address alone silently
+    /// collapsed those into one. An arriving datagram names its destination id
+    /// in the header, which is exactly this key.
     ///
     /// A read-write lock rather than a channel or a single owning task: the
     /// readers only ever look routes up, and taking a read lock lets several
     /// of them dispatch to different connections at once. Writes happen once
     /// per connection, at accept and at close.
-    routes: RwLock<HashMap<SocketAddr, mpsc::Sender<Inbound>>>,
+    routes: RwLock<HashMap<u32, mpsc::Sender<Inbound>>>,
+    /// The same connections, keyed by peer address.
+    ///
+    /// Needed because a peer cannot address us by an id it has not been told
+    /// yet: a handshake carries destination 0, and a rendezvous pair exchanges
+    /// several of them before either side knows the other's id. Those can only
+    /// be matched by address.
+    ///
+    /// So this is the handshake-time index and `routes` is the steady-state
+    /// one. Only `routes` can distinguish two connections sharing an address,
+    /// which is why it is the one consulted first.
+    by_addr: RwLock<HashMap<SocketAddr, mpsc::Sender<Inbound>>>,
     listener: Mutex<Option<ListenerSlot>>,
     /// False once the `Endpoint` handle is dropped. Readers keep serving
     /// existing connections after that, and stop when the last one goes.
@@ -149,9 +166,12 @@ impl EndpointInner {
             && self.routes.read().map(|r| r.is_empty()).unwrap_or(true)
     }
 
-    fn remove_route(&self, peer: SocketAddr) {
+    fn remove_route(&self, socket_id: u32, peer: SocketAddr) {
         if let Ok(mut routes) = self.routes.write() {
-            routes.remove(&peer);
+            routes.remove(&socket_id);
+        }
+        if let Ok(mut by_addr) = self.by_addr.write() {
+            by_addr.remove(&peer);
         }
         self.wind_down.notify_waiters();
     }
@@ -249,6 +269,7 @@ impl Endpoint {
             local_addr,
             cfg,
             routes: RwLock::new(HashMap::new()),
+            by_addr: RwLock::new(HashMap::new()),
             listener: Mutex::new(None),
             handle_alive: AtomicBool::new(true),
             wind_down: Notify::new(),
@@ -404,8 +425,12 @@ fn spawn_shared(
     let (recv_tx, recv_rx) = flume::bounded::<Bytes>(RECV_BACKLOG);
     let (connected_tx, connected) = oneshot::channel::<()>();
 
+    let socket_id = conn.socket_id();
     if let Ok(mut routes) = ep.routes.write() {
-        routes.insert(peer, datagram_tx);
+        routes.insert(socket_id, datagram_tx.clone());
+    }
+    if let Ok(mut by_addr) = ep.by_addr.write() {
+        by_addr.insert(peer, datagram_tx);
     }
 
     let udp = Arc::clone(&ep.socket);
@@ -420,7 +445,7 @@ fn spawn_shared(
         recv_tx,
         Some(connected_tx),
         shared.clone(),
-        move || owner.remove_route(peer),
+        move || owner.remove_route(socket_id, peer),
     ));
 
     let socket = Socket {
@@ -452,9 +477,9 @@ fn spawn_shared(
 async fn run_reader(ep: Arc<EndpointInner>) {
     let Ok(io) = BatchIo::new(&ep.socket) else { return };
     let mut rx = RecvBuffers::new(&io);
-    // Most datagrams arrive from the same peer as the last; remembering the
-    // previous route turns the hash lookup into an address comparison.
-    let mut cached: Option<(SocketAddr, mpsc::Sender<Inbound>)> = None;
+    // Most datagrams belong to the same connection as the last; remembering
+    // the previous route turns the hash lookup into an integer comparison.
+    let mut cached: Option<(u32, mpsc::Sender<Inbound>)> = None;
 
     loop {
         let count = tokio::select! {
@@ -478,24 +503,44 @@ async fn run_reader(ep: Arc<EndpointInner>) {
         // connections.
         for i in 0..count {
             let from = rx.metas[i].addr;
-            let route = match &cached {
-                Some((addr, tx)) if *addr == from => Some(tx.clone()),
-                _ => {
-                    let found = ep.routes.read().ok().and_then(|r| r.get(&from).cloned());
-                    if let Some(tx) = &found {
-                        cached = Some((from, tx.clone()));
-                    }
-                    found
-                }
-            };
 
             // A buffer can hold a run of datagrams coalesced by receive
             // offload; delivering it whole would hand the decoder a blob and
             // lose all but the first packet.
-            let mut datagrams = rx.take_datagrams(i);
-            match route {
-                Some(tx) => {
-                    for datagram in datagrams {
+            //
+            // Routing is per datagram, not per run. Coalescing groups by
+            // address, and one address may hold several connections, so a run
+            // can carry datagrams for different ones.
+            let datagrams = rx.take_datagrams(i);
+            let mut offered_handshake = false;
+            for datagram in datagrams {
+                let id = udt_proto::dst_socket_id(&datagram.bytes).unwrap_or(0);
+                // Zero addresses no connection in particular, which is what a
+                // peer sends before it has been told an id. It can only be a
+                // handshake.
+                let mut route = if id == 0 {
+                    None
+                } else {
+                    match &cached {
+                        Some((cached_id, tx)) if *cached_id == id => Some(tx.clone()),
+                        _ => {
+                            let found = ep.routes.read().ok().and_then(|r| r.get(&id).cloned());
+                            if let Some(tx) = &found {
+                                cached = Some((id, tx.clone()));
+                            }
+                            found
+                        }
+                    }
+                };
+                if route.is_none() {
+                    // Either a handshake, which carries destination 0, or a
+                    // peer still using an id we have since retired. Both can
+                    // only be matched by address.
+                    route = ep.by_addr.read().ok().and_then(|r| r.get(&from).cloned());
+                }
+
+                match route {
+                    Some(tx) => {
                         // Wait rather than drop when a connection's queue is
                         // full. Dropping looks right -- this task serves every
                         // connection on the port -- but a dropped datagram
@@ -510,13 +555,16 @@ async fn run_reader(ep: Arc<EndpointInner>) {
                             break;
                         }
                     }
-                }
-                None => {
-                    // Unknown source: only a handshake can be legitimate. The
-                    // rest of the run waits for the peer to retransmit, which
-                    // is what an opening connection does anyway.
-                    if let Some(datagram) = datagrams.next() {
-                        handle_handshake(&ep, from, datagram.bytes).await;
+                    None => {
+                        // Unknown destination: only a handshake can be
+                        // legitimate. One per run, as before -- the rest wait
+                        // for the peer to retransmit, which is what an opening
+                        // connection does anyway, and it keeps a coalesced run
+                        // from costing a handshake apiece.
+                        if !offered_handshake {
+                            offered_handshake = true;
+                            handle_handshake(&ep, from, datagram.bytes).await;
+                        }
                     }
                 }
             }
