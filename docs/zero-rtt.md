@@ -111,24 +111,58 @@ The transport's obligation is to document that a 0-RTT payload may be delivered
 more than once, and to bound the work a replay costs. It cannot provide
 exactly-once for a payload that arrives before any state exists.
 
-## Wire compatibility
+## Wire compatibility — the handshake packet cannot carry it
 
-The handshake is a fixed-layout control packet. The intended trick is the one
-selective ACK used: append the payload after the documented 48-byte body, so a
-peer that does not know about it reads the fields it expects and ignores the
-rest.
+**Tested, and the answer is no.** Both C++ implementations reject a handshake
+whose length is not exactly 48 bytes, before deserialising it:
 
-**This is unverified and is the first thing to establish.** Selective ACK proved
-both C++ implementations tolerate trailing bytes on an *ACK*; a handshake is
-parsed by different code, and `CHandShake::deserialize` may or may not care.
-Test it against the fork and pristine upstream before anything else — if either
-rejects an over-long handshake, the payload cannot ride along transparently and
-the design changes to a capability flag negotiated in the handshake's spare
-fields, with data only once both ends have agreed.
+| | | |
+|---|---|---|
+| pristine upstream | `core.cpp:2471` | `if (packet.getLength() != CHandShake::m_iContentSize) return 1004;` |
+| the fork | `core.cpp:1771` | identical |
 
-That test is cheap and the harness already exists.
+That is `CUDT::listen()`, which handles the induction *and* the conclusion. So
+appending a payload to either one is not a compatible extension — it is a
+connection that never establishes against an unmodified peer. Selective ACK's
+trick does not transfer; an ACK is parsed by code that tolerates trailing bytes
+and a handshake is not.
 
-## Sequencing
+This kills the transparent-extension design for both variants, and the doc above
+was written assuming it would work.
+
+## What replaces it: a separate packet
+
+Do not touch the handshake packet. Send the payload as its **own datagram**,
+immediately after the `CONNECT`, as a distinct control type.
+
+This sidesteps the length check completely, and it degrades correctly by
+construction:
+
+- An unmodified C++ peer receives a control packet of a type it does not know
+  and drops it. Its handshake is byte-identical to today's, so interop is
+  untouched and needs no negotiation at all.
+- A Rust peer that receives it before the connection exists holds it against the
+  pending handshake, under the same bounded pool described above.
+- If the extra datagram is lost, nothing breaks. There is no 0-RTT payload, the
+  handshake completes normally, and the application falls back — which it must
+  handle anyway, since the listener may be under pressure and drop it.
+
+Two consequences worth stating plainly.
+
+**No negotiation is needed for safety**, only for efficiency. A client can always
+send the payload; against a C++ peer it is wasted bandwidth, not a failure. If
+that waste matters, the listener can advertise support in a spare handshake
+field — but nothing is broken without it.
+
+**The payload is now unauthenticated and unordered relative to the handshake.**
+It is a lone datagram from an unverified source, arriving before any state
+exists, possibly before or after the `CONNECT` it belongs to. It needs to carry
+enough to be matched to a pending handshake — the client's socket id and ISN at
+minimum — and every byte of it is attacker-controlled. It parses before
+validation, so it wants a fuzz target from the first commit rather than a later
+one.
+
+## Sequencing## Sequencing
 
 The payload is not stream data and must not consume a sequence number — the
 connection's first data packet should still be the ISN. It is delivered
