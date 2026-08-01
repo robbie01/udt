@@ -12,9 +12,6 @@ use bytes::{BufMut, Bytes, BytesMut};
 // Data packet payloads are raw application bytes with no byte-order conversion.
 // This matches what C++ channel.cpp does with htonl/ntohl before/after sendmsg/recvmsg.
 
-/// Decode a single UDT packet from a datagram.
-/// The returned `Bytes` for data payloads slices into the provided `datagram`
-/// (zero-copy via ref-count bump).
 /// The destination socket id in a datagram's header, without decoding the rest.
 ///
 /// A demultiplexer needs this and nothing else, and it runs per datagram on the
@@ -27,6 +24,10 @@ pub fn dst_socket_id(datagram: &[u8]) -> Option<u32> {
     datagram.get(12..16).map(read_be_u32)
 }
 
+/// Decode a single UDT packet from a datagram.
+///
+/// The returned `Bytes` for data payloads slices into the provided `datagram`
+/// (zero-copy via ref-count bump).
 pub fn decode(datagram: Bytes) -> Option<Packet> {
     if datagram.len() < 16 {
         return None;

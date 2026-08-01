@@ -200,3 +200,27 @@ Every item below cost a wrong conclusion that was reported before it was caught.
   trusting the script's exit.
 - **`sed` on a `const` name hits every test in the file.** One size sweep
   silently rewrote three unrelated measurements; `git diff` caught it.
+- **Never anchor an insertion on a function signature.** Docs sit above the
+  signature, so inserting there puts the new item between an existing item and
+  its doc comment: the new one absorbs the docs and the old one is left bare.
+  This happened to `send_msg`, `SendOptions::ttl` and `codec::decode` in one
+  session and reached CI twice. Anchor on the *end of the preceding item*, and
+  after inserting, read the neighbour above — the damage is invisible at the
+  insertion site and shows up on the victim.
+
+## Matching CI locally
+
+Run lints with the flags CI uses, not the defaults. The fuzz job builds with
+`-D warnings`, which turns `missing_docs` into an error, and nothing else does:
+
+```bash
+RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets
+```
+
+A lint stricter in CI than locally is not a safety net. That gap is how two
+stolen doc comments reached master.
+
+**`#[ignore]` does not keep a test out of CI.** The slow-tests job runs
+`-- --ignored` on purpose, so an ignored test still runs there — parking a
+known-failing test under `#[ignore]` fails the build on every platform. If a
+test cannot pass, delete it and keep the coverage somewhere deterministic.
