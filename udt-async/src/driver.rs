@@ -49,6 +49,15 @@ pub(crate) struct Shared {
     pub(crate) reason: Arc<OnceLock<DisconnectReason>>,
     /// Latest protocol state, republished each wakeup.
     pub(crate) stats: Arc<OnceLock<crate::util::Mutex<udt_proto::ConnectionStats>>>,
+    /// Largest message that travels in one packet, once the handshake has
+    /// settled it.
+    ///
+    /// Its own slot rather than a read of `stats`, because it is fixed for the
+    /// connection's life and has to be readable the instant the application
+    /// holds a handle. `stats` is republished on the driver's wakeups, so an
+    /// accepted connection could be handed over before the first one and report
+    /// nothing — which is what CI caught.
+    pub(crate) max_unsegmented: Arc<OnceLock<usize>>,
 }
 
 /// Everything a driver needs, whatever its datagrams arrive on.
@@ -118,6 +127,7 @@ impl Driver {
             match event {
                 Event::DataReady => {}
                 Event::Connected => {
+                    let _ = self.shared.max_unsegmented.set(self.conn.max_unsegmented_len());
                     if let Some(tx) = self.connected_tx.take() {
                         let _ = tx.send(());
                     }

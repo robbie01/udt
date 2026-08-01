@@ -89,6 +89,11 @@ pub struct Connection {
     /// a path that will not carry its packets — which are opposite decisions:
     /// one says stop, the other says retry with a smaller MTU.
     pub(crate) reason: Arc<OnceLock<DisconnectReason>>,
+    /// Largest message that travels in one packet, fixed once the handshake
+    /// settles it. Its own slot rather than a field of `stats`, which is only
+    /// republished on driver wakeups and so can be absent when a freshly
+    /// accepted connection is handed over.
+    pub(crate) max_unsegmented: Arc<OnceLock<usize>>,
 }
 
 /// Turn a recorded reason into the error a caller sees.
@@ -156,7 +161,7 @@ impl Connection {
     ///
     /// [`MAX_PAYLOAD_SIZE`]: crate::MAX_PAYLOAD_SIZE
     pub fn max_unsegmented_len(&self) -> Option<usize> {
-        self.stats().map(|s| s.max_unsegmented_len)
+        self.max_unsegmented.get().copied()
     }
 
     fn closed(&self) -> io::Error {

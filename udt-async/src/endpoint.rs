@@ -377,6 +377,7 @@ impl Endpoint {
             local_addr,
             reason: shared.reason,
             stats: shared.stats,
+            max_unsegmented: shared.max_unsegmented,
         })
     }
 
@@ -528,6 +529,11 @@ fn spawn_shared(
     let udp = Arc::clone(&ep.socket);
     let owner = Arc::clone(ep);
     let shared = driver::Shared::default();
+    // An accepted connection is already past its handshake, so the negotiated
+    // size is known now and the driver will never emit `Connected` for it.
+    if conn.is_connected() {
+        let _ = shared.max_unsegmented.set(conn.max_unsegmented_len());
+    }
     tokio::spawn(driver::run_shared(
         conn,
         udp,
@@ -547,6 +553,7 @@ fn spawn_shared(
         local_addr: ep.local_addr,
         reason: shared.reason,
         stats: shared.stats,
+        max_unsegmented: shared.max_unsegmented,
     };
     (socket, connected)
 }
