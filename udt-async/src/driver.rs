@@ -193,12 +193,14 @@ impl Driver {
         match req {
             SendReq::Data { payload, ttl_ms, in_order } => {
                 // Before the handshake finishes there is nothing to send on
-                // yet, but there is a conclusion to ride: `queue_early` takes
-                // the message so it goes out beside it, a round trip earlier
-                // than it otherwise could. It refuses once the conclusion has
-                // gone or its cap is reached, and then this is held like any
-                // message that will not fit, to go out the moment the
-                // connection completes.
+                // yet, but there is a handshake packet to ride: `queue_early`
+                // takes the message so it goes out beside one, a round trip
+                // earlier than it otherwise could. It does not matter whether
+                // the peer has answered already -- a message queued after that
+                // rides the next retransmission -- so this needs no timing
+                // luck. It refuses once the cap is reached, and then the
+                // message is held like any that will not fit, to go out the
+                // moment the connection completes.
                 if !self.conn.is_connected() {
                     if self.conn.queue_early(payload.clone()) {
                         return;

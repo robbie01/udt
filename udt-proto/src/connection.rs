@@ -434,13 +434,19 @@ pub struct Connection {
     /// from the ISN — which is what lets the send buffer, filled from this in
     /// the same order, number them identically.
     early: Vec<Bytes>,
-    /// Whether the early burst has already gone out.
+    /// How many of `early` have already gone out ahead of a handshake packet.
     ///
-    /// The conclusion is retransmitted until the peer answers, and the burst
-    /// must not ride every copy: the send buffer owns delivery from
-    /// `post_connect` onwards, so a repeat is pure waste, and the listener
-    /// holds each copy it sees against a bounded slot.
-    early_sent: bool,
+    /// A count rather than a flag because the application queues on its own
+    /// schedule, not the handshake's. Whichever of the two wins the race, every
+    /// message must still get its early copy: a flag set by the first emission
+    /// would silently demote everything queued afterwards to the ordinary path,
+    /// which is the round trip this exists to save.
+    ///
+    /// It has to be remembered at all because the conclusion is retransmitted
+    /// until the peer answers, and a message must not ride every copy: the send
+    /// buffer owns delivery from `post_connect` onwards, so a repeat is pure
+    /// waste, and the listener holds each copy it sees against a bounded slot.
+    early_emitted: usize,
     /// Set when early data was injected at accept and its `DataReady` has not
     /// been handed to the application yet.
     early_ready: bool,
@@ -606,7 +612,7 @@ impl Connection {
             snd_pkts_total: 0,
             snd_pkts_retransmitted: 0,
             early: Vec::new(),
-            early_sent: false,
+            early_emitted: 0,
             early_ready: false,
             rtt_us: 10_000,
             rtt_var_us: 0,
@@ -735,11 +741,19 @@ impl Connection {
         }
         match &self.state {
             ConnState::Closed => return,
-            ConnState::Connecting { deadline_us, last_req_us, conn_req, attempts, .. } => {
+            ConnState::Connecting {
+                deadline_us,
+                last_req_us,
+                conn_req,
+                attempts,
+                last_peer_hs,
+                ..
+            } => {
                 let deadline = *deadline_us;
                 let last = *last_req_us;
                 let gap = hs_interval_us(*attempts);
                 let req = conn_req.clone();
+                let peer_hs = last_peer_hs.clone();
                 if now_us > deadline {
                     self.state = ConnState::Closed;
                     out.push(Event::Disconnected(DisconnectReason::Timeout));
@@ -749,6 +763,13 @@ impl Connection {
                     if let ConnState::Connecting { last_req_us, attempts, .. } = &mut self.state {
                         *last_req_us = now_us;
                         *attempts = attempts.saturating_add(1);
+                    }
+                    // Anything queued since the last handshake packet went out
+                    // rides this one, ahead of it. `emit_early` sends only what
+                    // has not gone already, so the ordinary retransmissions
+                    // here carry nothing and cost nothing.
+                    if let Some(hs) = peer_hs {
+                        self.emit_early(hs.mss as u32, hs.socket_id as u32, now_us, tx);
                     }
                     tx.push(|dst| codec::encode_handshake(&req, self.ts(now_us), 0, dst));
                 }
@@ -974,6 +995,12 @@ impl Connection {
     /// rendezvous rides the RESPONSE that plays the same part. A listener-side
     /// connection is built already connected and so has neither.
     ///
+    /// It does not matter whether the peer has been heard from yet. Queue
+    /// before, and the message rides the packet that answers; queue after, and
+    /// the next retransmission of that packet is brought forward to carry it.
+    /// Only the wall clock decides how early "early" is, never which of the
+    /// application and the peer reached this object first.
+    ///
     /// Each payload must fit a single packet, and at most
     /// [`MAX_EARLY_MESSAGES`] may be queued — the opening congestion window is
     /// what they have to travel in, so more than that could not go out early
@@ -987,6 +1014,22 @@ impl Connection {
             return false;
         }
         self.early.push(payload);
+        // If the peer has already been heard from, the packet this would have
+        // ridden has gone. Bring the next retransmission of it forward to now
+        // so the message still travels early, rather than waiting out the
+        // backoff and then losing the race to `post_connect`.
+        //
+        // Without this, whether `try_send` is early at all is decided by which
+        // of the application and the peer reaches the state machine first --
+        // on loopback the peer usually wins, and the message is silently
+        // demoted to the ordinary path. It costs one duplicate handshake
+        // packet, which the peer already tolerates: it is retransmitted until
+        // answered, and both roles ignore a repeat of one they have acted on.
+        if let ConnState::Connecting { last_req_us, last_peer_hs, .. } = &mut self.state
+            && last_peer_hs.is_some()
+        {
+            *last_req_us = 0;
+        }
         true
     }
 
@@ -1025,13 +1068,14 @@ impl Connection {
         now_us: u64,
         tx: &mut TransmitBuf,
     ) {
-        if self.early_sent {
+        let start = self.early_emitted;
+        if start >= self.early.len() {
             return;
         }
-        self.early_sent = true;
         let negotiated = peer_mss.min(self.mss).max(MIN_MSS);
         let early_payload = negotiated.saturating_sub(IP_AND_UDP_OVERHEAD + UDT_HEADER_SIZE as u32);
-        for (i, payload) in self.early.iter().enumerate() {
+        let mut emitted = start;
+        for (i, payload) in self.early.iter().enumerate().skip(start) {
             if payload.len() > early_payload as usize {
                 break;
             }
@@ -1047,7 +1091,9 @@ impl Connection {
                 dst.extend_from_slice(&hdr);
                 dst.extend_from_slice(payload);
             });
+            emitted = i + 1;
         }
+        self.early_emitted = emitted;
     }
 
     /// How many early messages are queued.
@@ -1658,12 +1704,19 @@ impl Connection {
                     let mut new_req = local_req;
                     new_req.req_type = req_type::RESPONSE; // -1
                     new_req.cookie = hs.cookie;
-                    if let ConnState::Connecting { conn_req, last_req_us, attempts, .. } =
-                        &mut self.state
+                    if let ConnState::Connecting {
+                        conn_req, last_req_us, attempts, last_peer_hs, ..
+                    } = &mut self.state
                     {
                         *conn_req = new_req.clone();
                         *last_req_us = 0; // resend immediately
                         *attempts = 0;
+                        // Kept so a message queued *after* the challenge can
+                        // still be emitted early: the conclusion is resent
+                        // until the peer answers, and riding one of those
+                        // copies needs the peer's MSS and socket id, which
+                        // only the challenge carries.
+                        *last_peer_hs = Some(hs.clone());
                     }
                     // Addressed to the listener's socket id, which the challenge
                     // just supplied.

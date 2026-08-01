@@ -285,3 +285,94 @@ fn the_early_queue_is_bounded() {
     assert_eq!(c.early_queued(), udt_proto::MAX_EARLY_MESSAGES);
     assert!(!c.queue_early(Bytes::from_static(b"one too many")), "the cap was not enforced");
 }
+
+/// Queueing *after* the challenge has arrived must still be early.
+///
+/// The application and the peer reach the state machine on their own schedules,
+/// and between the challenge and the peer's answer there is a whole round trip
+/// in which the connection is still `Connecting` — so `queue_early` accepts the
+/// message — but the packet it was going to ride has already gone. Loopback
+/// hides this by making that window microseconds wide; on a 50 ms path it is
+/// 50 ms, which is exactly when an application that does any work between
+/// connecting and sending will call `try_send`.
+///
+/// Handled by bringing the conclusion's next retransmission forward, so the
+/// message rides that copy instead. Without it the message waits for
+/// `post_connect` and arrives a round trip late, having reported success.
+#[test]
+fn a_message_queued_after_the_challenge_still_goes_out_early() {
+    const MSG: &[u8] = b"queued a round trip late";
+
+    let mut listener = Listener::new(LISTENER_ID, MSS, 0, 0xABCD_EF01_2345_6789, CcKind::default());
+    let mut client = Connection::new_active(CLIENT_ID, SeqNo::new(1000), MSS, 0, CcKind::default());
+    let mut events = Vec::new();
+    let mut tx = TransmitBuf::new();
+
+    // Induction out, challenge back — and stop there, holding the connection in
+    // the window. The conclusion has gone; the peer's answer has not arrived.
+    let mut now = 0u64;
+    let mut challenges = Vec::new();
+    for _ in 0..40 {
+        now += 1_000;
+        tx.clear();
+        client.on_timer(now, &mut tx, &mut events);
+        let mut listener_out = Vec::new();
+        for (bytes, segment) in tx.runs() {
+            for chunk in bytes.chunks(segment.max(1)) {
+                listener.on_datagram(peer(), Bytes::copy_from_slice(chunk), now, &mut listener_out);
+            }
+        }
+        for event in listener_out {
+            if let ListenerEvent::SendTo { data, .. } = event {
+                challenges.push(data);
+            }
+        }
+        if !challenges.is_empty() {
+            break;
+        }
+    }
+    assert!(!challenges.is_empty(), "the listener never issued a challenge");
+    tx.clear();
+    for challenge in challenges {
+        client.on_datagram(challenge, now, &mut tx, &mut events);
+    }
+    assert!(!client.is_connected(), "the window closed before the test could use it");
+    tx.clear();
+
+    // Now the application gets its turn.
+    assert!(client.queue_early(Bytes::from_static(MSG)), "early data refused mid-handshake");
+    client.on_timer(now + 1_000, &mut tx, &mut events);
+
+    let sent: Vec<Bytes> = tx
+        .runs()
+        .flat_map(|(bytes, segment)| {
+            bytes.chunks(segment.max(1)).map(Bytes::copy_from_slice).collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        sent.iter().any(|d| d.ends_with(MSG)),
+        "the message did not go out with the next handshake packet ({} datagrams)",
+        sent.len()
+    );
+
+    // And it is early in the sense that matters: the listener holds it and
+    // hands it over at accept, with no send from the established connection.
+    let mut listener_out = Vec::new();
+    for datagram in sent {
+        listener.on_datagram(peer(), datagram, now + 1_000, &mut listener_out);
+    }
+    let mut server = None;
+    for event in listener_out {
+        if let ListenerEvent::Accept(conn, _) = event {
+            server = Some(*conn);
+        }
+    }
+    let mut server = server.expect("the conclusion did not complete the handshake");
+    let mut out = Vec::new();
+    server.on_timer(1_000_000, &mut TransmitBuf::new(), &mut out);
+    assert_eq!(
+        server.recv_msg().as_deref(),
+        Some(MSG),
+        "the accepted connection did not have the message already"
+    );
+}
