@@ -304,6 +304,7 @@ fn copy_into(msg: &[u8], buf: &mut [u8]) -> usize {
 pub struct SendOptions {
     ttl: Option<Duration>,
     unordered: bool,
+    best_effort: bool,
 }
 
 impl SendOptions {
@@ -322,6 +323,25 @@ impl SendOptions {
     /// a shorter deadline is treated as one millisecond, because zero means
     /// something else: zero means expire the message as soon as any time has
     /// passed, so it may never be transmitted at all.
+    /// Sends the message once and never retries it.
+    ///
+    /// It goes out at the moment it is queued and is abandoned immediately
+    /// after; the peer is told to skip it rather than left waiting, so a loss
+    /// costs nothing and holds nothing else up. Ordered delivery of later
+    /// messages is unaffected.
+    ///
+    /// This is the unreliable-datagram case: telemetry, position updates,
+    /// anything where a fresher message is on the way and a stale one is not
+    /// worth a round trip. If the send window has no room at that instant the
+    /// message is dropped without going out at all, which is what best effort
+    /// means.
+    ///
+    /// Overrides [`ttl`](Self::ttl) if both are set.
+    pub fn best_effort(mut self) -> Self {
+        self.best_effort = true;
+        self
+    }
+
     pub fn ttl(mut self, ttl: Duration) -> Self {
         self.ttl = Some(ttl);
         self
@@ -348,7 +368,14 @@ impl SendOptions {
             // of trying hard and briefly. And anything past about 49 days
             // wrapped, which could turn a very long deadline into a very short
             // one. Both were silent.
-            ttl_ms: self.ttl.map(|d| d.as_millis().clamp(1, u32::MAX as u128) as u32),
+            ttl_ms: if self.best_effort {
+                // Zero is not "no deadline": it expires as soon as any time has
+                // passed, and the only transmission happens before that. Hence
+                // send-once.
+                Some(0)
+            } else {
+                self.ttl.map(|d| d.as_millis().clamp(1, u32::MAX as u128) as u32)
+            },
             in_order: !self.unordered,
         }
     }
@@ -393,6 +420,13 @@ mod tests {
     fn a_millisecond_or_more_is_carried_as_given() {
         let got = ttl_of(SendOptions::new().ttl(Duration::from_millis(250)).into_req(Bytes::new()));
         assert_eq!(got, Some(250));
+    }
+
+    #[test]
+    fn best_effort_asks_for_send_once() {
+        assert_eq!(ttl_of(SendOptions::new().best_effort().into_req(Bytes::new())), Some(0));
+        // And it is not reachable by accident from a very short duration.
+        assert_eq!(ttl_of(SendOptions::new().ttl(Duration::ZERO).into_req(Bytes::new())), Some(1));
     }
 
     #[test]

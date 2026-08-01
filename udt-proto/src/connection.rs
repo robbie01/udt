@@ -963,9 +963,15 @@ impl Connection {
     /// buffer space frees up — dropping it loses application data silently.
     ///
     /// `ttl_ms` gives up on the message after that many milliseconds and tells
-    /// the peer to skip it. `Some(0)` is not "no deadline" — it expires the
-    /// message the moment any time has passed, so it may be dropped before it
-    /// is ever transmitted. `None` is what means no deadline.
+    /// the peer to skip it. `None` means no deadline.
+    ///
+    /// `Some(0)` is not "no deadline" — it is **send once, best effort**. The
+    /// message is packed here, at the instant it is queued, when nothing has
+    /// elapsed; every later attempt finds it expired and retires it, and the
+    /// peer is told to skip its sequence range rather than left waiting. So it
+    /// makes exactly one trip to the wire and is never retransmitted, even
+    /// against a NAK naming it. If the window has no room at that instant it is
+    /// dropped without going out at all, which is what best effort means.
     ///
     /// A payload larger than the send buffer holds in total is
     /// [`SendOutcome::Rejected`] rather than [`SendOutcome::WouldBlock`],
@@ -2310,6 +2316,57 @@ mod tests {
 
     /// A connection wound forward to Connected, bypassing the handshake, so a
     /// test can reach the steady-state paths directly.
+    /// Counts data packets (word0's top bit clear) in what was written out.
+    fn data_packets(tx: &TransmitBuf) -> usize {
+        tx.datagrams().filter(|d| d.len() >= 16 && d[0] & 0x80 == 0).count()
+    }
+
+    /// A zero TTL is send-once, best-effort delivery.
+    ///
+    /// It expires the moment any time has passed, and the expiry check sits at
+    /// the send cursor. But `send_msg` packs synchronously at the instant it is
+    /// queued, when nothing has elapsed yet, so the message makes exactly one
+    /// trip to the wire and every tick after that retires it. The peer is told
+    /// to skip the sequence range, so a loss is not waited on.
+    ///
+    /// The caveat is in "if it can go out at once": if the congestion or flow
+    /// window has no room at that instant, it is dropped without ever being
+    /// sent. Best effort means best effort.
+    #[test]
+    fn a_zero_ttl_message_goes_out_once_and_is_never_retried() {
+        let mut c = connected(1_000);
+        let mut tx = TransmitBuf::new();
+        assert_eq!(
+            c.send_msg(Bytes::from_static(b"best effort"), Some(0), true, 1_000, &mut tx),
+            SendOutcome::Queued
+        );
+        assert_eq!(data_packets(&tx), 1, "it should reach the wire once, immediately");
+
+        // Nothing further, however long the connection runs and whatever the
+        // peer reports missing.
+        let mut events = Vec::new();
+        let mut nak = BytesMut::new();
+        codec::encode_nak(&[(SeqNo::new(100), SeqNo::new(100))], 0, c.socket_id(), &mut nak);
+        c.on_datagram(nak.freeze(), 2_000, &mut tx, &mut events);
+        for step in 2..40u64 {
+            c.on_timer(1_000 + step * 1_000, &mut tx, &mut events);
+        }
+        assert_eq!(data_packets(&tx), 1, "a zero-TTL message was retransmitted");
+    }
+
+    /// A one-millisecond deadline is the shortest that survives long enough to
+    /// be retried, for when one attempt is not enough but many are too many.
+    #[test]
+    fn a_one_millisecond_ttl_is_transmitted() {
+        let mut c = connected(1_000);
+        let mut tx = TransmitBuf::new();
+        assert_eq!(
+            c.send_msg(Bytes::from_static(b"brief"), Some(1), true, 1_000, &mut tx),
+            SendOutcome::Queued
+        );
+        assert!(data_packets(&tx) >= 1, "a one-millisecond message never went out");
+    }
+
     fn connected(now_us: u64) -> Connection {
         let mut c = Connection::new_connected(
             1,
