@@ -125,10 +125,12 @@ mod tests {
                     .expect("accept failed")
             },
             async {
-                tokio::time::timeout(Duration::from_secs(30), client_ep.connect(relay_addr))
-                    .await
-                    .expect("connect timed out")
-                    .expect("connect failed")
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    client_ep.connect(relay_addr).await?.await
+                })
+                .await
+                .expect("connect timed out")
+                .expect("connect failed")
             }
         );
         // Endpoints stay alive as long as their connections do, so leak the

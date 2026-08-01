@@ -27,10 +27,12 @@ mod tests {
         let (server_sock, client_sock) =
             tokio::join!(async { listener.accept().await.unwrap() }, async {
                 let cep = Endpoint::bind("127.0.0.1:0").await.unwrap();
-                tokio::time::timeout(Duration::from_secs(5), cep.connect(server_addr))
-                    .await
-                    .expect("connect timed out")
-                    .expect("connect failed")
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    cep.connect(server_addr).await?.await
+                })
+                .await
+                .expect("connect timed out")
+                .expect("connect failed")
             });
         (server_sock, client_sock)
     }
@@ -141,11 +143,12 @@ mod tests {
                 let payload = vec![(i as u8).wrapping_add(0x41); 3000]; // 'A', 'B', 'C', 'D' repeated
                 tokio::spawn(async move {
                     let cep = Endpoint::bind("127.0.0.1:0").await.unwrap();
-                    let sock =
-                        tokio::time::timeout(Duration::from_secs(5), cep.connect(server_addr))
-                            .await
-                            .expect("connect timed out")
-                            .expect("connect failed");
+                    let sock = tokio::time::timeout(Duration::from_secs(5), async {
+                        cep.connect(server_addr).await?.await
+                    })
+                    .await
+                    .expect("connect timed out")
+                    .expect("connect failed");
 
                     // Send our distinctive payload.
                     tokio::time::timeout(Duration::from_secs(5), sock.send(&payload))
@@ -216,7 +219,7 @@ mod tests {
         let client_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
 
         let (server, client) = tokio::join!(async { listener.accept().await.unwrap() }, async {
-            client_ep.connect(addr).await.unwrap()
+            client_ep.connect(addr).await.unwrap().await.unwrap()
         });
 
         let c = client.max_unsegmented_len().expect("client had no limit");
@@ -235,11 +238,11 @@ mod tests {
         assert_eq!(&buf[..n], &payload[..]);
     }
 
-    /// Data handed to `connect_with_early_data` must arrive as the
-    /// connection's first message, with no special handling on the server.
+    /// Messages queued on a `Connecting` must arrive as the connection's first
+    /// messages, in order, with no special handling on the server.
     #[tokio::test(flavor = "multi_thread")]
-    async fn early_data_arrives_as_the_first_message() {
-        const MSG: &[u8] = b"noise handshake message one";
+    async fn early_data_arrives_as_the_first_messages() {
+        let msgs: [&[u8]; 3] = [b"noise msg1", b"and a payload", b"and a request"];
 
         let server_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
         let addr = server_ep.local_addr();
@@ -247,37 +250,74 @@ mod tests {
 
         let client_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
         let (server, client) = tokio::join!(async { listener.accept().await.unwrap() }, async {
-            client_ep.connect_with_early_data(addr, MSG).await.unwrap()
+            let connecting = client_ep.connect(addr).await.unwrap();
+            for m in msgs {
+                connecting.try_send(m).expect("early message refused");
+            }
+            connecting.await.unwrap()
         });
 
-        // An ordinary recv, exactly as a server that knows nothing about this
-        // would write it.
+        // Ordinary recvs, exactly as a server that knows nothing about this
+        // would write them.
         let mut buf = vec![0u8; 4096];
-        let n = tokio::time::timeout(Duration::from_secs(10), server.recv(&mut buf))
-            .await
-            .expect("early data never arrived")
-            .unwrap();
-        assert_eq!(&buf[..n], MSG);
+        for want in msgs {
+            let n = tokio::time::timeout(Duration::from_secs(10), server.recv(&mut buf))
+                .await
+                .expect("early data never arrived")
+                .unwrap();
+            assert_eq!(&buf[..n], want);
+        }
 
-        // And it must not be delivered a second time by the ordinary path.
-        client.send(b"second").await.unwrap();
+        // And nothing is delivered twice: a follow-up must be next, not a
+        // repeat of what already arrived.
+        client.send(b"after").await.unwrap();
         let n = tokio::time::timeout(Duration::from_secs(10), server.recv(&mut buf))
             .await
             .expect("follow-up never arrived")
             .unwrap();
-        assert_eq!(&buf[..n], b"second", "early data was delivered twice");
+        assert_eq!(&buf[..n], b"after", "an early message was delivered twice");
     }
 
-    /// Rejected rather than silently dropped when it cannot travel.
+    /// Past what the handshake can carry, messages are held rather than lost —
+    /// they go out as soon as the connection completes, still in order.
     #[tokio::test(flavor = "multi_thread")]
-    async fn oversized_early_data_is_refused() {
+    async fn early_data_past_the_cap_still_arrives_in_order() {
+        const N: usize = udt_async::MAX_EARLY_MESSAGES + 8;
+
+        let server_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+        let addr = server_ep.local_addr();
+        let listener = server_ep.listen(4).unwrap();
+        let client_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+
+        let (server, _client) = tokio::join!(async { listener.accept().await.unwrap() }, async {
+            let connecting = client_ep.connect(addr).await.unwrap();
+            for i in 0..N {
+                connecting.try_send(format!("{i}").as_bytes()).expect("refused");
+            }
+            connecting.await.unwrap()
+        });
+
+        let mut buf = vec![0u8; 4096];
+        for i in 0..N {
+            let n = tokio::time::timeout(Duration::from_secs(10), server.recv(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("message {i} never arrived"))
+                .unwrap();
+            assert_eq!(&buf[..n], format!("{i}").as_bytes(), "message {i} out of order");
+        }
+    }
+
+    /// An empty early message is refused, as it is on an open connection.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_early_data_is_refused() {
         let server_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
         let addr = server_ep.local_addr();
         let _listener = server_ep.listen(4).unwrap();
         let client_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
 
-        let kind = match client_ep.connect_with_early_data(addr, &vec![0u8; 64 * 1024]).await {
-            Ok(_) => panic!("oversized early data was accepted"),
+        let connecting = client_ep.connect(addr).await.unwrap();
+        let kind = match connecting.try_send(b"") {
+            Ok(()) => panic!("an empty early message was accepted"),
             Err(e) => e.kind(),
         };
         assert_eq!(kind, std::io::ErrorKind::InvalidInput);
@@ -647,10 +687,12 @@ mod tests {
 
         let (server, client) = tokio::join!(async { listener.accept().await.unwrap() }, async {
             let cep = Endpoint::bind_with("127.0.0.1:0", cfg.clone()).await.unwrap();
-            tokio::time::timeout(Duration::from_secs(5), cep.connect(server_addr))
-                .await
-                .expect("ledbat connect timed out")
-                .expect("ledbat connect failed")
+            tokio::time::timeout(Duration::from_secs(5), async {
+                cep.connect(server_addr).await?.await
+            })
+            .await
+            .expect("ledbat connect timed out")
+            .expect("ledbat connect failed")
         });
 
         let sender = tokio::spawn(async move {
@@ -701,7 +743,7 @@ mod tests {
             let (server, client) =
                 tokio::join!(async { listener.accept().await.unwrap() }, async {
                     let cep = Endpoint::bind_with("127.0.0.1:0", cfg.clone()).await.unwrap();
-                    cep.connect(addr).await.unwrap()
+                    cep.connect(addr).await.unwrap().await.unwrap()
                 });
 
             let s = Arc::clone(&stop);
@@ -1024,7 +1066,7 @@ mod tests {
             .map(|_| {
                 tokio::spawn(async move {
                     let cep = Endpoint::bind("127.0.0.1:0").await.unwrap();
-                    (cep.connect(server_addr).await.unwrap(), cep)
+                    (cep.connect(server_addr).await.unwrap().await.unwrap(), cep)
                 })
             })
             .collect();
@@ -1242,7 +1284,7 @@ mod tests {
             .map(|_| {
                 tokio::spawn(async move {
                     let cep = Endpoint::bind("127.0.0.1:0").await.unwrap();
-                    cep.connect(server_addr).await.unwrap()
+                    cep.connect(server_addr).await.unwrap().await.unwrap()
                 })
             })
             .collect();
@@ -1368,7 +1410,7 @@ mod wind_down {
         let listener = ep.listen(4).unwrap();
         let (server, client) = tokio::join!(async { listener.accept().await.unwrap() }, async {
             let cep = Endpoint::bind("127.0.0.1:0").await.unwrap();
-            tokio::time::timeout(Duration::from_secs(5), cep.connect(addr))
+            tokio::time::timeout(Duration::from_secs(5), async { cep.connect(addr).await?.await })
                 .await
                 .expect("connect timed out")
                 .expect("connect failed")
@@ -1422,7 +1464,7 @@ mod source_address {
         let listener = ep.listen(4).unwrap();
         let (server, client) = tokio::join!(async { listener.accept().await.unwrap() }, async {
             let cep = Endpoint::bind("127.0.0.1:0").await.unwrap();
-            tokio::time::timeout(Duration::from_secs(5), cep.connect(addr))
+            tokio::time::timeout(Duration::from_secs(5), async { cep.connect(addr).await?.await })
                 .await
                 .expect("connect timed out")
                 .expect("connect failed")

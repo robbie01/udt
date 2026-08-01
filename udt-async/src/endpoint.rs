@@ -16,7 +16,7 @@ use udt_proto::{
 };
 
 use crate::batch::{BatchIo, Inbound, RecvBuffers};
-use crate::conn::{Connection, RECV_BACKLOG, SEND_BACKLOG, SendReq};
+use crate::conn::{Connecting, Connection, RECV_BACKLOG, SEND_BACKLOG, SendReq};
 use crate::driver;
 use crate::util::{
     Mutex, RwLock, configure_udp_buffers, lock, next_socket_id, now_us, outgoing_bind_addr,
@@ -222,7 +222,7 @@ impl Listener {
 /// use udt_async::Endpoint;
 /// # async fn f() -> std::io::Result<()> {
 /// let endpoint = Endpoint::bind("0.0.0.0:0").await?;
-/// let conn = endpoint.connect("203.0.113.7:9000").await?;
+/// let conn = endpoint.connect("203.0.113.7:9000").await?.await?;
 /// conn.send(b"hello").await?;
 /// # Ok(()) }
 /// ```
@@ -276,61 +276,36 @@ impl Endpoint {
         Ok(Endpoint { inner })
     }
 
-    /// Connects to a peer that is listening.
+    /// Begins connecting to a peer that is listening.
     ///
-    /// Resolves once the handshake completes. The connection gets its own
-    /// kernel socket, so it is unaffected by other traffic on this endpoint.
+    /// Returns as soon as the handshake is under way, without waiting for it.
+    /// Awaiting the [`Connecting`] yields the established [`Connection`]:
+    ///
+    /// ```no_run
+    /// # async fn f(endpoint: udt_async::Endpoint) -> std::io::Result<()> {
+    /// let conn = endpoint.connect("203.0.113.7:9000").await?.await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// The gap between the two is what [`Connecting::try_send`] is for: a
+    /// message queued there travels with the handshake and reaches the peer a
+    /// round trip before the connection is otherwise usable.
+    ///
+    /// The connection gets its own kernel socket, so it is unaffected by other
+    /// traffic on this endpoint.
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::TimedOut`] if the peer does not answer.
+    /// Fails here if the address cannot be resolved or a socket cannot be
+    /// bound. A handshake that never completes is reported by awaiting the
+    /// [`Connecting`], as [`ErrorKind::TimedOut`].
     ///
     /// [`ErrorKind::TimedOut`]: std::io::ErrorKind::TimedOut
-    pub async fn connect(&self, peer: impl ToSocketAddrs) -> io::Result<Connection> {
-        self.connect_inner(peer, None).await
+    pub async fn connect(&self, peer: impl ToSocketAddrs) -> io::Result<Connecting> {
+        self.connect_inner(peer).await
     }
 
-    /// Connects, sending one message with the handshake.
-    ///
-    /// UDT establishes in two round trips, so the first byte of data normally
-    /// costs both. `early` travels with the handshake's final packet and
-    /// reaches the peer a round trip sooner — it arrives as the connection's
-    /// first message, so a server reads it from [`Connection::recv`] exactly as it
-    /// would read anything else and needs no special handling.
-    ///
-    /// The motivating case is starting a cryptographic handshake, where this
-    /// makes a two-message exchange such as Noise `IK` fit inside connection
-    /// establishment instead of following it.
-    ///
-    /// This is an *extra* transmission of an ordinary message, not a separate
-    /// channel. It is acknowledged, retransmitted and de-duplicated by the same
-    /// machinery as anything else, so a peer that ignores it — an
-    /// implementation not expecting data before the handshake ends — costs one
-    /// wasted packet and a retransmission, and nothing above notices.
-    ///
-    /// `early` must fit in a single packet; anything larger is rejected with
-    /// [`ErrorKind::InvalidInput`]. It is delivered at most once despite the
-    /// duplicate transmission.
-    ///
-    /// # Errors
-    ///
-    /// As [`connect`](Self::connect), plus [`ErrorKind::InvalidInput`] if
-    /// `early` is empty or too large for one packet.
-    ///
-    /// [`ErrorKind::InvalidInput`]: std::io::ErrorKind::InvalidInput
-    pub async fn connect_with_early_data(
-        &self,
-        peer: impl ToSocketAddrs,
-        early: &[u8],
-    ) -> io::Result<Connection> {
-        self.connect_inner(peer, Some(Bytes::copy_from_slice(early))).await
-    }
-
-    async fn connect_inner(
-        &self,
-        peer: impl ToSocketAddrs,
-        early: Option<Bytes>,
-    ) -> io::Result<Connection> {
+    async fn connect_inner(&self, peer: impl ToSocketAddrs) -> io::Result<Connecting> {
         let peer = resolve(peer).await?;
         let std_sock = std::net::UdpSocket::bind(outgoing_bind_addr(self.inner.local_addr, peer))?;
         std_sock.set_nonblocking(true)?;
@@ -338,21 +313,13 @@ impl Endpoint {
         let socket = Arc::new(UdpSocket::from_std(std_sock)?);
         let local_addr = socket.local_addr()?;
 
-        let mut conn = ProtoConnection::new_active(
+        let conn = ProtoConnection::new_active(
             next_socket_id(),
             random_isn(),
             self.inner.cfg.mss,
             now_us(),
             self.inner.cfg.congestion,
         );
-        if let Some(bytes) = early
-            && !conn.set_early_data(bytes)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "early data must be non-empty and fit in one packet",
-            ));
-        }
         let (send_tx, send_rx) = mpsc::channel::<SendReq>(SEND_BACKLOG);
         let (recv_tx, recv_rx) = flume::bounded::<Bytes>(RECV_BACKLOG);
         let (connected_tx, connected) = oneshot::channel::<()>();
@@ -367,17 +334,17 @@ impl Endpoint {
             shared.clone(),
         ));
 
-        connected
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect handshake failed"))?;
-        Ok(Connection {
-            send_tx,
-            recv_rx,
-            peer_addr: peer,
-            local_addr,
-            reason: shared.reason,
-            stats: shared.stats,
-            max_unsegmented: shared.max_unsegmented,
+        Ok(Connecting {
+            conn: Some(Connection {
+                send_tx,
+                recv_rx,
+                peer_addr: peer,
+                local_addr,
+                reason: shared.reason,
+                stats: shared.stats,
+                max_unsegmented: shared.max_unsegmented,
+            }),
+            connected,
         })
     }
 

@@ -19,10 +19,15 @@ fn peer() -> PeerAddr {
 /// Runs the handshake to completion, returning the accepted connection and
 /// every datagram the client sent along the way.
 fn handshake(early: Option<&[u8]>) -> (Connection, Connection, Vec<Bytes>) {
+    handshake_many(early.into_iter().collect())
+}
+
+/// As [`handshake`], with any number of early messages.
+fn handshake_many(early: Vec<&[u8]>) -> (Connection, Connection, Vec<Bytes>) {
     let mut listener = Listener::new(LISTENER_ID, MSS, 0, 0xABCD_EF01_2345_6789, CcKind::default());
     let mut client = Connection::new_active(CLIENT_ID, SeqNo::new(1000), MSS, 0, CcKind::default());
-    if let Some(bytes) = early {
-        assert!(client.set_early_data(Bytes::copy_from_slice(bytes)), "early data refused");
+    for bytes in early {
+        assert!(client.queue_early(Bytes::copy_from_slice(bytes)), "early data refused");
     }
 
     let mut now = 0u64;
@@ -162,15 +167,15 @@ fn the_ordinary_copy_is_not_delivered_twice() {
 #[test]
 fn early_data_is_refused_when_it_cannot_be_sent() {
     let mut client = Connection::new_active(CLIENT_ID, SeqNo::new(1000), MSS, 0, CcKind::default());
-    assert!(!client.set_early_data(Bytes::new()), "an empty payload should be refused");
+    assert!(!client.queue_early(Bytes::new()), "an empty payload should be refused");
     assert!(
-        !client.set_early_data(Bytes::from(vec![0u8; MSS as usize * 2])),
+        !client.queue_early(Bytes::from(vec![0u8; MSS as usize * 2])),
         "a payload larger than one packet should be refused"
     );
 
     let (mut connected, _server, _) = handshake(None);
     assert!(
-        !connected.set_early_data(Bytes::from_static(b"too late")),
+        !connected.queue_early(Bytes::from_static(b"too late")),
         "an established connection has no conclusion left to carry it"
     );
 }
@@ -206,7 +211,7 @@ fn abandoned_early_data_does_not_hold_the_table() {
     let mut now = 90_000_000u64;
     let mut client =
         Connection::new_active(CLIENT_ID, SeqNo::new(1000), MSS, now, CcKind::default());
-    assert!(client.set_early_data(Bytes::from_static(MSG)));
+    assert!(client.queue_early(Bytes::from_static(MSG)));
     let mut tx = TransmitBuf::new();
     let mut events = Vec::new();
     let mut accepted = None;
@@ -268,4 +273,15 @@ fn abandoned_early_data_does_not_hold_the_table() {
         Some(MSG),
         "early data was dropped because abandoned entries never expired"
     );
+}
+
+/// The queue is bounded, and says so rather than silently dropping.
+#[test]
+fn the_early_queue_is_bounded() {
+    let mut c = Connection::new_active(CLIENT_ID, SeqNo::new(1000), MSS, 0, CcKind::default());
+    for i in 0..udt_proto::MAX_EARLY_MESSAGES {
+        assert!(c.queue_early(Bytes::from(vec![b'x'; 8])), "refused message {i} within the cap");
+    }
+    assert_eq!(c.early_queued(), udt_proto::MAX_EARLY_MESSAGES);
+    assert!(!c.queue_early(Bytes::from_static(b"one too many")), "the cap was not enforced");
 }

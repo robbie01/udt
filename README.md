@@ -83,7 +83,7 @@ use udt_async::Endpoint;
 
 async fn client() -> std::io::Result<()> {
     let endpoint = Endpoint::bind("0.0.0.0:0").await?;
-    let conn = endpoint.connect("203.0.113.7:9000").await?;
+    let conn = endpoint.connect("203.0.113.7:9000").await?.await?;
 
     conn.send(b"ping").await?;
 
@@ -98,19 +98,32 @@ Serving is the mirror image — `endpoint.listen(backlog)?` then
 `listener.accept().await`. Two peers behind firewalls can also reach each other
 directly with `connect_rendezvous`, no listener on either side.
 
-A connection can carry one message with its handshake, which arrives a round
-trip before the connection is otherwise usable:
+`connect` returns before the handshake finishes, and messages queued in that gap
+travel *with* it — reaching the peer a round trip before anything sent
+afterwards could:
 
 ```rust
-let conn = endpoint.connect_with_early_data(peer, &noise_msg1).await?;
+let connecting = endpoint.connect(peer).await?;
+connecting.try_send(&noise_msg1)?;
+connecting.try_send(&payload)?;
+let conn = connecting.await?;
 ```
 
-It arrives as the connection's first `recv`, so a server needs no special
-handling and cannot tell the difference. That is enough to fit a two-message
+They arrive as the connection's first `recv`s, in order, so a server needs no
+special handling and cannot tell the difference. That is enough to fit a
 cryptographic handshake — Noise `IK`, `NK`, `KK` — inside establishment rather
-than after it. It is an extra transmission of an ordinary message, so
-acknowledgement, retransmission and de-duplication are the usual ones, and a
-peer that ignores it costs one wasted packet.
+than after it.
+
+`try_send` is not async on purpose: the only thing waiting could buy is room in
+the send window, and that is freed by acknowledgements, which cannot arrive
+until the handshake it is racing has finished. For the same reason there is no
+`try_recv` — the peer has nothing to say until it has accepted. Queue more than
+the opening window carries and the rest are held for the moment the connection
+completes, which is where they would have gone anyway.
+
+Each early message is an extra transmission of an ordinary one, so
+acknowledgement, retransmission and de-duplication are the usual paths, and a
+peer that ignores them costs one wasted packet apiece.
 
 Every method takes `&self`, so a connection is shared between tasks with an `Arc`:
 one sending while another receives is the expected pattern.

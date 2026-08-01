@@ -14,7 +14,7 @@
 //!
 //! # async fn client() -> std::io::Result<()> {
 //! let endpoint = Endpoint::bind("0.0.0.0:0").await?;
-//! let conn = endpoint.connect("203.0.113.7:9000").await?;
+//! let conn = endpoint.connect("203.0.113.7:9000").await?.await?;
 //!
 //! conn.send(b"ping").await?;
 //!
@@ -79,10 +79,13 @@ mod driver;
 mod endpoint;
 mod util;
 
-pub use conn::{Connection, SendOptions};
+pub use conn::{Connecting, Connection, SendOptions};
 pub use endpoint::{
     DEFAULT_MTU, Endpoint, EndpointConfig, Listener, MAX_PAYLOAD_SIZE, max_payload_for_mtu,
 };
+/// How many messages [`Connecting::try_send`] can hand to the handshake before
+/// the rest are held for the established connection.
+pub use udt_proto::MAX_EARLY_MESSAGES;
 
 pub use udt_proto::CcKind;
 /// A snapshot of protocol state — see [`Connection::stats`].

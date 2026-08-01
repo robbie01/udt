@@ -192,6 +192,20 @@ impl Driver {
     fn handle_send(&mut self, req: SendReq) {
         match req {
             SendReq::Data { payload, ttl_ms, in_order } => {
+                // Before the handshake finishes there is nothing to send on
+                // yet, but there is a conclusion to ride: `queue_early` takes
+                // the message so it goes out beside it, a round trip earlier
+                // than it otherwise could. It refuses once the conclusion has
+                // gone or its cap is reached, and then this is held like any
+                // message that will not fit, to go out the moment the
+                // connection completes.
+                if !self.conn.is_connected() {
+                    if self.conn.queue_early(payload.clone()) {
+                        return;
+                    }
+                    self.blocked = Some(SendReq::Data { payload, ttl_ms, in_order });
+                    return;
+                }
                 let outcome =
                     self.conn.send_msg(payload.clone(), ttl_ms, in_order, now_us(), &mut self.tx);
                 match outcome {

@@ -41,6 +41,14 @@ const DEFAULT_FLIGHT_FLAG_SIZE: u32 = 25600;
 /// congestion control allows anyway.
 const MAX_FLOW_WND: u32 = 1 << 20;
 
+/// How many messages may ride the handshake.
+///
+/// They all go out in one burst beside the conclusion, before any
+/// acknowledgement has been seen, so the opening congestion window is what
+/// bounds them — queueing more than fits it would only defer the rest to the
+/// ordinary path, which is where they end up anyway.
+pub const MAX_EARLY_MESSAGES: usize = 64;
+
 /// Smallest MTU a peer may negotiate.
 ///
 /// Below this the payload left after headers is too small to make progress,
@@ -412,8 +420,20 @@ pub struct Connection {
     snd_pkts_total: u64,
     snd_pkts_retransmitted: u64,
     /// One message to send with the handshake conclusion, a round trip before
-    /// the connection is usable. See [`Connection::set_early_data`].
-    early_data: Option<Bytes>,
+    /// the connection is usable. See [`Connection::queue_early`].
+    ///
+    /// In order. Each entry is one message, and each is required to fit a
+    /// single packet so that its position here is also its sequence offset
+    /// from the ISN — which is what lets the send buffer, filled from this in
+    /// the same order, number them identically.
+    early: Vec<Bytes>,
+    /// Whether the early burst has already gone out.
+    ///
+    /// The conclusion is retransmitted until the peer answers, and the burst
+    /// must not ride every copy: the send buffer owns delivery from
+    /// `post_connect` onwards, so a repeat is pure waste, and the listener
+    /// holds each copy it sees against a bounded slot.
+    early_sent: bool,
     /// Set when early data was injected at accept and its `DataReady` has not
     /// been handed to the application yet.
     early_ready: bool,
@@ -577,7 +597,8 @@ impl Connection {
             bandwidth_pps: 1,
             snd_pkts_total: 0,
             snd_pkts_retransmitted: 0,
-            early_data: None,
+            early: Vec::new(),
+            early_sent: false,
             early_ready: false,
             rtt_us: 10_000,
             rtt_var_us: 0,
@@ -633,15 +654,15 @@ impl Connection {
         // retransmission apply. On the happy path the receiver has it already
         // and discards this copy by sequence number, which costs one packet;
         // if the early copy was lost or ignored, this is what delivers it.
-        if let Some(payload) = self.early_data.take()
-            && let Some(buf) = self.snd_buf.as_mut()
-        {
-            // Cannot fail: the buffer was created a few lines above and
-            // `set_early_data` already refused anything larger than one packet.
-            // Asserted rather than discarded so a change to either invariant is
-            // caught here instead of silently losing the message.
-            let queued = buf.add(payload, None, true, now_us);
-            debug_assert!(queued, "early data did not fit a freshly created send buffer");
+        if let Some(buf) = self.snd_buf.as_mut() {
+            for payload in self.early.drain(..) {
+                // Cannot fail: the buffer was created a few lines above, and
+                // `queue_early` capped the count well under its depth.
+                // Asserted rather than discarded so a change to either
+                // invariant is caught here instead of losing the message.
+                let queued = buf.add(payload, None, true, now_us);
+                debug_assert!(queued, "early data did not fit a freshly created send buffer");
+            }
         }
 
         let ctx = self.cc_ctx(now_us);
@@ -933,16 +954,25 @@ impl Connection {
     /// (`connect`-side) role sends a conclusion, so it does nothing for a
     /// rendezvous or listener connection.
     ///
-    /// Payload must fit one packet.
-    pub fn set_early_data(&mut self, payload: Bytes) -> bool {
+    /// Each payload must fit a single packet, and at most
+    /// [`MAX_EARLY_MESSAGES`] may be queued — the opening congestion window is
+    /// what they have to travel in, so more than that could not go out early
+    /// anyway.
+    pub fn queue_early(&mut self, payload: Bytes) -> bool {
         if !matches!(self.state, ConnState::Connecting { mode: ConnMode::Active, .. })
             || payload.len() > self.payload_size as usize
             || payload.is_empty()
+            || self.early.len() >= MAX_EARLY_MESSAGES
         {
             return false;
         }
-        self.early_data = Some(payload);
+        self.early.push(payload);
         true
+    }
+
+    /// How many early messages are queued.
+    pub fn early_queued(&self) -> usize {
+        self.early.len()
     }
 
     /// Places data a peer sent before this connection existed.
@@ -956,12 +986,12 @@ impl Connection {
     /// Any `DataReady` this produces cannot be delivered yet — there is nobody
     /// holding the connection at this point — so it is remembered and emitted
     /// from the next [`Connection::on_timer`].
-    pub fn inject_early_data(&mut self, seq: SeqNo, payload: &[u8], now_us: u64) {
+    pub fn inject_early_data(&mut self, seq: SeqNo, msg_no: MsgNo, payload: &[u8], now_us: u64) {
         let hdr = codec::encode_data_header(
             seq,
             MsgBoundary::Solo,
             true,
-            MsgNo::new(0),
+            msg_no,
             self.ts(now_us),
             self.socket_id,
         );
@@ -1561,18 +1591,39 @@ impl Connection {
                     // The sequence number is the ISN, where the receiver's
                     // buffer starts, so it lands where the first data packet was
                     // always going to.
-                    if let Some(payload) = self.early_data.clone() {
+                    //
+                    // One packet per message, numbered from the ISN in queue
+                    // order. The send buffer is filled from the same list in
+                    // the same order at `post_connect`, so it arrives at the
+                    // same numbers -- which is what makes the early copy a
+                    // duplicate the receiver discards rather than a second
+                    // message.
+                    //
+                    // The negotiated payload size can be smaller than this end
+                    // offered, since the challenge carries the peer's MSS. A
+                    // message that no longer fits one packet would span two and
+                    // shift everything after it, so emission stops there; those
+                    // messages still travel by the ordinary path.
+                    let negotiated = (hs.mss as u32).min(self.mss).max(MIN_MSS);
+                    let first_time = !self.early_sent;
+                    self.early_sent = true;
+                    let early_payload =
+                        negotiated.saturating_sub(IP_AND_UDP_OVERHEAD + UDT_HEADER_SIZE as u32);
+                    for (i, payload) in self.early.iter().enumerate() {
+                        if !first_time || payload.len() > early_payload as usize {
+                            break;
+                        }
                         let hdr = codec::encode_data_header(
-                            self.local_isn,
+                            self.local_isn + i as u32,
                             MsgBoundary::Solo,
                             true,
-                            MsgNo::new(0),
+                            MsgNo::new(i as u32),
                             self.ts(now_us),
                             hs.socket_id as u32,
                         );
                         tx.push(|dst| {
                             dst.extend_from_slice(&hdr);
-                            dst.extend_from_slice(&payload);
+                            dst.extend_from_slice(payload);
                         });
                     }
                     tx.push(|dst| codec::encode_handshake(&new_req, self.ts(now_us), 0, dst));

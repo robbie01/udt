@@ -156,6 +156,7 @@ mod time_window;
 mod transmit;
 
 pub use congestion::{CcKind, CongestionControl};
+pub use connection::MAX_EARLY_MESSAGES;
 pub use connection::{
     ConnMode, Connection, ConnectionStats, DisconnectReason, Event, SendOutcome, UDT_HEADER_SIZE,
 };

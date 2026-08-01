@@ -4,7 +4,7 @@ use crate::codec;
 use crate::congestion::CcKind;
 use crate::connection::Connection;
 use crate::handshake::{Handshake, SOCK_DGRAM, UDT_VERSION, req_type};
-use crate::seq::SeqNo;
+use crate::seq::{MsgNo, SeqNo};
 use bytes::{Bytes, BytesMut};
 use std::collections::{HashMap, VecDeque};
 
@@ -13,6 +13,10 @@ use std::collections::{HashMap, VecDeque};
 /// Each entry is one packet, and a peer that never completes its handshake
 /// holds one until it expires. Bounded rather than absent because an
 /// unverified peer can reach it.
+/// Data a peer sent before its handshake completed: when the first packet
+/// arrived, and each packet's sequence number, message number and payload.
+type EarlyHold = (u64, Vec<(SeqNo, MsgNo, Bytes)>);
+
 const EARLY_DATA_SLOTS: usize = 256;
 
 /// How long early data waits for the handshake it belongs to.
@@ -96,7 +100,7 @@ pub struct Listener {
     accepted_order: VecDeque<PeerAddr>,
     /// Data received from a peer whose handshake has not completed yet, keyed
     /// by address, with the sequence number it claimed and when it arrived.
-    early: HashMap<PeerAddr, (u64, SeqNo, Bytes)>,
+    early: HashMap<PeerAddr, EarlyHold>,
     /// Secret for cookie generation (random at listener creation).
     secret: u64,
     /// Counter behind [`Listener::mint_socket_id`].
@@ -190,11 +194,24 @@ impl Listener {
                 // quiet after sending early data must not hold a slot for ever,
                 // or the table fills and stays full.
                 if self.early.len() >= EARLY_DATA_SLOTS {
-                    self.early
-                        .retain(|_, (at, _, _)| now_us.saturating_sub(*at) < EARLY_DATA_TTL_US);
+                    self.early.retain(|_, (at, _)| now_us.saturating_sub(*at) < EARLY_DATA_TTL_US);
                 }
-                if self.early.len() < EARLY_DATA_SLOTS {
-                    self.early.insert(addr, (now_us, header.seq_no, payload));
+                // A peer may send several, so this is a list. Bounded by the
+                // same cap the sender is: more than that could not have gone
+                // out in the opening window anyway, and the rest of them arrive
+                // by the ordinary path.
+                let room = self.early.len() < EARLY_DATA_SLOTS;
+                match self.early.get_mut(&addr) {
+                    Some((_, held)) => {
+                        if held.len() < crate::connection::MAX_EARLY_MESSAGES {
+                            held.push((header.seq_no, header.msg_no, payload));
+                        }
+                    }
+                    None if room => {
+                        self.early
+                            .insert(addr, (now_us, vec![(header.seq_no, header.msg_no, payload)]));
+                    }
+                    None => {}
                 }
                 return;
             }
@@ -289,8 +306,10 @@ impl Listener {
                 // Hand over anything that arrived beside the conclusion. Done
                 // before the connection leaves here, since afterwards there is
                 // no way to reach it.
-                if let Some((_, seq, payload)) = self.early.remove(&addr) {
-                    conn.inject_early_data(seq, &payload, now_us);
+                if let Some((_, held)) = self.early.remove(&addr) {
+                    for (seq, msg_no, payload) in held {
+                        conn.inject_early_data(seq, msg_no, &payload, now_us);
+                    }
                 }
 
                 self.remember_accepted(addr.clone(), our_resp.clone(), now_us);

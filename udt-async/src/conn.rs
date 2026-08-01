@@ -426,6 +426,94 @@ impl SendOptions {
     }
 }
 
+/// A connection whose handshake is still in flight.
+///
+/// Returned by [`Endpoint::connect`], and a `Future` yielding the established
+/// [`Connection`]. The point of holding it rather than awaiting straight away
+/// is [`try_send`](Self::try_send): a message queued before the handshake
+/// finishes travels *with* it and reaches the peer a round trip earlier than
+/// anything sent afterwards could.
+///
+/// ```no_run
+/// # async fn f(endpoint: udt_async::Endpoint, msg1: &[u8]) -> std::io::Result<()> {
+/// let connecting = endpoint.connect("203.0.113.7:9000").await?;
+/// connecting.try_send(msg1)?;
+/// let conn = connecting.await?;
+/// # Ok(()) }
+/// ```
+///
+/// [`Endpoint::connect`]: crate::Endpoint::connect
+pub struct Connecting {
+    pub(crate) conn: Option<Connection>,
+    pub(crate) connected: oneshot::Receiver<()>,
+}
+
+impl Connecting {
+    /// Queues a message to travel with the handshake.
+    ///
+    /// Any number may be queued, up to what the opening congestion window can
+    /// carry; past that they are held and go out the moment the connection
+    /// completes, which is what would have happened to all of them anyway.
+    /// Ordering is preserved throughout — a message queued here arrives before
+    /// anything sent on the established connection.
+    ///
+    /// Not `async`, and deliberately: the only thing waiting could buy is room
+    /// in the send window, and that is freed by acknowledgements, which cannot
+    /// arrive until the handshake this is racing has finished. There is no
+    /// `try_recv` for the mirror of that reason — the peer has nothing to say
+    /// until it has accepted.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorKind::WouldBlock`] if the queue is full, [`ErrorKind::BrokenPipe`]
+    /// if the handshake has already failed, and [`ErrorKind::InvalidInput`] for
+    /// an empty message.
+    ///
+    /// [`ErrorKind::WouldBlock`]: std::io::ErrorKind::WouldBlock
+    /// [`ErrorKind::BrokenPipe`]: std::io::ErrorKind::BrokenPipe
+    /// [`ErrorKind::InvalidInput`]: std::io::ErrorKind::InvalidInput
+    pub fn try_send(&self, buf: &[u8]) -> io::Result<()> {
+        self.try_send_with(buf, SendOptions::new())
+    }
+
+    /// [`try_send`](Self::try_send) with the options of
+    /// [`Connection::send_with`].
+    ///
+    /// # Errors
+    ///
+    /// As [`try_send`](Self::try_send).
+    pub fn try_send_with(&self, buf: &[u8], opts: SendOptions) -> io::Result<()> {
+        self.conn.as_ref().expect("polled to completion").try_send_with(buf, opts)
+    }
+
+    /// The address being connected to.
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.conn.as_ref().expect("polled to completion").peer_addr()
+    }
+}
+
+impl std::future::Future for Connecting {
+    type Output = io::Result<Connection>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        use std::task::Poll;
+        match std::pin::Pin::new(&mut self.connected).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => {
+                let conn = self.conn.take().expect("polled after completion");
+                Poll::Ready(Ok(conn))
+            }
+            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "connect handshake failed",
+            ))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
