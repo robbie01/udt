@@ -144,7 +144,12 @@ mod tests {
         let client_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
         let (server, client) =
             tokio::join!(async { listener.accept().await.expect("accept") }, async {
-                client_ep.connect(addr).await.expect("connect")
+                client_ep
+                    .connect(addr)
+                    .await
+                    .expect("connect")
+                    .await
+                    .expect("connect")
             });
 
         let start = Instant::now();
@@ -229,7 +234,12 @@ mod tests {
 
         let (server, client) =
             tokio::join!(async { listener.accept().await.expect("accept") }, async {
-                client_ep.connect(relay_addr).await.expect("connect")
+                client_ep
+                    .connect(relay_addr)
+                    .await
+                    .expect("connect")
+                    .await
+                    .expect("connect")
             });
 
         let start = Instant::now();

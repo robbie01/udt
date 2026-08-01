@@ -82,7 +82,7 @@ mod tests {
         let accept = tokio::task::spawn_blocking(move || (listener.accept(), listener));
 
         let rust_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
-        let client = tokio::time::timeout(T, rust_ep.connect(server_addr))
+        let client = tokio::time::timeout(T, async { rust_ep.connect(server_addr).await?.await })
             .await
             .expect("rust connect timed out")
             .expect("rust connect failed");

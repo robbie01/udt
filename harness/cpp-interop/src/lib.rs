@@ -27,10 +27,12 @@ mod tests {
         let (server_sock, client_sock) =
             tokio::join!(async { listener.accept().await.unwrap() }, async {
                 let cep = Endpoint::bind("127.0.0.1:0").await.unwrap();
-                tokio::time::timeout(Duration::from_secs(5), cep.connect(server_addr))
-                    .await
-                    .expect("connect timed out")
-                    .expect("connect failed")
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    cep.connect(server_addr).await?.await
+                })
+                .await
+                .expect("connect timed out")
+                .expect("connect failed")
             });
         (server_sock, client_sock)
     }
@@ -167,10 +169,12 @@ mod tests {
             },
             async {
                 let cep = Endpoint::bind("127.0.0.1:0").await.unwrap();
-                tokio::time::timeout(Duration::from_secs(5), cep.connect(server_addr))
-                    .await
-                    .expect("connect timed out")
-                    .expect("connect failed")
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    cep.connect(server_addr).await?.await
+                })
+                .await
+                .expect("connect timed out")
+                .expect("connect failed")
             }
         );
         (cpp_conn, client_sock)
@@ -348,11 +352,12 @@ mod tests {
                 let payload = vec![(i as u8).wrapping_add(0x41); 3000]; // 'A', 'B', 'C', 'D' repeated
                 tokio::spawn(async move {
                     let cep = Endpoint::bind("127.0.0.1:0").await.unwrap();
-                    let sock =
-                        tokio::time::timeout(Duration::from_secs(5), cep.connect(server_addr))
-                            .await
-                            .expect("connect timed out")
-                            .expect("connect failed");
+                    let sock = tokio::time::timeout(Duration::from_secs(5), async {
+                        cep.connect(server_addr).await?.await
+                    })
+                    .await
+                    .expect("connect timed out")
+                    .expect("connect failed");
 
                     // Send our distinctive payload.
                     tokio::time::timeout(Duration::from_secs(5), sock.send(&payload))
@@ -1009,10 +1014,12 @@ mod tests {
             let cep = Endpoint::bind_with("127.0.0.1:0", cfg.clone())
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), cep.connect(server_addr))
-                .await
-                .expect("ledbat connect timed out")
-                .expect("ledbat connect failed")
+            tokio::time::timeout(Duration::from_secs(5), async {
+                cep.connect(server_addr).await?.await
+            })
+            .await
+            .expect("ledbat connect timed out")
+            .expect("ledbat connect failed")
         });
 
         let sender = tokio::spawn(async move {
@@ -1069,7 +1076,7 @@ mod tests {
                     let cep = Endpoint::bind_with("127.0.0.1:0", cfg.clone())
                         .await
                         .unwrap();
-                    cep.connect(addr).await.unwrap()
+                    cep.connect(addr).await.unwrap().await.unwrap()
                 });
 
             let s = Arc::clone(&stop);
@@ -1562,7 +1569,7 @@ mod tests {
             .map(|_| {
                 tokio::spawn(async move {
                     let cep = Endpoint::bind("127.0.0.1:0").await.unwrap();
-                    cep.connect(server_addr).await.unwrap()
+                    cep.connect(server_addr).await.unwrap().await.unwrap()
                 })
             })
             .collect();
