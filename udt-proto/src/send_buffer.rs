@@ -53,25 +53,19 @@ impl SendBuffer {
     }
 
     /// Enqueue a message. It is split into payload-sized blocks automatically.
-    /// Returns `Err(())` if there is insufficient space.
+    /// Returns `false` if there is insufficient space.
     ///
     /// Takes an owned [`Bytes`] so the per-packet blocks can be cheap slices of
     /// the caller's buffer (a refcount bump each) rather than copies. Splitting
     /// a large message would otherwise memcpy the whole payload a second time.
-    #[allow(clippy::result_unit_err)]
-    pub fn add(
-        &mut self,
-        data: Bytes,
-        ttl_ms: Option<u32>,
-        in_order: bool,
-        now_us: u64,
-    ) -> Result<(), ()> {
+    #[must_use]
+    pub fn add(&mut self, data: Bytes, ttl_ms: Option<u32>, in_order: bool, now_us: u64) -> bool {
         let n_chunks = data.len().div_ceil(self.payload_size);
         if n_chunks == 0 {
-            return Ok(());
+            return true;
         }
         if self.len + n_chunks > self.capacity {
-            return Err(());
+            return false;
         }
         let msg_no = self.next_msg_no;
         self.next_msg_no = self.next_msg_no.next();
@@ -99,7 +93,7 @@ impl SendBuffer {
             });
             self.len += 1;
         }
-        Ok(())
+        true
     }
 
     /// Read the next unsent block (new transmission). Returns None if no new data.
@@ -322,7 +316,7 @@ mod tests {
     #[test]
     fn add_and_read_single_block() {
         let mut buf = SendBuffer::new(64, 1000);
-        buf.add(Bytes::from_static(b"hello"), None, false, 0).unwrap();
+        assert!(buf.add(Bytes::from_static(b"hello"), None, false, 0));
         let block = buf.read_next().unwrap();
         assert_eq!(&block.data[..], b"hello");
         assert_eq!(block.boundary, MsgBoundary::Solo);
@@ -331,7 +325,7 @@ mod tests {
     #[test]
     fn add_multi_block_message() {
         let mut buf = SendBuffer::new(64, 4);
-        buf.add(Bytes::from_static(b"abcdefgh"), None, false, 0).unwrap(); // 2 blocks of 4
+        assert!(buf.add(Bytes::from_static(b"abcdefgh"), None, false, 0)); // 2 blocks of 4
         let b0 = buf.read_next().unwrap();
         assert_eq!(b0.boundary, MsgBoundary::First);
         assert_eq!(&b0.data[..], b"abcd");
@@ -344,22 +338,22 @@ mod tests {
     #[test]
     fn ack_frees_space() {
         let mut buf = SendBuffer::new(4, 1000);
-        buf.add(Bytes::from_static(b"a"), None, false, 0).unwrap();
-        buf.add(Bytes::from_static(b"b"), None, false, 0).unwrap();
-        buf.add(Bytes::from_static(b"c"), None, false, 0).unwrap();
-        buf.add(Bytes::from_static(b"d"), None, false, 0).unwrap();
-        assert!(buf.add(Bytes::from_static(b"e"), None, false, 0).is_err()); // full
+        assert!(buf.add(Bytes::from_static(b"a"), None, false, 0));
+        assert!(buf.add(Bytes::from_static(b"b"), None, false, 0));
+        assert!(buf.add(Bytes::from_static(b"c"), None, false, 0));
+        assert!(buf.add(Bytes::from_static(b"d"), None, false, 0));
+        assert!(!buf.add(Bytes::from_static(b"e"), None, false, 0)); // full
         buf.read_next();
         buf.read_next();
         buf.ack(2);
-        assert!(buf.add(Bytes::from_static(b"e"), None, false, 0).is_ok());
+        assert!(buf.add(Bytes::from_static(b"e"), None, false, 0));
     }
 
     #[test]
     fn read_at_for_retransmit() {
         let mut buf = SendBuffer::new(64, 1000);
-        buf.add(Bytes::from_static(b"first"), None, false, 0).unwrap();
-        buf.add(Bytes::from_static(b"second"), None, false, 0).unwrap();
+        assert!(buf.add(Bytes::from_static(b"first"), None, false, 0));
+        assert!(buf.add(Bytes::from_static(b"second"), None, false, 0));
         buf.read_next(); // advance sent cursor
         buf.read_next();
         let block = buf.read_at(0).unwrap();

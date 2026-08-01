@@ -306,7 +306,7 @@ impl RecvBuffer {
             self.slots[phys] = SlotState::Empty;
         }
         self.head = (self.head + n) % self.capacity;
-        self.base_seq = self.base_seq.add(n as u32);
+        self.base_seq = self.base_seq + n as u32;
         self.reclaimable = 0;
         self.max_off = self.max_off.saturating_sub(n);
     }

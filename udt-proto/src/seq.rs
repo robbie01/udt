@@ -6,7 +6,7 @@
 //! one, so `SeqNo(0)` is correctly *after* `SeqNo(SEQ_MAX)`. Never compare the
 //! raw integers.
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, ops::Add};
 
 /// Largest data sequence number; the space wraps to 0 after this.
 pub const SEQ_MAX: u32 = 0x7FFF_FFFF;
@@ -66,13 +66,6 @@ impl SeqNo {
         SeqNo(self.0.wrapping_sub(1) & SEQ_MAX)
     }
 
-    /// This sequence number advanced by `n`, wrapping.
-    #[allow(clippy::should_implement_trait)] // `Add::add` would require a different signature
-    #[inline]
-    pub fn add(self, n: u32) -> Self {
-        SeqNo((self.0 + n) & SEQ_MAX)
-    }
-
     /// This sequence number shifted by `n`, which may be negative. Wraps.
     ///
     /// The inverse of [`offset_from`](Self::offset_from), and the way back
@@ -110,6 +103,16 @@ impl SeqNo {
         let off = other.offset_from(self);
         debug_assert!(off >= 0, "len_to called with other < self");
         off as u32 + 1
+    }
+}
+
+impl Add<u32> for SeqNo {
+    type Output = Self;
+
+    /// This sequence number advanced by `n`, wrapping.
+    #[inline]
+    fn add(self, n: u32) -> Self {
+        SeqNo((self.0 + n) & SEQ_MAX)
     }
 }
 

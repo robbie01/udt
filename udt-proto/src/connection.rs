@@ -1018,7 +1018,7 @@ impl Connection {
                     // Larger than the whole buffer — retrying can never help.
                     return SendOutcome::Rejected;
                 }
-                if buf.add(payload, ttl_ms, in_order, now_us).is_err() {
+                if !buf.add(payload, ttl_ms, in_order, now_us) {
                     return SendOutcome::WouldBlock;
                 }
             }
@@ -1220,7 +1220,7 @@ impl Connection {
         let mut rebuilt = SendBuffer::new(DEFAULT_SND_BUF, payload_size as usize);
         rebuilt.resume_msg_no_at(resume_msg);
         for (payload, ttl_ms, in_order) in messages {
-            if rebuilt.add(payload, ttl_ms, in_order, now_us).is_err() {
+            if !rebuilt.add(payload, ttl_ms, in_order, now_us) {
                 // The same bytes need more blocks at a smaller size, and no
                 // longer fit. Failing here is honest; silently dropping a
                 // message the application handed us is not.
@@ -1979,8 +1979,8 @@ impl Connection {
             return false;
         };
 
-        let first = self.snd_last_ack.add(first_off as u32);
-        let last = self.snd_last_ack.add(last_off as u32);
+        let first = self.snd_last_ack + first_off as u32;
+        let last = self.snd_last_ack + last_off as u32;
         if last > self.snd_curr_seq {
             self.snd_curr_seq = last;
         }
@@ -2002,8 +2002,8 @@ impl Connection {
         else {
             return false;
         };
-        let first = self.snd_last_ack.add(first_off as u32);
-        let last = self.snd_last_ack.add(last_off as u32);
+        let first = self.snd_last_ack + first_off as u32;
+        let last = self.snd_last_ack + last_off as u32;
         self.snd_loss.remove_range(first, last);
 
         tx.push(|dst| {
