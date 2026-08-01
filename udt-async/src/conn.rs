@@ -320,7 +320,8 @@ impl SendOptions {
     ///
     /// Resolution is one millisecond, and that is a floor rather than a round:
     /// a shorter deadline is treated as one millisecond, because zero means
-    /// something else — see [`Connection::send_msg`] in `udt-proto`.
+    /// something else: zero means expire the message as soon as any time has
+    /// passed, so it may never be transmitted at all.
     pub fn ttl(mut self, ttl: Duration) -> Self {
         self.ttl = Some(ttl);
         self
