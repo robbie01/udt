@@ -625,7 +625,12 @@ impl Connection {
         if let Some(payload) = self.early_data.take()
             && let Some(buf) = self.snd_buf.as_mut()
         {
-            let _ = buf.add(payload, None, true, now_us);
+            // Cannot fail: the buffer was created a few lines above and
+            // `set_early_data` already refused anything larger than one packet.
+            // Asserted rather than discarded so a change to either invariant is
+            // caught here instead of silently losing the message.
+            let queued = buf.add(payload, None, true, now_us);
+            debug_assert!(queued, "early data did not fit a freshly created send buffer");
         }
 
         let ctx = self.cc_ctx(now_us);
