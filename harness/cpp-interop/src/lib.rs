@@ -7,7 +7,7 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::Duration;
-    use udt_async::{Endpoint, SendOptions, Socket};
+    use udt_async::{Connection as UdtConn, Endpoint, SendOptions};
 
     const SMALL: &[u8] = b"hello, world!   "; // 16 bytes — single packet
     fn medium() -> Vec<u8> {
@@ -19,7 +19,7 @@ mod tests {
 
     // ── Pure Rust helpers ────────────────────────────────────────────────────
 
-    async fn new_listener_pair(listener_addr: SocketAddr) -> (Socket, Socket) {
+    async fn new_listener_pair(listener_addr: SocketAddr) -> (UdtConn, UdtConn) {
         let ep = Endpoint::bind(listener_addr).await.unwrap();
         let server_addr = ep.local_addr();
         let listener = ep.listen(4).unwrap();
@@ -35,7 +35,7 @@ mod tests {
         (server_sock, client_sock)
     }
 
-    async fn echo_exchange(server: Socket, client: Socket, payload: &[u8], count: usize) {
+    async fn echo_exchange(server: UdtConn, client: UdtConn, payload: &[u8], count: usize) {
         let mut buf = vec![0u8; 131072];
         for _ in 0..count {
             // Client → Server
@@ -86,7 +86,7 @@ mod tests {
 
     // ── Scenario 4: rendezvous both new ──────────────────────────────────────
 
-    async fn new_rendezvous_pair() -> (Socket, Socket) {
+    async fn new_rendezvous_pair() -> (UdtConn, UdtConn) {
         let ep_a = Endpoint::bind("127.0.0.1:0").await.unwrap();
         let ep_b = Endpoint::bind("127.0.0.1:0").await.unwrap();
         let addr_a = ep_a.local_addr();
@@ -131,7 +131,7 @@ mod tests {
 
     /// Set up a Rust listener + C++ connector pair.
     /// Returns (rust_server_sock, cpp_client_conn).
-    async fn new_s2_pair() -> (Socket, udt_compat::Connection) {
+    async fn new_s2_pair() -> (UdtConn, udt_compat::Connection) {
         use udt_compat::Endpoint as CppEndpoint;
 
         let ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
@@ -151,7 +151,7 @@ mod tests {
 
     /// Set up a C++ listener + Rust connector pair.
     /// Returns (cpp_server_conn, rust_client_sock).
-    async fn new_s3_pair() -> (udt_compat::Connection, Socket) {
+    async fn new_s3_pair() -> (udt_compat::Connection, UdtConn) {
         use udt_compat::Endpoint as CppEndpoint;
 
         let cpp_ep = Arc::new(CppEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap());
@@ -178,7 +178,7 @@ mod tests {
 
     /// Set up a C++ rendezvous + Rust rendezvous pair.
     /// Returns (cpp_conn, rust_sock).
-    async fn new_s5_pair() -> (udt_compat::Connection, Socket) {
+    async fn new_s5_pair() -> (udt_compat::Connection, UdtConn) {
         use udt_compat::Endpoint as CppEndpoint;
 
         let cpp_ep = Arc::new(CppEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap());
@@ -206,7 +206,7 @@ mod tests {
     /// Exchange `count` messages: C++ sends first, Rust echoes back.
     async fn cpp_first_echo_exchange(
         cpp_conn: udt_compat::Connection,
-        rust_sock: Socket,
+        rust_sock: UdtConn,
         payload: &[u8],
         count: usize,
     ) {
@@ -238,7 +238,7 @@ mod tests {
 
     /// Exchange `count` messages: Rust sends first, C++ echoes back.
     async fn rust_first_echo_exchange(
-        rust_sock: Socket,
+        rust_sock: UdtConn,
         cpp_conn: udt_compat::Connection,
         payload: &[u8],
         count: usize,
@@ -462,11 +462,11 @@ mod tests {
             .collect();
 
         // Collect sockets from side A.
-        let mut socks_a: Vec<Socket> = Vec::new();
+        let mut socks_a: Vec<UdtConn> = Vec::new();
         for t in tasks_a.drain(..) {
             socks_a.push(t.await.unwrap());
         }
-        let pairs: Vec<(Socket, Socket, Vec<u8>)> = {
+        let pairs: Vec<(UdtConn, UdtConn, Vec<u8>)> = {
             let mut v = Vec::new();
             for (sa, tb) in socks_a.into_iter().zip(tasks_b.drain(..)) {
                 let (sb, payload) = tb.await.unwrap();

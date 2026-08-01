@@ -17,7 +17,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use udt_async::{Endpoint, Socket};
+    use udt_async::{Connection as UdtConn, Endpoint};
 
     /// Generous, but bounded — these paths block real OS threads.
     const T: Duration = Duration::from_secs(30);
@@ -74,7 +74,7 @@ mod tests {
     }
 
     /// Upstream listener + Rust connector.
-    async fn orig_listener_rust_connector() -> (Arc<udt_orig::Connection>, Socket, Keepalive) {
+    async fn orig_listener_rust_connector() -> (Arc<udt_orig::Connection>, UdtConn, Keepalive) {
         let server_ep = udt_orig::Endpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let server_addr = server_ep.local_addr().unwrap();
         let listener = server_ep.listen(4).unwrap();
@@ -101,7 +101,7 @@ mod tests {
     }
 
     /// Rust listener + upstream connector.
-    async fn rust_listener_orig_connector() -> (Socket, Arc<udt_orig::Connection>, Keepalive) {
+    async fn rust_listener_orig_connector() -> (UdtConn, Arc<udt_orig::Connection>, Keepalive) {
         let ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
         let server_addr = ep.local_addr();
         let listener = ep.listen(4).unwrap();
