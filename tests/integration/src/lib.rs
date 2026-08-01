@@ -1376,6 +1376,22 @@ mod wind_down {
         start.elapsed()
     }
 
+    /// The fastest of several slices.
+    ///
+    /// A single timing on a shared machine is at the mercy of whatever else is
+    /// running: one perturbed sample moves the ratio either way, which failed
+    /// this test once on a loaded CI runner with no spin to show for it. The
+    /// minimum is the least-disturbed sample, and it keeps the test's power --
+    /// a spinning driver steals from *every* slice, so the minimum stays high
+    /// exactly when it should.
+    async fn fastest_work_slice() -> Duration {
+        let mut best = Duration::MAX;
+        for _ in 0..5 {
+            best = best.min(work_slice().await);
+        }
+        best
+    }
+
     /// Dropping the last handle while data is still queued must leave the
     /// driver waiting, not spinning.
     ///
@@ -1422,10 +1438,10 @@ mod wind_down {
             client.send(&[7u8; 1000]).await.unwrap();
         }
 
-        let control = work_slice().await;
+        let control = fastest_work_slice().await;
         drop(client);
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let stalled = work_slice().await;
+        let stalled = fastest_work_slice().await;
         drop(server);
 
         let ratio = stalled.as_secs_f64() / control.as_secs_f64();
