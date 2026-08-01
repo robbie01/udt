@@ -84,6 +84,12 @@ packets but feeds messages in as the connection drains them, so the sender never
 holds a window at once. Pacing the initial window looked free in the second and
 was a regression in the first. Check both.
 
+**Routing lives in `udt-proto`, not the IO layer.** `router::Router` decides
+which connection a datagram belongs to — socket id first, address as the
+fallback a handshake needs, and "nothing here" meaning a new connection.
+`udt-async` holds the table and the lock and carries datagrams; it does not
+decide. A second IO layer should not have to rediscover those rules.
+
 **Wire compatibility is a hard constraint.** Anything touching `codec.rs`,
 `packet.rs` or `handshake.rs` has to keep interoperating with two C++
 references (below). Extensions have to be ignorable by a peer that does not

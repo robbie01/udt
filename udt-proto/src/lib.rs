@@ -140,6 +140,7 @@ pub mod fuzz {
 
 mod ack_window;
 mod codec;
+pub mod router;
 
 /// The destination socket id in a datagram, for demultiplexing before decode.
 pub use codec::dst_socket_id;
@@ -159,5 +160,6 @@ pub use connection::{
     ConnMode, Connection, ConnectionStats, DisconnectReason, Event, SendOutcome, UDT_HEADER_SIZE,
 };
 pub use listener::{Listener, ListenerEvent, PeerAddr};
+pub use router::{Route, Router};
 pub use seq::{AckSeqNo, MSG_MAX, MsgNo, SEQ_MAX, SeqNo};
 pub use transmit::{Runs, TransmitBuf};

@@ -2,8 +2,6 @@
 
 use std::collections::HashMap;
 
-/// One connection reachable at a peer address: its socket id and its inbox.
-type AddrRoute = (u32, mpsc::Sender<Inbound>);
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,7 +11,8 @@ use bytes::Bytes;
 use tokio::net::{ToSocketAddrs, UdpSocket};
 use tokio::sync::{Notify, mpsc, oneshot};
 use udt_proto::{
-    CcKind, Connection as ProtoConnection, Listener as ProtoListener, ListenerEvent, SeqNo,
+    CcKind, Connection as ProtoConnection, Listener as ProtoListener, ListenerEvent, Route, Router,
+    SeqNo,
 };
 
 use crate::batch::{BatchIo, Inbound, RecvBuffers};
@@ -131,37 +130,16 @@ struct EndpointInner {
     socket: Arc<UdpSocket>,
     local_addr: SocketAddr,
     cfg: EndpointConfig,
-    /// Our socket id to connection, for everything sharing the bound port.
+    /// Which connection an arriving datagram belongs to.
     ///
-    /// Keyed on the id rather than the peer address because a peer may hold
-    /// more than one connection to us — upstream demultiplexes on address,
-    /// client socket id and ISN together, and keying on address alone silently
-    /// collapsed those into one. An arriving datagram names its destination id
-    /// in the header, which is exactly this key.
+    /// The rules live in `udt-proto`, next to the wire format they come from;
+    /// this holds the table and the lock.
     ///
     /// A read-write lock rather than a channel or a single owning task: the
     /// readers only ever look routes up, and taking a read lock lets several
     /// of them dispatch to different connections at once. Writes happen once
     /// per connection, at accept and at close.
-    routes: RwLock<HashMap<u32, mpsc::Sender<Inbound>>>,
-    /// The same connections, keyed by peer address.
-    ///
-    /// Needed because a peer cannot address us by an id it has not been told
-    /// yet: a handshake carries destination 0, and a rendezvous pair exchanges
-    /// several of them before either side knows the other's id. Those can only
-    /// be matched by address.
-    ///
-    /// So this is the handshake-time index and `routes` is the steady-state
-    /// one. Only `routes` can distinguish two connections sharing an address,
-    /// which is why it is the one consulted first.
-    ///
-    /// A list, not a single entry: several connections can share an address,
-    /// and a handshake addressed to 0 has nothing to pick between them with.
-    /// It goes to all of them, and only one can act on it — a connection past
-    /// its handshake ignores handshakes, so at most the one still negotiating
-    /// responds. That is what makes serialising rendezvous establishment
-    /// sufficient rather than merely narrowing.
-    by_addr: RwLock<HashMap<SocketAddr, Vec<AddrRoute>>>,
+    routes: RwLock<Router<SocketAddr, mpsc::Sender<Inbound>>>,
     listener: Mutex<Option<ListenerSlot>>,
     /// False once the `Endpoint` handle is dropped. Readers keep serving
     /// existing connections after that, and stop when the last one goes.
@@ -183,15 +161,7 @@ impl EndpointInner {
 
     fn remove_route(&self, socket_id: u32, peer: SocketAddr) {
         if let Ok(mut routes) = self.routes.write() {
-            routes.remove(&socket_id);
-        }
-        if let Ok(mut by_addr) = self.by_addr.write()
-            && let Some(list) = by_addr.get_mut(&peer)
-        {
-            list.retain(|(id, _)| *id != socket_id);
-            if list.is_empty() {
-                by_addr.remove(&peer);
-            }
+            routes.remove(socket_id, &peer);
         }
         self.wind_down.notify_waiters();
     }
@@ -288,8 +258,7 @@ impl Endpoint {
             socket,
             local_addr,
             cfg,
-            routes: RwLock::new(HashMap::new()),
-            by_addr: RwLock::new(HashMap::new()),
+            routes: RwLock::new(Router::new()),
             listener: Mutex::new(None),
             handle_alive: AtomicBool::new(true),
             wind_down: Notify::new(),
@@ -546,10 +515,7 @@ fn spawn_shared(
 
     let socket_id = conn.socket_id();
     if let Ok(mut routes) = ep.routes.write() {
-        routes.insert(socket_id, datagram_tx.clone());
-    }
-    if let Ok(mut by_addr) = ep.by_addr.write() {
-        by_addr.entry(peer).or_default().push((socket_id, datagram_tx));
+        routes.insert(socket_id, peer, datagram_tx);
     }
 
     let udp = Arc::clone(&ep.socket);
@@ -634,37 +600,27 @@ async fn run_reader(ep: Arc<EndpointInner>) {
             let mut offered_handshake = false;
             for datagram in datagrams {
                 let id = udt_proto::dst_socket_id(&datagram.bytes).unwrap_or(0);
-                // Zero addresses no connection in particular, which is what a
-                // peer sends before it has been told an id. It can only be a
-                // handshake.
-                let mut route = if id == 0 {
-                    None
-                } else {
-                    match &cached {
-                        Some((cached_id, tx)) if *cached_id == id => Some(tx.clone()),
-                        _ => {
-                            let found = ep.routes.read().ok().and_then(|r| r.get(&id).cloned());
-                            if let Some(tx) = &found {
-                                cached = Some((id, tx.clone()));
-                            }
-                            found
-                        }
-                    }
-                };
+                // Where it goes is `udt-proto`'s decision; this only carries
+                // it there. The cache short-circuits the common case of a run
+                // of datagrams for one connection.
                 let mut fanout: Vec<mpsc::Sender<Inbound>> = Vec::new();
-                if route.is_none() {
-                    // Either a handshake, which carries destination 0, or a
-                    // peer still using an id we have since retired. Neither
-                    // names a connection, so it goes to every connection on
-                    // this address and they decide: anything past its handshake
-                    // ignores a handshake, so at most one acts on it.
-                    if let Ok(map) = ep.by_addr.read()
-                        && let Some(list) = map.get(&from)
-                    {
-                        fanout.extend(list.iter().map(|(_, tx)| tx.clone()));
-                    }
-                    route = fanout.pop();
-                }
+                let route = match &cached {
+                    Some((cached_id, tx)) if id != 0 && *cached_id == id => Some(tx.clone()),
+                    _ => match ep.routes.read() {
+                        Ok(routes) => match routes.route(&datagram.bytes, &from) {
+                            Route::Connection(tx) => {
+                                cached = Some((id, tx.clone()));
+                                Some(tx.clone())
+                            }
+                            Route::Unaddressed(list) => {
+                                fanout.extend(list.iter().map(|(_, tx)| tx.clone()));
+                                fanout.pop()
+                            }
+                            Route::Unknown => None,
+                        },
+                        Err(_) => None,
+                    },
+                };
 
                 for extra in &fanout {
                     let _ = extra.try_send(datagram.clone());
