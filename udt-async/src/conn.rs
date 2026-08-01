@@ -317,6 +317,10 @@ impl SendOptions {
     /// The peer is told to skip it and the connection carries on with the next
     /// message. Without a TTL a message is retried until it arrives or the
     /// connection fails.
+    ///
+    /// Resolution is one millisecond, and that is a floor rather than a round:
+    /// a shorter deadline is treated as one millisecond, because zero means
+    /// something else — see [`Connection::send_msg`] in `udt-proto`.
     pub fn ttl(mut self, ttl: Duration) -> Self {
         self.ttl = Some(ttl);
         self
@@ -336,8 +340,62 @@ impl SendOptions {
     fn into_req(self, payload: Bytes) -> SendReq {
         SendReq::Data {
             payload,
-            ttl_ms: self.ttl.map(|d| d.as_millis() as u32),
+            // Clamped, not truncated. `as_millis() as u32` gets both ends
+            // wrong: anything under a millisecond becomes 0, which the protocol
+            // reads as "expire as soon as any time has passed" -- so asking for
+            // a 500 us deadline dropped the message almost immediately instead
+            // of trying hard and briefly. And anything past about 49 days
+            // wrapped, which could turn a very long deadline into a very short
+            // one. Both were silent.
+            ttl_ms: self.ttl.map(|d| d.as_millis().clamp(1, u32::MAX as u128) as u32),
             in_order: !self.unordered,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ttl_of(req: SendReq) -> Option<u32> {
+        match req {
+            SendReq::Data { ttl_ms, .. } => ttl_ms,
+            _ => panic!("expected a data request"),
+        }
+    }
+
+    /// A deadline shorter than the wire's resolution must not become zero.
+    ///
+    /// Zero is a real value to the protocol — expire as soon as any time has
+    /// passed — so truncating a sub-millisecond deadline to it inverts what the
+    /// caller asked for, turning "try hard, briefly" into "drop at once".
+    #[test]
+    fn a_sub_millisecond_ttl_does_not_become_zero() {
+        for micros in [1u64, 100, 500, 999] {
+            let got = ttl_of(
+                SendOptions::new().ttl(Duration::from_micros(micros)).into_req(Bytes::new()),
+            );
+            assert_eq!(got, Some(1), "{micros}us became {got:?}");
+        }
+    }
+
+    /// And a deadline past what the field holds must not wrap into a short one.
+    #[test]
+    fn an_enormous_ttl_saturates_rather_than_wrapping() {
+        let got = ttl_of(
+            SendOptions::new().ttl(Duration::from_secs(60 * 60 * 24 * 365)).into_req(Bytes::new()),
+        );
+        assert_eq!(got, Some(u32::MAX));
+    }
+
+    #[test]
+    fn a_millisecond_or_more_is_carried_as_given() {
+        let got = ttl_of(SendOptions::new().ttl(Duration::from_millis(250)).into_req(Bytes::new()));
+        assert_eq!(got, Some(250));
+    }
+
+    #[test]
+    fn no_ttl_stays_none() {
+        assert_eq!(ttl_of(SendOptions::new().into_req(Bytes::new())), None);
     }
 }

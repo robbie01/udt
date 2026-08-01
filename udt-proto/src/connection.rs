@@ -963,8 +963,18 @@ impl Connection {
     /// buffer space frees up — dropping it loses application data silently.
     ///
     /// `ttl_ms` gives up on the message after that many milliseconds and tells
-    /// the peer to skip it. `in_order` set to `false` lets the peer deliver
-    /// this message ahead of earlier ones that are still in flight.
+    /// the peer to skip it. `Some(0)` is not "no deadline" — it expires the
+    /// message the moment any time has passed, so it may be dropped before it
+    /// is ever transmitted. `None` is what means no deadline.
+    ///
+    /// A payload larger than the send buffer holds in total is
+    /// [`SendOutcome::Rejected`] rather than [`SendOutcome::WouldBlock`],
+    /// because no amount of draining would make room; that limit is the buffer
+    /// depth times the path's payload size, about 11 MB at a 1500-byte MTU.
+    /// Anything smaller is split across packets and reassembled by the peer.
+    ///
+    /// `in_order` set to `false` lets the peer deliver this message ahead of
+    /// earlier ones that are still in flight.
     #[must_use = "a message that was not Queued must be retried or reported"]
     pub fn send_msg(
         &mut self,
