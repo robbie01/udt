@@ -96,16 +96,20 @@ mod tests {
 
         let (sock_a, sock_b) = tokio::join!(
             async {
-                tokio::time::timeout(Duration::from_secs(5), ep_a.connect_rendezvous(addr_b))
-                    .await
-                    .expect("rendezvous A timed out")
-                    .expect("rendezvous A failed")
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    ep_a.connect_rendezvous(addr_b).await.expect("rendezvous A not started").await
+                })
+                .await
+                .expect("rendezvous A timed out")
+                .expect("rendezvous A failed")
             },
             async {
-                tokio::time::timeout(Duration::from_secs(5), ep_b.connect_rendezvous(addr_a))
-                    .await
-                    .expect("rendezvous B timed out")
-                    .expect("rendezvous B failed")
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    ep_b.connect_rendezvous(addr_a).await.expect("rendezvous B not started").await
+                })
+                .await
+                .expect("rendezvous B timed out")
+                .expect("rendezvous B failed")
             }
         );
         (sock_a, sock_b)
@@ -278,6 +282,61 @@ mod tests {
         assert_eq!(&buf[..n], b"after", "an early message was delivered twice");
     }
 
+    /// Rendezvous carries early data too, in both directions at once.
+    ///
+    /// It is the case with no listener to hold anything: each peer's connection
+    /// exists before either sends a packet, so the data arrives at a connection
+    /// still negotiating. Both sides queue, so both have to handle that.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rendezvous_carries_early_data_both_ways() {
+        let msgs: [&[u8]; 2] = [b"noise e", b"noise es payload"];
+
+        let ep_a = Endpoint::bind("127.0.0.1:0").await.unwrap();
+        let ep_b = Endpoint::bind("127.0.0.1:0").await.unwrap();
+        let (addr_a, addr_b) = (ep_a.local_addr(), ep_b.local_addr());
+
+        let (conn_a, conn_b) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                async {
+                    let c = ep_a.connect_rendezvous(addr_b).await.expect("A not started");
+                    for m in msgs {
+                        c.try_send(m).expect("early message refused");
+                    }
+                    c.await.expect("rendezvous A failed")
+                },
+                async {
+                    let c = ep_b.connect_rendezvous(addr_a).await.expect("B not started");
+                    for m in msgs {
+                        c.try_send(m).expect("early message refused");
+                    }
+                    c.await.expect("rendezvous B failed")
+                },
+            )
+        })
+        .await
+        .expect("rendezvous timed out");
+
+        for conn in [&conn_a, &conn_b] {
+            let mut buf = vec![0u8; 4096];
+            for want in msgs {
+                let n = tokio::time::timeout(Duration::from_secs(10), conn.recv(&mut buf))
+                    .await
+                    .expect("early data never arrived")
+                    .unwrap();
+                assert_eq!(&buf[..n], want);
+            }
+        }
+
+        // Nothing delivered twice: the follow-up must be next, not a repeat.
+        conn_a.send(b"after").await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(10), conn_b.recv(&mut buf))
+            .await
+            .expect("follow-up never arrived")
+            .unwrap();
+        assert_eq!(&buf[..n], b"after", "an early message was delivered twice");
+    }
+
     /// Past what the handshake can carry, messages are held rather than lost —
     /// they go out as soon as the connection completes, still in order.
     #[tokio::test(flavor = "multi_thread")]
@@ -346,10 +405,15 @@ mod tests {
                 let ep_a = Arc::clone(&ep_a);
                 let _payload = vec![(i as u8).wrapping_add(0x61); 2000]; // 'a', 'b', 'c' repeated
                 tokio::spawn(async move {
-                    tokio::time::timeout(Duration::from_secs(5), ep_a.connect_rendezvous(addr_b))
-                        .await
-                        .expect("rendezvous A timed out")
-                        .expect("rendezvous A failed")
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        ep_a.connect_rendezvous(addr_b)
+                            .await
+                            .expect("rendezvous A not started")
+                            .await
+                    })
+                    .await
+                    .expect("rendezvous A timed out")
+                    .expect("rendezvous A failed")
                 })
             })
             .collect();
@@ -361,10 +425,12 @@ mod tests {
                 let ep_b = Arc::clone(ep_b);
                 let payload = vec![(i as u8).wrapping_add(0x61); 2000];
                 tokio::spawn(async move {
-                    let sock = tokio::time::timeout(
-                        Duration::from_secs(5),
-                        ep_b.connect_rendezvous(addr_a),
-                    )
+                    let sock = tokio::time::timeout(Duration::from_secs(5), async {
+                        ep_b.connect_rendezvous(addr_a)
+                            .await
+                            .expect("rendezvous B not started")
+                            .await
+                    })
                     .await
                     .expect("rendezvous B timed out")
                     .expect("rendezvous B failed");
@@ -1191,9 +1257,10 @@ mod tests {
             };
             let b = Arc::new(Endpoint::bind("127.0.0.1:0").await.unwrap());
             let (aa, ba) = (a.local_addr(), b.local_addr());
-            let (sa, sb) = tokio::join!(async { a.connect_rendezvous(ba).await.unwrap() }, async {
-                b.connect_rendezvous(aa).await.unwrap()
-            },);
+            let (sa, sb) = tokio::join!(
+                async { a.connect_rendezvous(ba).await.unwrap().await.unwrap() },
+                async { b.connect_rendezvous(aa).await.unwrap().await.unwrap() },
+            );
             pairs.push((sa, sb, a, b));
         }
 

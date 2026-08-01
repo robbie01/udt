@@ -1325,6 +1325,42 @@ fn a_path_that_carries_nothing_at_all_is_reported() {
     assert_eq!(sim.b_got.len(), 0, "something got through a link that drops everything");
 }
 
+/// The same recovery must not fire when the peer has merely gone quiet, because
+/// then the data may already have been delivered.
+///
+/// Restarting the send buffer renumbers it, and the peer cannot recognise under
+/// new numbering what it took under the old — so it hands its application the
+/// same messages a second time. "Nothing was acknowledged" does not rule that
+/// out: a dead return path explains it as well as a black hole does, and here
+/// the return path dies the moment the handshake ends while every data packet
+/// still arrives. The peer answering is what tells the two apart.
+#[test]
+fn a_peer_that_has_gone_quiet_is_not_handed_the_data_twice() {
+    let mut sim = Sim::asymmetric(LinkConfig::perfect(), LinkConfig::perfect(), 11);
+    sim.connect();
+
+    // Nothing from B gets home from here on, so no acknowledgement can ever
+    // arrive, while A's data keeps being delivered.
+    sim.b_to_a.cfg.loss = 1.0;
+
+    let sent: Vec<bytes::Bytes> = (0..4).map(|i| bytes::Bytes::from(message(i, 400))).collect();
+    for payload in &sent {
+        assert_eq!(
+            sim.a.send_msg(payload.clone(), None, true, sim.now, &mut sim.a_tx),
+            SendOutcome::Queued
+        );
+    }
+    sim.drain(Side::A);
+
+    for _ in 0..MAX_STEPS {
+        if !sim.a.stats().connected || !sim.step() {
+            break;
+        }
+    }
+
+    assert_eq!(sim.b_got, sent, "the peer was handed messages it had already received");
+}
+
 /// The same detection must not fire on a link that is merely slow and lossy,
 /// where data does eventually get through.
 #[test]
@@ -1532,4 +1568,58 @@ fn concurrent_rendezvous_handshakes_orphan_a_pair() {
              the serialisation in `connect_rendezvous` may no longer be needed"
         );
     }
+}
+
+/// Rendezvous carries early data too, and it is the case with no listener in
+/// it: both peers built their `Connection` before either sent a packet, so the
+/// data reaches the peer directly rather than being held and attached.
+///
+/// Both sides queue, so both emit ahead of their RESPONSE and each has to
+/// handle a data packet arriving mid-negotiation. What is asserted is what the
+/// application sees: the messages, once each, in order, ahead of anything sent
+/// afterwards.
+#[test]
+fn rendezvous_carries_early_data_in_both_directions() {
+    let mut sim = Sim::asymmetric(LinkConfig::perfect(), LinkConfig::perfect(), 3);
+
+    let early: Vec<bytes::Bytes> = (0..3).map(|i| bytes::Bytes::from(message(i, 200))).collect();
+    for payload in &early {
+        assert!(sim.a.queue_early(payload.clone()), "A refused early data");
+        assert!(sim.b.queue_early(payload.clone()), "B refused early data");
+    }
+    assert_eq!(sim.a.early_queued(), 3);
+    assert_eq!(sim.b.early_queued(), 3);
+
+    sim.connect();
+
+    // The point of the exercise: they were on the wire ahead of the packet that
+    // completed the negotiation, so they are already delivered by the moment it
+    // completes. `post_connect` also queues them as ordinary messages, which
+    // would deliver them a round trip later and pass every assertion below —
+    // this is what separates the early path from that fallback.
+    assert_eq!(sim.a_got.len(), early.len(), "B's early data had not arrived by {}us", sim.now);
+    assert_eq!(sim.b_got.len(), early.len(), "A's early data had not arrived by {}us", sim.now);
+
+    // One ordinary message behind them, to pin down that the early ones are
+    // first rather than merely present.
+    let late = bytes::Bytes::from(message(9, 200));
+    assert_eq!(
+        sim.a.send_msg(late.clone(), None, true, sim.now, &mut sim.a_tx),
+        SendOutcome::Queued
+    );
+    sim.drain(Side::A);
+
+    for _ in 0..MAX_STEPS {
+        if sim.b_got.len() > early.len() && sim.a_got.len() >= early.len() {
+            break;
+        }
+        if !sim.step() {
+            break;
+        }
+    }
+
+    let mut expected = early.clone();
+    assert_eq!(sim.a_got, expected, "A did not get B's early data exactly once");
+    expected.push(late);
+    assert_eq!(sim.b_got, expected, "B did not get A's early data exactly once");
 }

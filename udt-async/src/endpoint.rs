@@ -345,6 +345,7 @@ impl Endpoint {
                 max_unsegmented: shared.max_unsegmented,
             }),
             connected,
+            gate: None,
         })
     }
 
@@ -355,12 +356,21 @@ impl Endpoint {
     /// punches a hole in its own firewall or NAT for the other, which lets two
     /// peers connect with no listener in between.
     ///
+    /// Like [`connect`](Self::connect), this returns once the handshake is
+    /// under way rather than once it has finished, so early data can be queued
+    /// on the [`Connecting`] with [`try_send`](Connecting::try_send). Rendezvous
+    /// sends a RESPONSE where the active role sends a conclusion, and early data
+    /// rides that the same way.
+    ///
+    /// Awaiting it resolves to the established [`Connection`].
+    ///
     /// # Errors
     ///
-    /// Returns [`ErrorKind::TimedOut`] if the peer never appears.
+    /// Fails here if the address cannot be resolved. Awaiting the [`Connecting`]
+    /// returns [`ErrorKind::TimedOut`] if the peer never appears.
     ///
     /// [`ErrorKind::TimedOut`]: std::io::ErrorKind::TimedOut
-    pub async fn connect_rendezvous(&self, peer: impl ToSocketAddrs) -> io::Result<Connection> {
+    pub async fn connect_rendezvous(&self, peer: impl ToSocketAddrs) -> io::Result<Connecting> {
         let peer = resolve(peer).await?;
 
         // One rendezvous handshake to a given peer at a time.
@@ -389,7 +399,11 @@ impl Endpoint {
             let mut locks = lock(&self.inner.rendezvous_locks);
             Arc::clone(locks.entry(peer).or_default())
         };
-        let _held = gate.lock().await;
+        // Owned, so it can travel in the `Connecting` and be released when the
+        // handshake ends rather than when this call returns — which is now
+        // before the handshake has even gone out. `lock_owned` consumes the
+        // clone above, leaving the map's own reference the only other one.
+        let held = gate.lock_owned().await;
 
         let conn = ProtoConnection::new_rendezvous(
             next_socket_id(),
@@ -399,27 +413,11 @@ impl Endpoint {
             self.inner.cfg.congestion,
         );
         let (socket, connected) = spawn_shared(&self.inner, conn, peer);
-        let outcome = connected
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "rendezvous timed out"));
-
-        // Release before checking, or our own two references keep the count
-        // above one and the entry is never collected.
-        drop(_held);
-        drop(gate);
-
-        // Drop the entry once nobody else is waiting, so a long-lived endpoint
-        // does not keep one per address it has ever dialled. Anyone already
-        // queued holds an `Arc`, which keeps the count above one and leaves it
-        // in place for them.
-        {
-            let mut locks = lock(&self.inner.rendezvous_locks);
-            if locks.get(&peer).is_some_and(|g| Arc::strong_count(g) == 1) {
-                locks.remove(&peer);
-            }
-        }
-        outcome?;
-        Ok(socket)
+        Ok(Connecting {
+            conn: Some(socket),
+            connected,
+            gate: Some(RendezvousGate { inner: Arc::clone(&self.inner), peer, held: Some(held) }),
+        })
     }
 
     /// Accepts incoming connections on this endpoint's address.
@@ -471,6 +469,36 @@ async fn resolve(addr: impl ToSocketAddrs) -> io::Result<SocketAddr> {
         .await?
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no address to connect to"))
+}
+
+/// A rendezvous handshake's turn at a peer address, held for as long as the
+/// handshake runs. See [`Endpoint::connect_rendezvous`] for what it protects.
+///
+/// It rides in the [`Connecting`] rather than in the call that started it,
+/// because that call now returns the moment the handshake is under way. It is
+/// released on completion, and on drop for a handshake abandoned before then.
+pub(crate) struct RendezvousGate {
+    inner: Arc<EndpointInner>,
+    peer: SocketAddr,
+    /// `None` once released. Owned rather than borrowed so it can outlive the
+    /// call that took it.
+    held: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for RendezvousGate {
+    fn drop(&mut self) {
+        // Release before counting, or our own reference keeps the count above
+        // one and the entry is never collected.
+        self.held = None;
+        // Drop the entry once nobody else is waiting, so a long-lived endpoint
+        // does not keep one per address it has ever dialled. Anyone already
+        // queued holds an `Arc`, which keeps the count above one and leaves it
+        // in place for them.
+        let mut locks = lock(&self.inner.rendezvous_locks);
+        if locks.get(&self.peer).is_some_and(|g| Arc::strong_count(g) == 1) {
+            locks.remove(&self.peer);
+        }
+    }
 }
 
 /// Route `peer` to a new connection, start driving it, and hand back the

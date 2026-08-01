@@ -114,6 +114,11 @@ special handling and cannot tell the difference. That is enough to fit a
 cryptographic handshake — Noise `IK`, `NK`, `KK` — inside establishment rather
 than after it.
 
+`connect_rendezvous` returns the same `Connecting` and carries early data the
+same way, in both directions at once — which is the shape a peer-to-peer `XX`
+or `KK` wants. Which end takes which Noise role is settled above this layer;
+the transport delivers both and says nothing about them.
+
 `try_send` is not async on purpose: the only thing waiting could buy is room in
 the send window, and that is freed by acknowledgements, which cannot arrive
 until the handshake it is racing has finished. For the same reason there is no

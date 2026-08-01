@@ -45,7 +45,9 @@
 //! ```
 //!
 //! Two peers behind firewalls can also reach each other directly with
-//! [`Endpoint::connect_rendezvous`], with no listener on either side.
+//! [`Endpoint::connect_rendezvous`], with no listener on either side. It
+//! returns the same [`Connecting`], so early data rides a rendezvous handshake
+//! too — in both directions at once.
 //!
 //! # Choosing message sizes
 //!

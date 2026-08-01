@@ -317,15 +317,20 @@ payload. A pattern like `XX` has to decide which end takes which role, and that
 belongs above this layer — the transport delivers both and says nothing about
 them.
 
-## Sequencing## Sequencing
+## Sequencing
 
-The payload is not stream data and must not consume a sequence number — the
-connection's first data packet should still be the ISN. It is delivered
-out-of-band, once, at accept time.
+An early draft had the payload delivered out of band, consuming no sequence
+number. What shipped is the opposite, and it is much less machinery: an early
+message *is* an ordinary message, at the ISN and the ones after it, and the copy
+that rides the handshake is an **extra transmission** of it. It is also placed in
+the send buffer the moment there is one, so acknowledgement, loss recovery,
+duplicate suppression and ordering are all the paths that already exist. A peer
+that ignores the early copy is indistinguishable from loss, and recovered the
+same way.
 
-The listener currently builds its `Connection` *after* the handshake completes,
-so a payload accepted on the first packet has to be held across that boundary
-and attached to the connection when it is created.
+The listener still builds its `Connection` *after* the handshake completes, so a
+payload accepted on the first packet is held across that boundary and attached
+as the connection is created.
 
 ## API
 
@@ -477,81 +482,41 @@ It also means the feature is testable without any API at all on one side.
 
 ### What is deliberately not offered
 
-- **A stream of early data.** One message, because one message is what fits
-  beside a handshake. Anything larger belongs after establishment.
+- **A stream of early data.** Messages, not bytes, and a bounded number of them
+  (`MAX_EARLY_MESSAGES`), because the opening congestion window is what they
+  have to travel in. Queue past that and they are held rather than refused, and
+  go out the moment the connection completes — which is what would have happened
+  to them anyway. Anything larger belongs after establishment.
 - **Early data on `accept`.** The listener cannot speak before it has heard, so
   there is nothing for it to send early. Its reply rides the accept regardless.
+- **A `try_recv` on `Connecting`.** The mirror of the above: the peer has
+  nothing to say until it has accepted.
 
-## Rendezvous is the easy case, not the hard one
+## What shipped
 
-The doc above treated rendezvous as an afterthought. It is the opposite, and for
-a peer-to-peer system it is probably the path that matters.
+The conclusion-phase variant, for both roles that negotiate one.
 
-Rendezvous sends `cookie: 0` — there is no challenge, and no address validation
-of any kind. That sounds worse and is better, because of what it replaces:
-**a rendezvous peer already holds state for the address it is connecting to.**
-The application called `connect_rendezvous(peer)`, so a `Connection` exists,
-pending, before anything is sent.
+- `Endpoint::connect` and `Endpoint::connect_rendezvous` both return
+  `io::Result<Connecting>`: the handshake is under way, not finished.
+- `Connecting::try_send` queues an early message. Not `async`, deliberately —
+  the only thing waiting could buy is room in the send window, and that is
+  freed by acknowledgements, which cannot arrive until the handshake it is
+  racing has finished.
+- Awaiting the `Connecting` yields the established `Connection`.
+- `Connection::queue_early` in `udt-proto` is the sans-IO half, allowed in
+  either `Connecting` mode. The active role emits ahead of its conclusion, and
+  rendezvous ahead of the RESPONSE that plays the same part; a listener-side
+  connection is built already connected and so has neither.
 
-A payload arriving from that address is matched against state the local
-application deliberately created. There is no pool, no speculative allocation,
-and no new exposure — the number of pending rendezvous connections is bounded by
-the local application's own behaviour, not by an attacker's. Reordering is a
-non-issue for the same reason: the state to match against exists before either
-datagram is sent.
+True first-packet 0-RTT — data on the very first datagram, before any challenge
+— is **not** built. Everything in *Amplification*, *Replay* and *Ordering*
+above applies to it and none of it is resolved; the pool, the per-address cap
+and the pressure fallback described there remain a design, not code. The
+conclusion is address-validated, which is what makes the shipped version cost
+nothing to defend.
 
-So rendezvous gets true 0-RTT essentially for free, while connect/accept is
-where all the difficulty lives. If the motivating use is peer-to-peer with a
-Noise handshake over rendezvous, **that is the version to build first**, and it
-can ship without resolving the pool question at all.
-
-The remaining wrinkle is symmetry: both peers are initiators and both may send a
-payload. A pattern like `XX` has to decide which end takes which role, and that
-belongs above this layer — the transport delivers both and says nothing about
-them.
-
-## Sequencing## Sequencing
-
-The payload is not stream data and must not consume a sequence number — the
-connection's first data packet should still be the ISN. It is delivered
-out-of-band, once, at accept time.
-
-The listener currently builds its `Connection` *after* the handshake completes,
-so a payload accepted on the first packet has to be held across that boundary
-and attached to the connection when it is created.
-
-## API shape
-
-```rust
-// client
-let conn = endpoint.connect_with_data(peer, &noise_msg1).await?;
-
-// server
-let (socket, early) = listener.accept_with_data().await?;
-```
-
-`early` is `Option<Bytes>` — `None` when the peer sent nothing, or when the
-listener was under pressure and dropped it. An application must handle `None` by
-falling back to its normal handshake, because it will happen.
-
-The existing `connect` and `accept` keep their signatures and behaviour.
-
-## Rendezvous
-
-Both peers send handshakes simultaneously and neither is a listener, so there is
-no cookie challenge and no unverified-peer problem in the same shape — but also
-no obvious "first" side. Both payloads would be carried, and an upper layer doing
-`XX` or `KK` has to resolve which role each end takes.
-
-Supporting it in the first version is optional and saying no is defensible. The
-connect/accept path is where the round trips actually hurt.
-
-## Order of work
-
-1. Test whether both C++ implementations tolerate trailing bytes on a handshake.
-   Everything below depends on the answer.
-2. Decide the pool budget and whether the padding requirement is on by default.
-3. Wire format and codec, with a fuzz target, since this parses attacker-supplied
-   bytes before any validation has happened.
-4. Listener state and the pressure fallback.
-5. API, then rendezvous if wanted.
+Rendezvous is the exception the *easy case* section predicted: it needs no pool
+at all, because both peers hold a pending `Connection` for the address before
+either sends a packet, so early data is routed to state the local application
+deliberately created. Both ends may send, and which end takes which Noise role
+is settled above this layer.

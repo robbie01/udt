@@ -392,6 +392,13 @@ pub struct Connection {
     no_progress_since_us: Option<u64>,
     /// Whether the peer has ever acknowledged a single byte of data.
     data_ever_acked: bool,
+    /// When a packet was last received from the peer.
+    ///
+    /// Distinct from `last_rsp_us`, which the expiry timer also resets so that
+    /// it does not immediately re-fire. That makes `last_rsp_us` a record of
+    /// when we last looked rather than of when the peer last spoke, and the
+    /// black-hole check needs the second one.
+    last_peer_us: u64,
     /// When the last full ACK was emitted, for re-ACK rate limiting.
     last_ack_us: u64,
     exp_count: u32,
@@ -585,6 +592,7 @@ impl Connection {
             exp_without_progress: 0,
             no_progress_since_us: None,
             data_ever_acked: false,
+            last_peer_us: now_us,
             last_ack_us: now_us,
             exp_count: 1,
             next_cwarn_us: 0,
@@ -705,6 +713,8 @@ impl Connection {
         if !ok {
             return;
         }
+        // Past the address and identifier checks, so this really is the peer.
+        self.last_peer_us = now_us;
         match pkt {
             Packet::Data { header, payload } => self.recv_data(header, payload, now_us, tx, out),
             Packet::Control { header: _, body } => self.recv_ctrl(body, now_us, tx, out),
@@ -859,9 +869,18 @@ impl Connection {
             // retransmits into the void indefinitely.
             let stalled_for =
                 self.no_progress_since_us.map_or(0, |since| now_us.saturating_sub(since));
+            // A peer that has said nothing since the stall began is not
+            // evidence of a black hole, and `shrink_path` re-sends data it
+            // cannot know the fate of. See the argument on `shrink_path`: it is
+            // sound only while the peer is answering, because an answering peer
+            // that had received data would be acknowledging it. A silent peer
+            // is a path dead in both directions, which halving cannot mend and
+            // the hard timeout already handles.
+            let peer_answered = self.no_progress_since_us.is_some_and(|s| self.last_peer_us > s);
             if self.exp_without_progress >= BLACK_HOLE_EXP_COUNT
                 && stalled_for >= BLACK_HOLE_MIN_US
                 && !self.data_ever_acked
+                && peer_answered
                 && !self.snd_buf_is_empty()
             {
                 // The path answers but carries nothing we send, so the packets
@@ -950,16 +969,17 @@ impl Connection {
     /// same way.
     ///
     /// Must be called before the handshake completes; afterwards there is no
-    /// conclusion left to ride and it is refused. Only the active
-    /// (`connect`-side) role sends a conclusion, so it does nothing for a
-    /// rendezvous or listener connection.
+    /// conclusion left to ride and it is refused. Both roles that negotiate one
+    /// can carry it: the active (`connect`-side) role rides the conclusion, and
+    /// rendezvous rides the RESPONSE that plays the same part. A listener-side
+    /// connection is built already connected and so has neither.
     ///
     /// Each payload must fit a single packet, and at most
     /// [`MAX_EARLY_MESSAGES`] may be queued — the opening congestion window is
     /// what they have to travel in, so more than that could not go out early
     /// anyway.
     pub fn queue_early(&mut self, payload: Bytes) -> bool {
-        if !matches!(self.state, ConnState::Connecting { mode: ConnMode::Active, .. })
+        if !matches!(self.state, ConnState::Connecting { .. })
             || payload.len() > self.payload_size as usize
             || payload.is_empty()
             || self.early.len() >= MAX_EARLY_MESSAGES
@@ -968,6 +988,66 @@ impl Connection {
         }
         self.early.push(payload);
         true
+    }
+
+    /// Puts the queued early messages on the wire, ahead of the handshake
+    /// packet that concludes the negotiation.
+    ///
+    /// Early data goes out *before* that packet, not after. The conclusion is
+    /// what completes the handshake, and a listener hands the connection away
+    /// the instant it processes one. A data packet behind it arrives to find
+    /// the connection gone from the listener and no route to it yet. Ahead of
+    /// it, the listener holds it and attaches it as it accepts, which needs no
+    /// timing luck.
+    ///
+    /// See [`queue_early`](Self::queue_early): this is an extra transmission of
+    /// a message that is also queued normally once there is a send buffer, so
+    /// nothing here owns its delivery.
+    ///
+    /// `peer_socket_id` is the one the peer's handshake just supplied, since
+    /// this connection has not been told an id to use yet. The sequence number
+    /// is the ISN, where the receiver's buffer starts, so it lands where the
+    /// first data packet was always going to.
+    ///
+    /// One packet per message, numbered from the ISN in queue order. The send
+    /// buffer is filled from the same list in the same order at `post_connect`,
+    /// so it arrives at the same numbers — which is what makes the early copy a
+    /// duplicate the receiver discards rather than a second message.
+    ///
+    /// The negotiated payload size can be smaller than this end offered, since
+    /// the peer's handshake carries its MSS. A message that no longer fits one
+    /// packet would span two and shift everything after it, so emission stops
+    /// there; those messages still travel by the ordinary path.
+    fn emit_early(
+        &mut self,
+        peer_mss: u32,
+        peer_socket_id: u32,
+        now_us: u64,
+        tx: &mut TransmitBuf,
+    ) {
+        if self.early_sent {
+            return;
+        }
+        self.early_sent = true;
+        let negotiated = peer_mss.min(self.mss).max(MIN_MSS);
+        let early_payload = negotiated.saturating_sub(IP_AND_UDP_OVERHEAD + UDT_HEADER_SIZE as u32);
+        for (i, payload) in self.early.iter().enumerate() {
+            if payload.len() > early_payload as usize {
+                break;
+            }
+            let hdr = codec::encode_data_header(
+                self.local_isn + i as u32,
+                MsgBoundary::Solo,
+                true,
+                MsgNo::new(i as u32),
+                self.ts(now_us),
+                peer_socket_id,
+            );
+            tx.push(|dst| {
+                dst.extend_from_slice(&hdr);
+                dst.extend_from_slice(payload);
+            });
+        }
     }
 
     /// How many early messages are queued.
@@ -1232,10 +1312,22 @@ impl Connection {
     /// Returns whether it was worth trying. `false` means give up: either there
     /// is no room left to shrink into, or the data no longer fits.
     ///
-    /// Only reachable while `data_ever_acked` is false — nothing this side sent
-    /// has ever arrived — which is what makes restarting safe. Nothing the peer
-    /// has delivered to its application can be disturbed, because it has
-    /// delivered nothing.
+    /// Restarting re-sends data under numbering the peer has never seen, so it
+    /// is safe only where the peer cannot already have delivered any of it.
+    /// Two conditions together give that, and the caller checks both:
+    ///
+    /// - `data_ever_acked` is false, so nothing has been *acknowledged*; and
+    /// - the peer has spoken since the stall began.
+    ///
+    /// The second is the one that does the work. On its own the first says
+    /// only that no acknowledgement came back, which a dead return path
+    /// explains just as well as a black hole — and on that path the peer may
+    /// have delivered everything, so re-sending it duplicates. A peer that is
+    /// answering settles it: a receiver whose sequence cursor had advanced
+    /// would be sending acknowledgements, and an acknowledgement is a control
+    /// packet like the one that just arrived, so a path carrying the second
+    /// carries the first. Answering but never acknowledging therefore means it
+    /// has received nothing to acknowledge.
     ///
     /// The sequence numbers already spent are the problem, not the data. Blocks
     /// are chunked at [`SendBuffer::add`] time and one block is one sequence
@@ -1573,59 +1665,9 @@ impl Connection {
                         *last_req_us = 0; // resend immediately
                         *attempts = 0;
                     }
-                    // Early data goes out *before* the conclusion, not after.
-                    //
-                    // The conclusion is what completes the handshake, and the
-                    // listener hands the connection away the instant it
-                    // processes one. A data packet behind it arrives to find
-                    // the connection gone from the listener and no route to it
-                    // yet. Ahead of it, the listener holds it and attaches it
-                    // as it accepts, which needs no timing luck.
-                    //
-                    // See `set_early_data`: this is an extra transmission of a
-                    // message that is also queued normally once there is a send
-                    // buffer, so nothing here owns its delivery.
-                    //
                     // Addressed to the listener's socket id, which the challenge
-                    // just supplied — the connection's own does not exist yet.
-                    // The sequence number is the ISN, where the receiver's
-                    // buffer starts, so it lands where the first data packet was
-                    // always going to.
-                    //
-                    // One packet per message, numbered from the ISN in queue
-                    // order. The send buffer is filled from the same list in
-                    // the same order at `post_connect`, so it arrives at the
-                    // same numbers -- which is what makes the early copy a
-                    // duplicate the receiver discards rather than a second
-                    // message.
-                    //
-                    // The negotiated payload size can be smaller than this end
-                    // offered, since the challenge carries the peer's MSS. A
-                    // message that no longer fits one packet would span two and
-                    // shift everything after it, so emission stops there; those
-                    // messages still travel by the ordinary path.
-                    let negotiated = (hs.mss as u32).min(self.mss).max(MIN_MSS);
-                    let first_time = !self.early_sent;
-                    self.early_sent = true;
-                    let early_payload =
-                        negotiated.saturating_sub(IP_AND_UDP_OVERHEAD + UDT_HEADER_SIZE as u32);
-                    for (i, payload) in self.early.iter().enumerate() {
-                        if !first_time || payload.len() > early_payload as usize {
-                            break;
-                        }
-                        let hdr = codec::encode_data_header(
-                            self.local_isn + i as u32,
-                            MsgBoundary::Solo,
-                            true,
-                            MsgNo::new(i as u32),
-                            self.ts(now_us),
-                            hs.socket_id as u32,
-                        );
-                        tx.push(|dst| {
-                            dst.extend_from_slice(&hdr);
-                            dst.extend_from_slice(payload);
-                        });
-                    }
+                    // just supplied.
+                    self.emit_early(hs.mss as u32, hs.socket_id as u32, now_us, tx);
                     tx.push(|dst| codec::encode_handshake(&new_req, self.ts(now_us), 0, dst));
                 } else if hs.req_type == req_type::RESPONSE {
                     // Server confirmation — connection complete
@@ -1672,6 +1714,16 @@ impl Connection {
                         *attempts = 0;
                         *last_peer_hs = Some(hs.clone());
                     }
+                    // Rendezvous has no listener to hold anything: the peer
+                    // built its `Connection` before either side sent a packet,
+                    // so early data reaches it directly. Arriving ahead of our
+                    // RESPONSE it may find the peer still negotiating, in which
+                    // case `try_rendezvous_complete` finishes the handshake off
+                    // the request it already cached and the data lands in the
+                    // buffer that creates. If it has cached nothing yet the
+                    // packet is dropped, which is the loss case the ordinary
+                    // copy in the send buffer already covers.
+                    self.emit_early(hs.mss as u32, hs.socket_id as u32, now_us, tx);
                     tx.push(|dst| codec::encode_handshake(&new_req, self.ts(now_us), 0, dst));
                 } else if local_req_type == req_type::RESPONSE && recv_req_type == req_type::RESPONSE {
                     // Both at -1 → complete

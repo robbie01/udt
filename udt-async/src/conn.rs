@@ -446,6 +446,10 @@ impl SendOptions {
 pub struct Connecting {
     pub(crate) conn: Option<Connection>,
     pub(crate) connected: oneshot::Receiver<()>,
+    /// A rendezvous handshake's turn at the peer address, released as soon as
+    /// this settles. `None` for every other kind of connect, which needs no
+    /// turn. See [`Endpoint::connect_rendezvous`](crate::Endpoint::connect_rendezvous).
+    pub(crate) gate: Option<crate::endpoint::RendezvousGate>,
 }
 
 impl Connecting {
@@ -503,13 +507,21 @@ impl std::future::Future for Connecting {
         match std::pin::Pin::new(&mut self.connected).poll(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(())) => {
+                // Settled, so any turn taken to get here is over. Released
+                // now rather than left to the drop, so the next rendezvous to
+                // this peer starts without waiting on what the caller does
+                // with the value it has just been handed.
+                self.gate = None;
                 let conn = self.conn.take().expect("polled after completion");
                 Poll::Ready(Ok(conn))
             }
-            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "connect handshake failed",
-            ))),
+            Poll::Ready(Err(_)) => {
+                self.gate = None;
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "connect handshake failed",
+                )))
+            }
         }
     }
 }
