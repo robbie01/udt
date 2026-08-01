@@ -313,16 +313,6 @@ impl SendOptions {
         Self::default()
     }
 
-    /// Gives up on the message if it has not been delivered within `ttl`.
-    ///
-    /// The peer is told to skip it and the connection carries on with the next
-    /// message. Without a TTL a message is retried until it arrives or the
-    /// connection fails.
-    ///
-    /// Resolution is one millisecond, and that is a floor rather than a round:
-    /// a shorter deadline is treated as one millisecond, because zero means
-    /// something else: zero means expire the message as soon as any time has
-    /// passed, so it may never be transmitted at all.
     /// Sends the message once and never retries it.
     ///
     /// It goes out at the moment it is queued and is abandoned immediately
@@ -342,6 +332,17 @@ impl SendOptions {
         self
     }
 
+    /// Gives up on the message if it has not been delivered within `ttl`.
+    ///
+    /// The peer is told to skip it and the connection carries on with the next
+    /// message. Without a TTL a message is retried until it arrives or the
+    /// connection fails.
+    ///
+    /// Resolution is one millisecond, and that is a floor rather than a round:
+    /// a shorter deadline is treated as one millisecond. Zero is not reachable
+    /// here on purpose, because it does not mean "no time" — it means send once
+    /// and never retry, which [`best_effort`](Self::best_effort) asks for by
+    /// name.
     pub fn ttl(mut self, ttl: Duration) -> Self {
         self.ttl = Some(ttl);
         self
