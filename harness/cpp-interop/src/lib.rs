@@ -96,16 +96,26 @@ mod tests {
 
         let (sock_a, sock_b) = tokio::join!(
             async {
-                tokio::time::timeout(Duration::from_secs(5), ep_a.connect_rendezvous(addr_b))
-                    .await
-                    .expect("rendezvous A timed out")
-                    .expect("rendezvous A failed")
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    ep_a.connect_rendezvous(addr_b)
+                        .await
+                        .expect("rendezvous A not started")
+                        .await
+                })
+                .await
+                .expect("rendezvous A timed out")
+                .expect("rendezvous A failed")
             },
             async {
-                tokio::time::timeout(Duration::from_secs(5), ep_b.connect_rendezvous(addr_a))
-                    .await
-                    .expect("rendezvous B timed out")
-                    .expect("rendezvous B failed")
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    ep_b.connect_rendezvous(addr_a)
+                        .await
+                        .expect("rendezvous B not started")
+                        .await
+                })
+                .await
+                .expect("rendezvous B timed out")
+                .expect("rendezvous B failed")
             }
         );
         (sock_a, sock_b)
@@ -198,10 +208,16 @@ mod tests {
                     .expect("cpp rendezvous failed")
             },
             async {
-                tokio::time::timeout(Duration::from_secs(5), rust_ep.connect_rendezvous(cpp_addr))
-                    .await
-                    .expect("rust rendezvous timed out")
-                    .expect("rust rendezvous failed")
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    rust_ep
+                        .connect_rendezvous(cpp_addr)
+                        .await
+                        .expect("rust rendezvous not started")
+                        .await
+                })
+                .await
+                .expect("rust rendezvous timed out")
+                .expect("rust rendezvous failed")
             }
         );
         (cpp_conn, rust_sock)
@@ -439,10 +455,15 @@ mod tests {
                 let ep_a = Arc::clone(&ep_a);
                 let _payload = vec![(i as u8).wrapping_add(0x61); 2000]; // 'a', 'b', 'c' repeated
                 tokio::spawn(async move {
-                    tokio::time::timeout(Duration::from_secs(5), ep_a.connect_rendezvous(addr_b))
-                        .await
-                        .expect("rendezvous A timed out")
-                        .expect("rendezvous A failed")
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        ep_a.connect_rendezvous(addr_b)
+                            .await
+                            .expect("rendezvous A not started")
+                            .await
+                    })
+                    .await
+                    .expect("rendezvous A timed out")
+                    .expect("rendezvous A failed")
                 })
             })
             .collect();
@@ -454,10 +475,12 @@ mod tests {
                 let ep_b = Arc::clone(ep_b);
                 let payload = vec![(i as u8).wrapping_add(0x61); 2000];
                 tokio::spawn(async move {
-                    let sock = tokio::time::timeout(
-                        Duration::from_secs(5),
-                        ep_b.connect_rendezvous(addr_a),
-                    )
+                    let sock = tokio::time::timeout(Duration::from_secs(5), async {
+                        ep_b.connect_rendezvous(addr_a)
+                            .await
+                            .expect("rendezvous B not started")
+                            .await
+                    })
                     .await
                     .expect("rendezvous B timed out")
                     .expect("rendezvous B failed");
