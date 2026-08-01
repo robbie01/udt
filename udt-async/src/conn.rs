@@ -48,10 +48,10 @@ pub(crate) enum SendReq {
 /// flow control, which is the mechanism meant to carry it.
 pub(crate) const RECV_BACKLOG: usize = 256;
 
-/// Send requests the application may queue before [`Socket::send`] waits.
+/// Send requests the application may queue before [`Connection::send`] waits.
 pub(crate) const SEND_BACKLOG: usize = 256;
 
-// ── Socket ────────────────────────────────────────────────────────────────────
+// ── Connection ────────────────────────────────────────────────────────────────────
 
 /// An established UDT connection.
 ///
@@ -60,16 +60,16 @@ pub(crate) const SEND_BACKLOG: usize = 256;
 /// respect it behaves like a connected [`UdpSocket`], but delivery is reliable
 /// and ordered by default.
 ///
-/// Every method takes `&self`, so a socket can be shared between tasks through
+/// Every method takes `&self`, so a connection can be shared between tasks through
 /// an `Arc` — one sending while another receives is the expected pattern.
 /// Concurrent receivers each get whole messages, but which task gets which is
 /// unspecified.
 ///
-/// Dropping the socket closes the connection once anything already sent has
+/// Dropping it closes the connection once anything already sent has
 /// been acknowledged.
 ///
 /// [`UdpSocket`]: tokio::net::UdpSocket
-pub struct Socket {
+pub struct Connection {
     pub(crate) send_tx: mpsc::Sender<SendReq>,
     pub(crate) recv_rx: flume::Receiver<Bytes>,
     pub(crate) peer_addr: SocketAddr,
@@ -94,7 +94,7 @@ pub struct Socket {
 /// Turn a recorded reason into the error a caller sees.
 ///
 /// The kinds are a coarse hint for code that matches on them; the precise
-/// answer is [`Socket::disconnect_reason`], which loses nothing.
+/// answer is [`Connection::disconnect_reason`], which loses nothing.
 pub(crate) fn closed_with(reason: Option<DisconnectReason>) -> io::Error {
     let (kind, msg) = match reason {
         Some(DisconnectReason::Shutdown) => {
@@ -117,7 +117,7 @@ pub(crate) fn closed_with(reason: Option<DisconnectReason>) -> io::Error {
     io::Error::new(kind, msg)
 }
 
-impl Socket {
+impl Connection {
     /// Why the connection ended, or `None` while it is still up.
     ///
     /// The errors returned by [`send`](Self::send) and [`recv`](Self::recv)
@@ -297,9 +297,9 @@ fn copy_into(msg: &[u8], buf: &mut [u8]) -> usize {
 
 // ── Send options ──────────────────────────────────────────────────────────────
 
-/// Per-message delivery options for [`Socket::send_with`].
+/// Per-message delivery options for [`Connection::send_with`].
 ///
-/// The default is reliable, ordered delivery, the same as [`Socket::send`].
+/// The default is reliable, ordered delivery, the same as [`Connection::send`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SendOptions {
     ttl: Option<Duration>,

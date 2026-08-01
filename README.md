@@ -83,12 +83,12 @@ use udt_async::Endpoint;
 
 async fn client() -> std::io::Result<()> {
     let endpoint = Endpoint::bind("0.0.0.0:0").await?;
-    let socket = endpoint.connect("203.0.113.7:9000").await?;
+    let conn = endpoint.connect("203.0.113.7:9000").await?;
 
-    socket.send(b"ping").await?;
+    conn.send(b"ping").await?;
 
     let mut buf = [0u8; 1500];
-    let n = socket.recv(&mut buf).await?;
+    let n = conn.recv(&mut buf).await?;
     println!("{:?}", &buf[..n]);
     Ok(())
 }
@@ -102,7 +102,7 @@ A connection can carry one message with its handshake, which arrives a round
 trip before the connection is otherwise usable:
 
 ```rust
-let socket = endpoint.connect_with_early_data(peer, &noise_msg1).await?;
+let conn = endpoint.connect_with_early_data(peer, &noise_msg1).await?;
 ```
 
 It arrives as the connection's first `recv`, so a server needs no special
@@ -112,7 +112,7 @@ than after it. It is an extra transmission of an ordinary message, so
 acknowledgement, retransmission and de-duplication are the usual ones, and a
 peer that ignores it costs one wasted packet.
 
-Every method takes `&self`, so a socket is shared between tasks with an `Arc`:
+Every method takes `&self`, so a connection is shared between tasks with an `Arc`:
 one sending while another receives is the expected pattern.
 
 Sending in large messages rather than many small ones is the single biggest

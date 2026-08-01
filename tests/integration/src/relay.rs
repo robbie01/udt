@@ -18,7 +18,7 @@ mod tests {
     use std::time::Duration;
 
     use tokio::net::UdpSocket;
-    use udt_async::{Endpoint, Socket};
+    use udt_async::{Connection, Endpoint};
 
     /// How the relay treats each datagram crossing it.
     #[derive(Clone, Copy)]
@@ -111,7 +111,7 @@ mod tests {
     }
 
     /// A connected pair whose traffic crosses a misbehaving relay.
-    async fn relayed_pair(cfg: RelayConfig) -> (Socket, Socket, Arc<RelayStats>) {
+    async fn relayed_pair(cfg: RelayConfig) -> (Connection, Connection, Arc<RelayStats>) {
         let server_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
         let listener = server_ep.listen(4).unwrap();
         let (relay_addr, stats) = spawn_relay(server_ep.local_addr(), cfg).await;
@@ -148,7 +148,7 @@ mod tests {
     }
 
     /// Send `count` messages one way and verify every byte arrives in order.
-    async fn verify_transfer(server: Socket, client: Socket, count: usize, size: usize) {
+    async fn verify_transfer(server: Connection, client: Connection, count: usize, size: usize) {
         let sender = tokio::spawn(async move {
             for i in 0..count {
                 client.send(&payload(i, size)).await.expect("send failed");

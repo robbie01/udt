@@ -38,7 +38,7 @@ const SEND_DRAIN_CAP: usize = 32;
 /// How long the driver parks when the state machine wants no timer at all.
 const IDLE_TICK: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The two things a driver publishes for its `Socket` to read.
+/// The two things a driver publishes for its `Connection` to read.
 ///
 /// Bundled because they are always created, cloned and passed together, and
 /// threading them separately through both entry points pushed the argument
@@ -68,7 +68,7 @@ struct Driver {
     blocked: Option<SendReq>,
     /// Resolved once the send buffer drains.
     pending_flush: Option<oneshot::Sender<()>>,
-    /// What this driver reports back to its `Socket`.
+    /// What this driver reports back to its `Connection`.
     shared: Shared,
     done: bool,
 }
@@ -99,7 +99,7 @@ impl Driver {
         }
     }
 
-    /// Republish protocol state where `Socket::stats` can read it.
+    /// Republish protocol state where `Connection::stats` can read it.
     fn publish_stats(&self) {
         let snapshot = self.conn.stats();
         match self.shared.stats.get() {

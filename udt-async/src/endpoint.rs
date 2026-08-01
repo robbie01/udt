@@ -12,10 +12,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use bytes::Bytes;
 use tokio::net::{ToSocketAddrs, UdpSocket};
 use tokio::sync::{Notify, mpsc, oneshot};
-use udt_proto::{CcKind, Connection, Listener as ProtoListener, ListenerEvent, SeqNo};
+use udt_proto::{
+    CcKind, Connection as ProtoConnection, Listener as ProtoListener, ListenerEvent, SeqNo,
+};
 
 use crate::batch::{BatchIo, Inbound, RecvBuffers};
-use crate::conn::{RECV_BACKLOG, SEND_BACKLOG, SendReq, Socket};
+use crate::conn::{Connection, RECV_BACKLOG, SEND_BACKLOG, SendReq};
 use crate::driver;
 use crate::util::{
     Mutex, RwLock, configure_udp_buffers, lock, next_socket_id, now_us, outgoing_bind_addr,
@@ -121,7 +123,7 @@ impl Default for EndpointConfig {
 
 struct ListenerSlot {
     proto: ProtoListener,
-    accept_tx: flume::Sender<Socket>,
+    accept_tx: flume::Sender<Connection>,
 }
 
 /// State the reader tasks and the [`Endpoint`] handle share.
@@ -199,12 +201,12 @@ impl EndpointInner {
 
 /// Accepts incoming UDT connections on a bound address.
 ///
-/// Created by [`Endpoint::listen`]. Like [`Socket`] it takes `&self`
+/// Created by [`Endpoint::listen`]. Like [`Connection`] it takes `&self`
 /// throughout, so several tasks can accept from one listener through an `Arc`.
 /// Dropping it stops accepting; connections already returned by
 /// [`accept`](Self::accept) stay open.
 pub struct Listener {
-    accept_rx: flume::Receiver<Socket>,
+    accept_rx: flume::Receiver<Connection>,
     local_addr: SocketAddr,
 }
 
@@ -216,7 +218,7 @@ impl Listener {
     /// Returns [`ErrorKind::BrokenPipe`] if the endpoint has shut down.
     ///
     /// [`ErrorKind::BrokenPipe`]: std::io::ErrorKind::BrokenPipe
-    pub async fn accept(&self) -> io::Result<Socket> {
+    pub async fn accept(&self) -> io::Result<Connection> {
         self.accept_rx
             .recv_async()
             .await
@@ -243,8 +245,8 @@ impl Listener {
 /// use udt_async::Endpoint;
 /// # async fn f() -> std::io::Result<()> {
 /// let endpoint = Endpoint::bind("0.0.0.0:0").await?;
-/// let socket = endpoint.connect("203.0.113.7:9000").await?;
-/// socket.send(b"hello").await?;
+/// let conn = endpoint.connect("203.0.113.7:9000").await?;
+/// conn.send(b"hello").await?;
 /// # Ok(()) }
 /// ```
 ///
@@ -308,7 +310,7 @@ impl Endpoint {
     /// Returns [`ErrorKind::TimedOut`] if the peer does not answer.
     ///
     /// [`ErrorKind::TimedOut`]: std::io::ErrorKind::TimedOut
-    pub async fn connect(&self, peer: impl ToSocketAddrs) -> io::Result<Socket> {
+    pub async fn connect(&self, peer: impl ToSocketAddrs) -> io::Result<Connection> {
         self.connect_inner(peer, None).await
     }
 
@@ -317,7 +319,7 @@ impl Endpoint {
     /// UDT establishes in two round trips, so the first byte of data normally
     /// costs both. `early` travels with the handshake's final packet and
     /// reaches the peer a round trip sooner — it arrives as the connection's
-    /// first message, so a server reads it from [`Socket::recv`] exactly as it
+    /// first message, so a server reads it from [`Connection::recv`] exactly as it
     /// would read anything else and needs no special handling.
     ///
     /// The motivating case is starting a cryptographic handshake, where this
@@ -344,7 +346,7 @@ impl Endpoint {
         &self,
         peer: impl ToSocketAddrs,
         early: &[u8],
-    ) -> io::Result<Socket> {
+    ) -> io::Result<Connection> {
         self.connect_inner(peer, Some(Bytes::copy_from_slice(early))).await
     }
 
@@ -352,7 +354,7 @@ impl Endpoint {
         &self,
         peer: impl ToSocketAddrs,
         early: Option<Bytes>,
-    ) -> io::Result<Socket> {
+    ) -> io::Result<Connection> {
         let peer = resolve(peer).await?;
         let std_sock = std::net::UdpSocket::bind(outgoing_bind_addr(self.inner.local_addr, peer))?;
         std_sock.set_nonblocking(true)?;
@@ -360,7 +362,7 @@ impl Endpoint {
         let socket = Arc::new(UdpSocket::from_std(std_sock)?);
         let local_addr = socket.local_addr()?;
 
-        let mut conn = Connection::new_active(
+        let mut conn = ProtoConnection::new_active(
             next_socket_id(),
             random_isn(),
             self.inner.cfg.mss,
@@ -392,7 +394,7 @@ impl Endpoint {
         connected
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect handshake failed"))?;
-        Ok(Socket {
+        Ok(Connection {
             send_tx,
             recv_rx,
             peer_addr: peer,
@@ -414,7 +416,7 @@ impl Endpoint {
     /// Returns [`ErrorKind::TimedOut`] if the peer never appears.
     ///
     /// [`ErrorKind::TimedOut`]: std::io::ErrorKind::TimedOut
-    pub async fn connect_rendezvous(&self, peer: impl ToSocketAddrs) -> io::Result<Socket> {
+    pub async fn connect_rendezvous(&self, peer: impl ToSocketAddrs) -> io::Result<Connection> {
         let peer = resolve(peer).await?;
 
         // One rendezvous handshake to a given peer at a time.
@@ -445,7 +447,7 @@ impl Endpoint {
         };
         let _held = gate.lock().await;
 
-        let conn = Connection::new_rendezvous(
+        let conn = ProtoConnection::new_rendezvous(
             next_socket_id(),
             random_isn(),
             self.inner.cfg.mss,
@@ -490,7 +492,7 @@ impl Endpoint {
     ///
     /// Returns an error if the endpoint has shut down.
     pub fn listen(&self, backlog: usize) -> io::Result<Listener> {
-        let (accept_tx, accept_rx) = flume::bounded::<Socket>(backlog.max(1));
+        let (accept_tx, accept_rx) = flume::bounded::<Connection>(backlog.max(1));
         let proto = ProtoListener::new(
             next_socket_id(),
             self.inner.cfg.mss,
@@ -534,9 +536,9 @@ async fn resolve(addr: impl ToSocketAddrs) -> io::Result<SocketAddr> {
 /// arrive unrouted.
 fn spawn_shared(
     ep: &Arc<EndpointInner>,
-    conn: Connection,
+    conn: ProtoConnection,
     peer: SocketAddr,
-) -> (Socket, oneshot::Receiver<()>) {
+) -> (Connection, oneshot::Receiver<()>) {
     let (datagram_tx, datagram_rx) = mpsc::channel::<Inbound>(DATAGRAM_BACKLOG);
     let (send_tx, send_rx) = mpsc::channel::<SendReq>(SEND_BACKLOG);
     let (recv_tx, recv_rx) = flume::bounded::<Bytes>(RECV_BACKLOG);
@@ -565,7 +567,7 @@ fn spawn_shared(
         move || owner.remove_route(socket_id, peer),
     ));
 
-    let socket = Socket {
+    let socket = Connection {
         send_tx,
         recv_rx,
         peer_addr: peer,

@@ -14,12 +14,12 @@
 //!
 //! # async fn client() -> std::io::Result<()> {
 //! let endpoint = Endpoint::bind("0.0.0.0:0").await?;
-//! let socket = endpoint.connect("203.0.113.7:9000").await?;
+//! let conn = endpoint.connect("203.0.113.7:9000").await?;
 //!
-//! socket.send(b"ping").await?;
+//! conn.send(b"ping").await?;
 //!
 //! let mut buf = [0u8; 1500];
-//! let n = socket.recv(&mut buf).await?;
+//! let n = conn.recv(&mut buf).await?;
 //! assert_eq!(&buf[..n], b"pong");
 //! # Ok(()) }
 //! ```
@@ -33,11 +33,11 @@
 //! let endpoint = Endpoint::bind("0.0.0.0:9000").await?;
 //! let mut listener = endpoint.listen(128)?;
 //!
-//! while let Ok(socket) = listener.accept().await {
+//! while let Ok(conn) = listener.accept().await {
 //!     tokio::spawn(async move {
 //!         let mut buf = [0u8; 1500];
-//!         while let Ok(n) = socket.recv(&mut buf).await {
-//!             socket.send(&buf[..n]).await.ok();
+//!         while let Ok(n) = conn.recv(&mut buf).await {
+//!             conn.send(&buf[..n]).await.ok();
 //!         }
 //!     });
 //! }
@@ -60,8 +60,8 @@
 //!   here.
 //!
 //! [Tokio]: https://tokio.rs
-//! [`send`]: Socket::send
-//! [`recv`]: Socket::recv
+//! [`send`]: Connection::send
+//! [`recv`]: Connection::recv
 //! # Security
 //!
 //! UDT has no encryption and no authentication, and this crate adds none. On a
@@ -79,13 +79,13 @@ mod driver;
 mod endpoint;
 mod util;
 
-pub use conn::{SendOptions, Socket};
+pub use conn::{Connection, SendOptions};
 pub use endpoint::{
     DEFAULT_MTU, Endpoint, EndpointConfig, Listener, MAX_PAYLOAD_SIZE, max_payload_for_mtu,
 };
 
 pub use udt_proto::CcKind;
-/// A snapshot of protocol state — see [`Socket::stats`].
+/// A snapshot of protocol state — see [`Connection::stats`].
 pub use udt_proto::ConnectionStats;
-/// Why a connection ended — see [`Socket::disconnect_reason`].
+/// Why a connection ended — see [`Connection::disconnect_reason`].
 pub use udt_proto::DisconnectReason;

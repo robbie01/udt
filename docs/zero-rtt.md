@@ -342,12 +342,12 @@ payload, and the only question is whether the peer understood it.
 
 ```rust
 // unchanged
-let socket = endpoint.connect(peer).await?;
+let conn = endpoint.connect(peer).await?;
 
 // new: start the handshake, attach bytes to it, then await as before
 let mut connecting = endpoint.connect_early(peer)?;
 connecting.send_early(&noise_msg1)?;
-let socket = connecting.await?;
+let conn = connecting.await?;
 ```
 
 `connect_early` returns immediately — the handshake runs in the background, and
@@ -464,7 +464,7 @@ staying broken. It does mean `udt-async`'s route table, currently keyed on
 
 ```rust
 let socket = listener.accept().await?;
-let n = socket.recv(&mut buf).await?;   // noise msg1, early or not
+let n = conn.recv(&mut buf).await?;   // noise msg1, early or not
 ```
 
 This falls out of the transport being message-oriented, and it is the best part
@@ -524,7 +524,7 @@ and attached to the connection when it is created.
 
 ```rust
 // client
-let socket = endpoint.connect_with_data(peer, &noise_msg1).await?;
+let conn = endpoint.connect_with_data(peer, &noise_msg1).await?;
 
 // server
 let (socket, early) = listener.accept_with_data().await?;
