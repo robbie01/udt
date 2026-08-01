@@ -110,6 +110,19 @@ impl SendBuffer {
         self.slots[idx].as_ref().filter(|b| !b.dropped)
     }
 
+    /// Record `count` blocks at the head as already transmitted, without
+    /// reading them out again.
+    ///
+    /// For data that reached the wire before this buffer existed: early data
+    /// rides the handshake, and is added here afterwards so that the ordinary
+    /// acknowledgement and retransmission own it. It must not be *sent* from
+    /// here as well — that is a second copy of every early message — but it
+    /// must still count as in flight, or the acknowledgement covering it frees
+    /// more blocks than were sent.
+    pub fn mark_sent(&mut self, count: usize) {
+        self.sent = (self.sent + count).min(self.len);
+    }
+
     /// Read a specific in-flight block by offset from the ACK boundary (0 = oldest unacked).
     /// Used for retransmission. Returns None if the offset is out of range or the
     /// message was dropped, in which case the caller must not retransmit it.

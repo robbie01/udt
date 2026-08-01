@@ -126,9 +126,13 @@ until the handshake it is racing has finished. For the same reason there is no
 the opening window carries and the rest are held for the moment the connection
 completes, which is where they would have gone anyway.
 
-Each early message is an extra transmission of an ordinary one, so
-acknowledgement, retransmission and de-duplication are the usual paths, and a
-peer that ignores them costs one wasted packet apiece.
+Each early message is an ordinary one that happens to have travelled with the
+handshake, so acknowledgement, retransmission and de-duplication are the usual
+paths. It costs no extra packet: the send buffer treats what already went out as
+sent and waits one ACK period for the peer to confirm it. A peer that ignored the
+early copy — anything that does not expect data before the handshake finishes —
+confirms nothing, and the message is retransmitted from there, which is one ACK
+period rather than the round trip that was saved.
 
 Every method takes `&self`, so a connection is shared between tasks with an `Arc`:
 one sending while another receives is the expected pattern.

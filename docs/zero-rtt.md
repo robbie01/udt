@@ -321,12 +321,24 @@ them.
 
 An early draft had the payload delivered out of band, consuming no sequence
 number. What shipped is the opposite, and it is much less machinery: an early
-message *is* an ordinary message, at the ISN and the ones after it, and the copy
-that rides the handshake is an **extra transmission** of it. It is also placed in
-the send buffer the moment there is one, so acknowledgement, loss recovery,
-duplicate suppression and ordering are all the paths that already exist. A peer
-that ignores the early copy is indistinguishable from loss, and recovered the
-same way.
+message *is* an ordinary message, at the ISN and the ones after it, placed in
+the send buffer the moment there is one — so acknowledgement, loss recovery,
+duplicate suppression and ordering are all the paths that already exist.
+
+The copy that rides the handshake was at first an **extra** transmission: the
+buffer sent its own copy the instant the connection opened, and the peer threw
+that one away by sequence number. It cost a packet per early message, on every
+connection that used the feature, which is most of what the feature was trying
+to save. It is now the *only* transmission — the buffer counts those sequences
+as sent and holds them in flight.
+
+That needs a bound, because "in flight" is a guess here in a way it never is
+elsewhere. A peer that ignored the early copy will not acknowledge it, and
+nothing follows it to open a gap it would NAK, so the sender would be waiting on
+evidence that is never coming. One ACK period after the connection opens, an
+unacknowledged early message goes on the loss list and is retransmitted like
+anything else. The expiry timer would eventually do the same, but it is a round
+trip and four deviations out — measured at 161 ms against 35 ms on a 50 ms path.
 
 The listener still builds its `Connection` *after* the handshake completes, so a
 payload accepted on the first packet is held across that boundary and attached

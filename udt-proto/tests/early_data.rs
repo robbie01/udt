@@ -376,3 +376,201 @@ fn a_message_queued_after_the_challenge_still_goes_out_early() {
         "the accepted connection did not have the message already"
     );
 }
+
+/// The happy path must cost one transmission per message, not two.
+///
+/// Early data is added to the send buffer at `post_connect` so the ordinary
+/// machinery owns it, and for a long time it was also *sent* from there
+/// immediately — so every early message went out twice, on every connection
+/// that used the feature, and the peer discarded the second copy by sequence
+/// number. The saved round trip was real and so was the doubled packet count.
+#[test]
+fn the_early_copy_is_the_only_copy_when_it_arrives() {
+    let msgs: Vec<&[u8]> = vec![b"noise e", b"noise es", b"payload"];
+    let (mut client, mut server, _) = handshake_many(msgs.clone());
+
+    // Let both ends run: the server acknowledges what it was handed at accept,
+    // and the client must conclude it has nothing to send.
+    let mut now = 100_000u64;
+    let mut client_data = 0usize;
+    for _ in 0..200 {
+        now += 1_000;
+        let mut ctx = TransmitBuf::new();
+        let mut cev = Vec::new();
+        client.on_timer(now, &mut ctx, &mut cev);
+        let mut to_server: Vec<Bytes> = Vec::new();
+        for (bytes, segment) in ctx.runs() {
+            for chunk in bytes.chunks(segment.max(1)) {
+                to_server.push(Bytes::copy_from_slice(chunk));
+            }
+        }
+        for datagram in to_server {
+            // Control packets carry the high bit; anything else is data.
+            if datagram.first().is_some_and(|b| b & 0x80 == 0) {
+                client_data += 1;
+            }
+            let mut stx = TransmitBuf::new();
+            let mut sev = Vec::new();
+            server.on_datagram(datagram, now, &mut stx, &mut sev);
+        }
+        let mut stx = TransmitBuf::new();
+        let mut sev = Vec::new();
+        server.on_timer(now, &mut stx, &mut sev);
+        for (bytes, segment) in stx.runs() {
+            for chunk in bytes.chunks(segment.max(1)) {
+                let mut c2 = TransmitBuf::new();
+                let mut e2 = Vec::new();
+                client.on_datagram(Bytes::copy_from_slice(chunk), now, &mut c2, &mut e2);
+            }
+        }
+    }
+
+    let mut delivered = Vec::new();
+    while let Some(msg) = server.recv_msg() {
+        delivered.push(msg);
+    }
+    assert_eq!(delivered.len(), msgs.len(), "the messages did not arrive exactly once");
+    assert_eq!(client_data, 0, "{client_data} data packets were sent for data the peer had");
+}
+
+/// And a peer that never took the early copy must still be served, promptly.
+///
+/// An implementation that does not expect data before the handshake finishes
+/// drops it, and nothing about that is visible to the sender — no gap opens at
+/// the peer, so no NAK is coming, and there is no later packet to provoke one.
+/// The send buffer counts those sequences as sent, so without a bound on how
+/// long that is believed the message would wait for the expiry timer, which is
+/// a round trip and four deviations away.
+#[test]
+fn early_data_the_peer_threw_away_still_arrives() {
+    const MSG: &[u8] = b"nobody caught this";
+
+    let mut listener = Listener::new(LISTENER_ID, MSS, 0, 0xABCD_EF01_2345_6789, CcKind::default());
+    let mut client = Connection::new_active(CLIENT_ID, SeqNo::new(1000), MSS, 0, CcKind::default());
+    assert!(client.queue_early(Bytes::from_static(MSG)), "early data refused");
+
+    let mut now = 0u64;
+    let mut events = Vec::new();
+    let mut server: Option<Connection> = None;
+    let mut dropped_early = 0usize;
+    let mut connected_at = None;
+    // A real one-way delay, so the handshake measures an RTT and the expiry
+    // timer -- a round trip and four deviations -- is nowhere near one ACK
+    // period. Without it both recover in about ten milliseconds and the test
+    // cannot tell them apart.
+    const ONE_WAY_US: u64 = 25_000;
+    let mut to_client: Vec<(u64, Bytes)> = Vec::new();
+
+    fn split(tx: &TransmitBuf) -> Vec<Bytes> {
+        tx.runs()
+            .flat_map(|(bytes, segment)| {
+                bytes.chunks(segment.max(1)).map(Bytes::copy_from_slice).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    for _ in 0..400 {
+        now += 1_000;
+
+        let mut inbound: Vec<Bytes> = Vec::new();
+        to_client.retain(|(at, d)| {
+            if *at <= now {
+                inbound.push(d.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for datagram in inbound {
+            let mut ctx = TransmitBuf::new();
+            client.on_datagram(datagram, now, &mut ctx, &mut events);
+            for reply in split(&ctx) {
+                deliver(
+                    reply,
+                    &mut listener,
+                    &mut server,
+                    now + ONE_WAY_US,
+                    &mut to_client,
+                    &mut dropped_early,
+                    ONE_WAY_US,
+                );
+            }
+        }
+
+        let mut ctx = TransmitBuf::new();
+        client.on_timer(now, &mut ctx, &mut events);
+        for datagram in split(&ctx) {
+            deliver(
+                datagram,
+                &mut listener,
+                &mut server,
+                now + ONE_WAY_US,
+                &mut to_client,
+                &mut dropped_early,
+                ONE_WAY_US,
+            );
+        }
+
+        if connected_at.is_none() && client.is_connected() {
+            connected_at = Some(now);
+        }
+        if let Some(conn) = server.as_mut() {
+            let mut stx = TransmitBuf::new();
+            let mut sev = Vec::new();
+            conn.on_timer(now, &mut stx, &mut sev);
+            to_client.extend(split(&stx).into_iter().map(|d| (now + ONE_WAY_US, d)));
+            if conn.recv_msg().as_deref() == Some(MSG) {
+                assert!(
+                    dropped_early > 0,
+                    "no early copy was ever dropped, so this proves nothing"
+                );
+                let took = now - connected_at.expect("delivered before the client was connected");
+                // One ACK period plus the path, not one expiry: on this link
+                // the expiry timer is `rtt + 4*var`, which lands past 100ms.
+                assert!(
+                    took < 60_000,
+                    "the message took {took}us after connect, which is expiry-timer territory"
+                );
+                return;
+            }
+        }
+    }
+    panic!("a peer that ignored the early copy never got the message at all");
+}
+
+/// Routes one client datagram the way a peer with no early-data support would:
+/// before the connection exists, data is discarded rather than held.
+fn deliver(
+    datagram: Bytes,
+    listener: &mut Listener,
+    server: &mut Option<Connection>,
+    now: u64,
+    to_client: &mut Vec<(u64, Bytes)>,
+    dropped_early: &mut usize,
+    delay_us: u64,
+) {
+    let is_data = datagram.first().is_some_and(|b| b & 0x80 == 0);
+    if let Some(conn) = server.as_mut() {
+        let mut stx = TransmitBuf::new();
+        let mut sev = Vec::new();
+        conn.on_datagram(datagram, now, &mut stx, &mut sev);
+        for d in stx.runs().flat_map(|(b, seg)| {
+            b.chunks(seg.max(1)).map(Bytes::copy_from_slice).collect::<Vec<_>>()
+        }) {
+            to_client.push((now + delay_us, d));
+        }
+        return;
+    }
+    if is_data {
+        *dropped_early += 1;
+        return;
+    }
+    let mut out = Vec::new();
+    listener.on_datagram(peer(), datagram, now, &mut out);
+    for event in out {
+        match event {
+            ListenerEvent::SendTo { data, .. } => to_client.push((now + delay_us, data)),
+            ListenerEvent::Accept(conn, _) => *server = Some(*conn),
+        }
+    }
+}

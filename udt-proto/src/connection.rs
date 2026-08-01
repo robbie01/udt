@@ -447,6 +447,21 @@ pub struct Connection {
     /// buffer owns delivery from `post_connect` onwards, so a repeat is pure
     /// waste, and the listener holds each copy it sees against a bounded slot.
     early_emitted: usize,
+    /// When to give up on the early copies having arrived and send them the
+    /// ordinary way, or `None` once that is settled.
+    ///
+    /// What went out early has been transmitted, so re-sending it the instant
+    /// the connection opens doubles every early message on the wire — which was
+    /// the whole cost of the feature, paid on every connection that used it.
+    /// Instead the send buffer treats those sequences as sent and waits: a peer
+    /// that received them acknowledges within its ACK period, and nothing is
+    /// sent twice.
+    ///
+    /// The wait is bounded because a peer may have ignored them entirely — an
+    /// implementation that does not expect data before the handshake finishes
+    /// drops them, and no acknowledgement is coming. This is how long that
+    /// costs, and it is deliberately short: one ACK period, not an expiry.
+    early_probe_us: Option<u64>,
     /// Set when early data was injected at accept and its `DataReady` has not
     /// been handed to the application yet.
     early_ready: bool,
@@ -613,6 +628,7 @@ impl Connection {
             snd_pkts_retransmitted: 0,
             early: Vec::new(),
             early_emitted: 0,
+            early_probe_us: None,
             early_ready: false,
             rtt_us: 10_000,
             rtt_var_us: 0,
@@ -665,9 +681,8 @@ impl Connection {
         self.rcv_loss = RcvLossList::new(LOSS_LIST_RESERVE);
         // Whatever went out early is queued here as an ordinary message, so
         // the send buffer owns it and the usual acknowledgement and
-        // retransmission apply. On the happy path the receiver has it already
-        // and discards this copy by sequence number, which costs one packet;
-        // if the early copy was lost or ignored, this is what delivers it.
+        // retransmission apply — a peer that never got the early copy is served
+        // from here, by the paths that already exist.
         if let Some(buf) = self.snd_buf.as_mut() {
             for payload in self.early.drain(..) {
                 // Cannot fail: the buffer was created a few lines above, and
@@ -677,6 +692,25 @@ impl Connection {
                 let queued = buf.add(payload, None, true, now_us);
                 debug_assert!(queued, "early data did not fit a freshly created send buffer");
             }
+        }
+        // But it must not go straight back out. Those sequences have been
+        // transmitted, and sending them again the moment the connection opens
+        // put two copies of every early message on the wire, always — the early
+        // one and this one, a packet apiece, on the happy path as much as the
+        // unhappy one. Each early message is one block, since `queue_early`
+        // takes nothing larger than a packet, so the numbering is exactly the
+        // one `emit_early` used.
+        //
+        // The cursor sits where it would after sending them, and the send
+        // buffer still holds them: unacknowledged, retransmittable, and owned
+        // by the ordinary machinery. `early_probe_us` bounds how long that is
+        // allowed to look like success.
+        if self.early_emitted > 0 {
+            self.snd_curr_seq = self.local_isn + (self.early_emitted as u32 - 1);
+            if let Some(buf) = self.snd_buf.as_mut() {
+                buf.mark_sent(self.early_emitted);
+            }
+            self.early_probe_us = Some(now_us + self.ack_int_us());
         }
 
         let ctx = self.cc_ctx(now_us);
@@ -858,6 +892,30 @@ impl Connection {
             self.next_nak_us = now_us + self.nak_int_us();
         }
 
+        // Early data that nothing has acknowledged. `post_connect` counted it
+        // as sent because it went out beside the handshake; if the peer never
+        // took it — dropped as unexpected, or lost — nothing else will ask for
+        // it, because there is no later packet to open a gap the peer would
+        // NAK. So it goes on the loss list, which is where every other
+        // unacknowledged sequence would be, and the ordinary retransmission
+        // path takes it from there.
+        //
+        // Deliberately not left to the expiry timer: that is a round trip and
+        // four deviations away, and this is a peer answering normally rather
+        // than a path in trouble. One ACK period is how long the evidence takes
+        // to arrive.
+        if let Some(at) = self.early_probe_us {
+            let last_early = self.local_isn + (self.early_emitted as u32 - 1);
+            if self.snd_last_ack > last_early {
+                // Acknowledged: the early copies did their job and this costs
+                // nothing at all.
+                self.early_probe_us = None;
+            } else if now_us >= at {
+                self.early_probe_us = None;
+                self.snd_loss.insert(self.snd_last_ack, last_early);
+            }
+        }
+
         // EXP — mirrors C++ checkTimers() logic; see `exp_int_us` for the
         // interval formula.
         //
@@ -982,12 +1040,18 @@ impl Connection {
     ///
     /// This is not a separate delivery mechanism. The message is an ordinary
     /// one, at sequence `ISN`, and it is placed in the send buffer like any
-    /// other the moment there is one; the early copy is an *extra* transmission
-    /// of it. So acknowledgement, loss recovery, duplicate suppression and
-    /// ordering are the paths that already exist, and a peer that ignores the
-    /// early copy — an implementation that does not expect data before the
-    /// handshake finishes — is indistinguishable from loss and recovered the
-    /// same way.
+    /// other the moment there is one — so acknowledgement, loss recovery,
+    /// duplicate suppression and ordering are the paths that already exist.
+    ///
+    /// Nor is it an extra transmission. What went out beside the handshake is
+    /// counted as sent, so it is not sent a second time when the connection
+    /// opens; the buffer holds it, unacknowledged, exactly as it would hold any
+    /// packet in flight. A peer that ignored the early copy — an implementation
+    /// that does not expect data before the handshake finishes — never
+    /// acknowledges it, and since nothing follows it there is no gap for that
+    /// peer to NAK either. `early_probe_us` is the bound on believing it
+    /// arrived: one ACK period later it goes on the loss list and ordinary
+    /// retransmission takes over.
     ///
     /// Must be called before the handshake completes; afterwards there is no
     /// conclusion left to ride and it is refused. Both roles that negotiate one
@@ -1260,6 +1324,9 @@ impl Connection {
                     t = t.min(self.next_nak_us);
                 }
                 t = t.min(self.last_rsp_us + self.exp_int_us());
+                if let Some(at) = self.early_probe_us {
+                    t = t.min(at);
+                }
                 Some(t.min(self.next_keepalive_us))
             }
         }
