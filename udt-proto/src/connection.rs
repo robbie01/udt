@@ -596,7 +596,18 @@ impl Connection {
     fn post_connect(&mut self, peer_isn: SeqNo, mss: u32, flow_wnd: u32, now_us: u64) {
         self.mss = mss;
         self.payload_size = mss.saturating_sub(IP_AND_UDP_OVERHEAD + UDT_HEADER_SIZE as u32);
-        self.flow_wnd = flow_wnd;
+        // Clamped here rather than by each caller, so there is no third path
+        // to get it wrong. The listener passed this straight through: a peer
+        // advertising zero left `max_flight` at zero, so `pack_data` refused
+        // every packet for ever and the connection then reported `PathMtu` --
+        // "the path did not carry any full-size packet" -- having never offered
+        // one. A negative value became 4_294_967_295 and switched flow control
+        // off until the peer's first full ACK replaced it.
+        //
+        // One is the floor because a window of zero cannot make progress and no
+        // peer can mean it; `MAX_FLOW_WND` is the same ceiling `recv_ack`
+        // applies to every later advertisement.
+        self.flow_wnd = flow_wnd.clamp(1, MAX_FLOW_WND);
         // Start one before ISN so the first pack_data increments to ISN.
         self.snd_curr_seq = self.local_isn.prev();
         // ...but the ACK point starts *at* ISN: it names the first unacknowledged
@@ -1015,6 +1026,24 @@ impl Connection {
         tx: &mut TransmitBuf,
     ) -> SendOutcome {
         if !matches!(self.state, ConnState::Connected) {
+            return SendOutcome::Rejected;
+        }
+
+        // An empty message is refused rather than accepted and dropped.
+        //
+        // `SendBuffer::add` reports success for a zero-length payload without
+        // storing anything, so this used to answer `Queued` for a message that
+        // never reached the wire and never arrived -- the one outcome that
+        // loses data in silence.
+        //
+        // Refused rather than encoded, though the wire could carry it. In
+        // `udt-async` a message surfaces through `recv(&mut buf) -> usize`, and
+        // a zero there is how every such API in the language says "no more" --
+        // so delivering an empty message would make a legitimate one
+        // indistinguishable from a closed connection. Keeping the contract that
+        // every `send` arrives as one `recv` of the same length is worth more
+        // than carrying a payload with nothing in it.
+        if payload.is_empty() {
             return SendOutcome::Rejected;
         }
         match self.snd_buf.as_mut() {
@@ -1642,7 +1671,8 @@ impl Connection {
         // Both of these are peer-supplied and reach allocation sizing, so they
         // are clamped before use rather than trusted.
         let mss = (hs.mss as u32).min(self.mss).max(MIN_MSS);
-        let flow_wnd = (hs.flight_flag_size.max(1) as u32).min(MAX_FLOW_WND);
+        // `post_connect` clamps; this only has to survive the sign conversion.
+        let flow_wnd = hs.flight_flag_size.max(0) as u32;
         self.peer_id = hs.socket_id as u32;
         // Completing the handshake means a request went out and an answer came
         // back, which is a round trip and the only one available this early.
@@ -3096,6 +3126,31 @@ mod tests {
         c.on_datagram(buf.freeze(), 1_000_000, &mut tx, &mut out);
 
         assert!(c.recv_msg().is_none(), "a misaddressed packet was delivered");
+    }
+
+    /// A message the caller was told was queued has to reach the peer.
+    ///
+    /// `SendBuffer::add` returns `true` for a zero-length payload without
+    /// storing anything — `n_chunks` is 0, so the loop that fills slots does
+    /// not run — and `send_msg` turns that into `SendOutcome::Queued`. Nothing
+    /// goes on the wire and no message is ever delivered, so an application
+    /// using empty messages as a marker or heartbeat waits for one that was
+    /// reported as sent. Either encode it (a data packet with an empty payload
+    /// is representable, and `Solo` already marks the boundary) or refuse it
+    /// with `Rejected`; reporting success and dropping it is the one answer
+    /// that loses data silently.
+    #[test]
+    fn an_empty_message_is_not_reported_as_queued_and_then_dropped() {
+        let mut c = connected(1_000_000);
+        let mut tx = TransmitBuf::new();
+        let outcome = c.send_msg(Bytes::new(), None, true, 1_000_000, &mut tx);
+        if outcome == SendOutcome::Queued {
+            assert_eq!(
+                data_packets(&tx),
+                1,
+                "an empty message was accepted for delivery and then discarded"
+            );
+        }
     }
 
     #[test]

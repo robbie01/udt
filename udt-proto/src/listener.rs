@@ -342,3 +342,115 @@ impl Listener {
         h as i32
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connection::SendOutcome;
+    use crate::transmit::TransmitBuf;
+
+    fn peer() -> PeerAddr {
+        PeerAddr::from_v4([127, 0, 0, 1], 5000)
+    }
+
+    fn handshake_datagram(hs: &Handshake, dst: u32) -> Bytes {
+        let mut b = BytesMut::new();
+        codec::encode_handshake(hs, 0, dst, &mut b);
+        b.freeze()
+    }
+
+    fn decode_handshake(data: &Bytes) -> Handshake {
+        match codec::decode(data.clone()) {
+            Some(crate::packet::Packet::Control {
+                body: crate::packet::ControlBody::Handshake(hs),
+                ..
+            }) => hs,
+            other => panic!("expected a handshake, got {other:?}"),
+        }
+    }
+
+    /// Runs the two-step handshake against a listener and returns the accepted
+    /// connection, with the peer advertising `flight_flag_size`.
+    fn accept_with_flight_flag(flight_flag_size: i32) -> Connection {
+        let mut l = Listener::new(1, 1500, 0, 0xABCD_EF01_2345_6789, CcKind::Udt);
+        let mut out = Vec::new();
+
+        let opening = Handshake {
+            version: UDT_VERSION,
+            sock_type: SOCK_DGRAM,
+            isn: 1000,
+            mss: 1500,
+            flight_flag_size,
+            req_type: req_type::CONNECT,
+            socket_id: 77,
+            cookie: 0,
+            peer_ip: [0u32; 4],
+        };
+        l.on_datagram(peer(), handshake_datagram(&opening, 0), 1_000_000, &mut out);
+        let challenge = match out.drain(..).next() {
+            Some(ListenerEvent::SendTo { data, .. }) => decode_handshake(&data),
+            _ => panic!("no cookie challenge"),
+        };
+
+        let mut conclusion = opening.clone();
+        conclusion.req_type = req_type::RESPONSE;
+        conclusion.cookie = challenge.cookie;
+        l.on_datagram(peer(), handshake_datagram(&conclusion, 1), 1_000_100, &mut out);
+
+        out.into_iter()
+            .find_map(|e| match e {
+                ListenerEvent::Accept(conn, _) => Some(*conn),
+                _ => None,
+            })
+            .expect("handshake did not produce a connection")
+    }
+
+    fn data_packets(tx: &TransmitBuf) -> usize {
+        tx.datagrams().filter(|d| d.len() >= 16 && d[0] & 0x80 == 0).count()
+    }
+
+    /// A peer advertising a flow window of zero must not be able to wedge the
+    /// connection it opens.
+    ///
+    /// The value comes straight off the wire and is the sender's window gate:
+    /// `pack_data` will not send new data while `in_flight >= min(cwnd,
+    /// flow_wnd)`, so at zero nothing may ever go out. Nothing recovers from
+    /// that on its own — `flow_wnd` is only revised by an ACK, and the peer has
+    /// no reason to send one when it is receiving nothing. `Connection`'s own
+    /// handshake path clamps this with `.max(1)`; the listener does not.
+    #[test]
+    fn a_peer_advertising_a_zero_flow_window_cannot_wedge_the_connection() {
+        let mut conn = accept_with_flight_flag(0);
+        let mut tx = TransmitBuf::new();
+        let mut events = Vec::new();
+        conn.on_timer(1_000_200, &mut tx, &mut events);
+        tx.clear();
+
+        assert_eq!(
+            conn.send_msg(Bytes::from_static(b"hello"), None, true, 1_000_300, &mut tx),
+            SendOutcome::Queued
+        );
+        // Forty seconds of virtual time. Nothing goes out, and the connection
+        // eventually gives up reporting `PathMtu` — "the path did not carry any
+        // full-size packet, retry with a smaller MTU" — when in truth no packet
+        // was ever offered to the path at all.
+        for step in 1..4000u64 {
+            conn.on_timer(1_000_300 + step * 10_000, &mut tx, &mut events);
+        }
+        assert!(
+            data_packets(&tx) > 0,
+            "a zero flow window left the connection unable to send anything at all"
+        );
+    }
+
+    /// And the same field read as a huge one must not switch flow control off.
+    #[test]
+    fn a_peer_advertising_a_negative_flow_window_is_clamped() {
+        let conn = accept_with_flight_flag(-1);
+        assert!(
+            conn.stats().flow_wnd <= 1 << 20,
+            "flow window of {} accepted from the wire",
+            conn.stats().flow_wnd
+        );
+    }
+}

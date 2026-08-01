@@ -1312,3 +1312,145 @@ mod tests {
         report_latency("pingpong rust→rust", PINGPONG_MSGS, start.elapsed().as_secs_f64());
     }
 }
+
+/// Regression cover for the driver's wind-down loop.
+#[cfg(test)]
+mod wind_down {
+    use std::time::Duration;
+    use udt_async::Endpoint;
+
+    /// A fixed slice of cooperative work, measured on the thread the drivers
+    /// share with this task.
+    async fn work_slice() -> Duration {
+        let start = std::time::Instant::now();
+        for _ in 0..2_000 {
+            let mut acc = 0u64;
+            for i in 0..2_000u64 {
+                acc = acc.wrapping_add(i * i);
+            }
+            std::hint::black_box(acc);
+            tokio::task::yield_now().await;
+        }
+        start.elapsed()
+    }
+
+    /// Dropping the last handle while data is still queued must leave the
+    /// driver waiting, not spinning.
+    ///
+    /// The driver's `select!` has an arm on the application's send channel. A
+    /// closed channel makes `recv()` resolve *immediately and for ever*, so once
+    /// the last handle is dropped that arm is permanently ready: the loop turns
+    /// as fast as the thread allows, doing no useful work, for the whole time
+    /// the send buffer takes to drain. Measured directly, with a counter in the
+    /// `None` arm, at ~363,000 iterations a second, sustained indefinitely
+    /// while the transfer was stalled.
+    ///
+    /// Measured here by what a co-scheduled task loses to it, which needs no
+    /// instrumentation: `#[tokio::test]` runs everything on one thread, so a
+    /// driver that never parks halves it at best. The threshold is far below
+    /// what was observed (5.3x to 6.6x across runs, with the stalled figure
+    /// steady to within 1%), because the point is to catch a spin rather than
+    /// to measure the machine. A driver that parks costs the probe nothing, so
+    /// the honest expectation is ~1.0; what is measured is 2.19-2.25x in
+    /// release and 6.75-7.00x in debug, each steady to within a few percent
+    /// across runs. Release is lower only because the driver's work per
+    /// iteration is cheaper, not because it spins less.
+    ///
+    /// The stall is set up so nothing is ever `blocked`: fewer bytes than the
+    /// send buffer holds, but more messages than the peer's receive backlog, so
+    /// the peer's driver stops reading and flow control pins the sender. With a
+    /// message `blocked` instead, the arm is disabled by its own guard and the
+    /// spin does not appear.
+    #[tokio::test]
+    async fn dropping_the_last_handle_does_not_spin_the_driver() {
+        let ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+        let addr = ep.local_addr();
+        let listener = ep.listen(4).unwrap();
+        let (server, client) = tokio::join!(async { listener.accept().await.unwrap() }, async {
+            let cep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), cep.connect(addr))
+                .await
+                .expect("connect timed out")
+                .expect("connect failed")
+        });
+
+        // The peer never reads, so its receive backlog fills and the transfer
+        // stalls with the send buffer still holding data.
+        for _ in 0..400 {
+            client.send(&[7u8; 1000]).await.unwrap();
+        }
+
+        let control = work_slice().await;
+        drop(client);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let stalled = work_slice().await;
+        drop(server);
+
+        let ratio = stalled.as_secs_f64() / control.as_secs_f64();
+        assert!(
+            ratio < 1.8,
+            "the driver kept the thread busy after its last handle went away: \
+             a work slice took {stalled:?} against {control:?} idle, {ratio:.1}x",
+        );
+    }
+}
+
+/// Regression cover for where an established connection accepts datagrams from.
+#[cfg(test)]
+mod source_address {
+    use std::time::Duration;
+    use udt_async::Endpoint;
+
+    /// A datagram naming a connection's socket id must still have to come from
+    /// that connection's peer.
+    ///
+    /// `Router::route` keys on the socket id alone and hands the datagram
+    /// straight to that connection's driver, and `run_shared` — the path every
+    /// accepted connection takes — never compares the source address against
+    /// its peer. (`run_owned`, which each outgoing connection uses, does:
+    /// `if rx.metas[i].addr != d.peer { continue }`.) So for an accepted
+    /// connection the 32-bit socket id is the whole of the check.
+    ///
+    /// That matters because UDT authenticates nothing and several control
+    /// packets are fatal. Forging one is normally gated on *also* spoofing the
+    /// peer's source address, which off-path attackers on a network doing
+    /// ingress filtering cannot do. Here an unrelated host needs only the id.
+    #[tokio::test]
+    async fn a_shutdown_from_a_stranger_does_not_close_the_connection() {
+        let ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+        let addr = ep.local_addr();
+        let listener = ep.listen(4).unwrap();
+        let (server, client) = tokio::join!(async { listener.accept().await.unwrap() }, async {
+            let cep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), cep.connect(addr))
+                .await
+                .expect("connect timed out")
+                .expect("connect failed")
+        });
+        client.send(b"hello").await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(5), server.recv(&mut buf))
+            .await
+            .expect("recv timed out")
+            .unwrap();
+        assert_eq!(&buf[..n], b"hello");
+
+        // Stand in for a guessed identifier: take the real one and send a
+        // shutdown from a host that has nothing to do with this connection.
+        let victim_id = server.stats().expect("stats").socket_id;
+        let mut shutdown = [0u8; 20];
+        // word0: control bit | type 5 (shutdown); word3: destination socket id.
+        shutdown[0..4].copy_from_slice(&(0x8000_0000u32 | (5u32 << 16)).to_be_bytes());
+        shutdown[12..16].copy_from_slice(&victim_id.to_be_bytes());
+        let stranger = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        stranger.send_to(&shutdown, addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        client.send(b"still here").await.unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(5), server.recv(&mut buf))
+            .await
+            .expect("the connection was killed by a third party")
+            .expect("the connection was killed by a third party");
+        assert_eq!(&buf[..n], b"still here");
+    }
+}

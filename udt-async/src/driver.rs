@@ -71,6 +71,15 @@ struct Driver {
     recv_tx: flume::Sender<Bytes>,
     /// Signals `connect` that the handshake finished.
     connected_tx: Option<oneshot::Sender<()>>,
+    /// Set once the application's send channel is closed and drained.
+    ///
+    /// A closed `mpsc::Receiver` resolves to `None` immediately and for ever,
+    /// so without this the arm that reads it stays permanently ready and the
+    /// loop turns as fast as the thread allows for the whole wind-down --
+    /// measured at 363,000 iterations a second, one core per connection, until
+    /// the send buffer drains. `half_close` is idempotent but makes no progress
+    /// after the first call, so re-running it only spins.
+    send_closed: bool,
     /// A message the send buffer had no room for. While one is held the driver
     /// stops taking send requests, so backpressure reaches the application
     /// through its channel rather than data being dropped.
@@ -101,6 +110,7 @@ impl Driver {
             events: Vec::new(),
             recv_tx,
             connected_tx,
+            send_closed: false,
             blocked: None,
             pending_flush: None,
             shared,
@@ -189,8 +199,12 @@ impl Driver {
                     SendOutcome::WouldBlock => {
                         self.blocked = Some(SendReq::Data { payload, ttl_ms, in_order });
                     }
-                    // Unsendable however long we wait, and the connection is
-                    // winding down anyway.
+                    // Unsendable however long we wait: the connection is
+                    // closing, or the payload exceeds the send buffer entire.
+                    // An empty message cannot reach here -- `Connection::send`
+                    // refuses one at the boundary, where the caller can be
+                    // told, because a refusal discarded here would look like
+                    // success.
                     SendOutcome::Rejected => {}
                 }
             }
@@ -220,6 +234,24 @@ impl Driver {
     /// marking happened on the path carrying data to us, so it is the peer's
     /// rate that needs to come down.
     fn on_inbound(&mut self, datagram: Inbound) {
+        // Only this connection's peer may drive it.
+        //
+        // A datagram is routed on the destination socket id alone, so anything
+        // that can reach the port and name the id lands here -- no session
+        // state, no sequence number, and no need to spoof a source address. A
+        // 20-byte `Shutdown` was enough to tear down someone else's connection.
+        //
+        // The id is still the only secret, and unguessability is still what it
+        // rests on. But requiring the address as well is what makes the
+        // comparison with TCP honest: an off-path attacker there must guess a
+        // window *and* forge an address that ingress filtering drops. Without
+        // this, the address came free.
+        //
+        // `run_owned` has always checked, at its own recv; this is the same
+        // rule for connections that share an endpoint's socket.
+        if datagram.from != self.peer {
+            return;
+        }
         let now = now_us();
         if datagram.ce {
             self.conn.congestion_experienced(now, &mut self.tx);
@@ -325,13 +357,16 @@ pub(crate) async fn run_owned(
             }
             // Stop taking new work while a message waits for buffer space, so
             // the channel carries backpressure to the application.
-            req = send_rx.recv(), if d.blocked.is_none() => {
+            req = send_rx.recv(), if d.blocked.is_none() && !d.send_closed => {
                 match req {
                     Some(req) => {
                         d.handle_send(req);
                         d.drain_sends(&mut send_rx);
                     }
-                    None => d.half_close(),
+                    None => {
+                        d.send_closed = true;
+                        d.half_close();
+                    }
                 }
             }
             _ = tokio::time::sleep_until(deadline) => {
@@ -388,13 +423,16 @@ pub(crate) async fn run_shared(
                 }
                 d.run_due_timers();
             }
-            req = send_rx.recv(), if d.blocked.is_none() => {
+            req = send_rx.recv(), if d.blocked.is_none() && !d.send_closed => {
                 match req {
                     Some(req) => {
                         d.handle_send(req);
                         d.drain_sends(&mut send_rx);
                     }
-                    None => d.half_close(),
+                    None => {
+                        d.send_closed = true;
+                        d.half_close();
+                    }
                 }
             }
             _ = tokio::time::sleep_until(deadline) => {

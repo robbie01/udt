@@ -62,7 +62,11 @@ impl SendBuffer {
     pub fn add(&mut self, data: Bytes, ttl_ms: Option<u32>, in_order: bool, now_us: u64) -> bool {
         let n_chunks = data.len().div_ceil(self.payload_size);
         if n_chunks == 0 {
-            return true;
+            // Nothing to store, so nothing was queued. Reporting success here
+            // is what let an empty message be accepted and then vanish;
+            // `Connection::send_msg` refuses one before it reaches this, and
+            // this agrees with it rather than contradicting it.
+            return false;
         }
         if self.len + n_chunks > self.capacity {
             return false;

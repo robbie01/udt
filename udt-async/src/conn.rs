@@ -96,6 +96,26 @@ pub struct Connection {
     pub(crate) max_unsegmented: Arc<OnceLock<usize>>,
 }
 
+/// Refuse an empty message before it is queued.
+///
+/// The protocol refuses one too, but a `send` here hands the request to the
+/// driver and returns, so a refusal made there would be discarded and the
+/// caller would still be told the message was on its way. Caught at the
+/// boundary, where it can be reported.
+///
+/// Refused rather than carried because a message surfaces through
+/// `recv(&mut buf) -> usize`, and zero there is how such an API says the
+/// connection is done — an empty message would be indistinguishable from one.
+fn empty_check(buf: &[u8]) -> io::Result<()> {
+    if buf.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "an empty message cannot be sent; a zero-length recv means the connection closed",
+        ));
+    }
+    Ok(())
+}
+
 /// Turn a recorded reason into the error a caller sees.
 ///
 /// The kinds are a coarse hint for code that matches on them; the precise
@@ -209,6 +229,7 @@ impl Connection {
     ///
     /// As [`send`](Self::send).
     pub async fn send_bytes_with(&self, buf: Bytes, opts: SendOptions) -> io::Result<()> {
+        empty_check(&buf)?;
         self.send_tx.send(opts.into_req(buf)).await.map_err(|_| self.closed())
     }
 
@@ -232,6 +253,7 @@ impl Connection {
     ///
     /// As [`try_send`](Self::try_send).
     pub fn try_send_with(&self, buf: &[u8], opts: SendOptions) -> io::Result<()> {
+        empty_check(buf)?;
         let req = opts.into_req(Bytes::copy_from_slice(buf));
         self.send_tx.try_send(req).map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => {

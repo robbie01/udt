@@ -196,6 +196,9 @@ impl BatchIo {
 pub(crate) struct Inbound {
     pub(crate) bytes: Bytes,
     pub(crate) ce: bool,
+    /// Who sent it. A connection only acts on datagrams from its own peer, and
+    /// on the shared-endpoint path this is the only place that survives to say.
+    pub(crate) from: std::net::SocketAddr,
 }
 
 /// Receive storage sized for this socket's offload settings.
@@ -239,7 +242,8 @@ impl RecvBuffers {
         // carries the same mark. That is the kernel's granularity, not a
         // simplification of ours.
         let ce = meta.ecn == Some(quinn_udp::EcnCodepoint::Ce);
-        split_run(run, meta.stride).map(move |bytes| Inbound { bytes, ce })
+        let from = meta.addr;
+        split_run(run, meta.stride).map(move |bytes| Inbound { bytes, ce, from })
     }
 }
 
