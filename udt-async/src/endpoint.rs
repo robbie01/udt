@@ -30,6 +30,13 @@ pub const DEFAULT_MTU: u32 = 1500;
 ///
 /// Longer messages are split across packets and reassembled by the peer, so
 /// this is a throughput consideration rather than a limit.
+///
+/// This describes the default MTU and this end of a connection. What an
+/// established connection actually negotiated — possibly less, if the peer
+/// offered a smaller MTU — is [`Connection::max_unsegmented_len`], and that is
+/// the one to ask.
+///
+/// [`Connection::max_unsegmented_len`]: crate::Connection::max_unsegmented_len
 pub const MAX_PAYLOAD_SIZE: usize = max_payload_for_mtu(DEFAULT_MTU);
 
 /// Largest message that fits in a single packet at the given path MTU.

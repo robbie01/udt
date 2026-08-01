@@ -142,6 +142,23 @@ impl Connection {
         self.stats.get().map(|s| *lock(s))
     }
 
+    /// Largest message that still travels in one packet, in bytes.
+    ///
+    /// Longer messages are split and reassembled by the peer, so this is not a
+    /// limit — but a message a few bytes over it costs a whole second packet,
+    /// so a sender that controls its own framing usually wants to stay under
+    /// it.
+    ///
+    /// This is the value the two ends negotiated, which may be smaller than
+    /// [`MAX_PAYLOAD_SIZE`] if the peer offered a lower MTU. Prefer it to that
+    /// constant, which only describes the default MTU and this end of the
+    /// connection. `None` before the handshake has settled.
+    ///
+    /// [`MAX_PAYLOAD_SIZE`]: crate::MAX_PAYLOAD_SIZE
+    pub fn max_unsegmented_len(&self) -> Option<usize> {
+        self.stats().map(|s| s.max_unsegmented_len)
+    }
+
     fn closed(&self) -> io::Error {
         closed_with(self.disconnect_reason())
     }

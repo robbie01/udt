@@ -289,6 +289,11 @@ pub struct ConnectionStats {
     /// Consecutive expiry-timer firings without a response from the peer;
     /// the connection gives up at 16.
     pub exp_count: u32,
+    /// Largest message that still travels in one packet, in bytes.
+    ///
+    /// Derived from the MTU the two ends negotiated, so it is known only once
+    /// connected and may be smaller than this end asked for.
+    pub max_unsegmented_len: usize,
     /// Data packets put on the wire, retransmissions included.
     pub snd_pkts_total: u64,
     /// How many of those were retransmissions.
@@ -956,6 +961,20 @@ impl Connection {
         }
     }
 
+    /// Largest message that still travels in one packet, in bytes.
+    ///
+    /// Longer messages are split and reassembled by the peer, so this is a
+    /// throughput consideration rather than a limit — but a message just over
+    /// it costs two packets to carry a few bytes past one, and a sender that
+    /// controls its own framing usually wants to stay under it.
+    ///
+    /// This is the negotiated value, taken from the smaller of the two ends'
+    /// MTUs, so it is only meaningful once connected. Before that it is what
+    /// this end intends to offer.
+    pub fn max_unsegmented_len(&self) -> usize {
+        self.payload_size as usize
+    }
+
     /// Queues a message for transmission.
     ///
     /// Messages are all-or-nothing: the return value says whether this one was
@@ -1112,6 +1131,7 @@ impl Connection {
             snd_period_us: self.snd_period_us,
             rtt_us: self.rtt_us,
             exp_count: self.exp_count,
+            max_unsegmented_len: self.payload_size as usize,
             snd_pkts_total: self.snd_pkts_total,
             snd_pkts_retransmitted: self.snd_pkts_retransmitted,
         }
@@ -2319,6 +2339,34 @@ mod tests {
     /// Counts data packets (word0's top bit clear) in what was written out.
     fn data_packets(tx: &TransmitBuf) -> usize {
         tx.datagrams().filter(|d| d.len() >= 16 && d[0] & 0x80 == 0).count()
+    }
+
+    /// The advertised size must be the real boundary: exactly it fits in one
+    /// packet, one byte more does not.
+    ///
+    /// A number that only approximates where segmentation begins is worse than
+    /// none, because a caller sizing its framing to it would silently pay for a
+    /// second packet on every message.
+    #[test]
+    fn max_unsegmented_len_is_where_segmentation_actually_begins() {
+        let mut c = connected(1_000);
+        let limit = c.max_unsegmented_len();
+        assert!(limit > 0 && limit < 1500, "implausible limit {limit}");
+
+        let mut tx = TransmitBuf::new();
+        assert_eq!(
+            c.send_msg(Bytes::from(vec![0u8; limit]), None, true, 1_000, &mut tx),
+            SendOutcome::Queued
+        );
+        assert_eq!(data_packets(&tx), 1, "a message of exactly the limit was split");
+
+        let mut c = connected(1_000);
+        let mut tx = TransmitBuf::new();
+        assert_eq!(
+            c.send_msg(Bytes::from(vec![0u8; limit + 1]), None, true, 1_000, &mut tx),
+            SendOutcome::Queued
+        );
+        assert_eq!(data_packets(&tx), 2, "one byte past the limit did not segment");
     }
 
     /// A zero TTL is send-once, best-effort delivery.

@@ -204,6 +204,37 @@ mod tests {
     // Verifies that concurrent connect_rendezvous() calls on the same Endpoint
     // all go through the single endpoint mux without racing on recv_from.
 
+    /// The negotiated limit must be visible on both ends and agree.
+    ///
+    /// It is what a sender sizes its framing to, so a value that only one end
+    /// knows, or that the two disagree on, would be worse than none.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn both_ends_agree_on_the_unsegmented_limit() {
+        let server_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+        let addr = server_ep.local_addr();
+        let listener = server_ep.listen(4).unwrap();
+        let client_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+
+        let (server, client) = tokio::join!(async { listener.accept().await.unwrap() }, async {
+            client_ep.connect(addr).await.unwrap()
+        });
+
+        let c = client.max_unsegmented_len().expect("client had no limit");
+        let s = server.max_unsegmented_len().expect("server had no limit");
+        assert_eq!(c, s, "the two ends disagree on the unsegmented limit");
+        assert_eq!(c, udt_async::MAX_PAYLOAD_SIZE, "loopback should negotiate the default MTU");
+
+        // And a message of exactly that size makes the round trip intact.
+        let payload = vec![0xA5u8; c];
+        client.send(&payload).await.unwrap();
+        let mut buf = vec![0u8; c * 2];
+        let n = tokio::time::timeout(Duration::from_secs(10), server.recv(&mut buf))
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(&buf[..n], &payload[..]);
+    }
+
     /// Data handed to `connect_with_early_data` must arrive as the
     /// connection's first message, with no special handling on the server.
     #[tokio::test(flavor = "multi_thread")]

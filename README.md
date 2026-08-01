@@ -119,6 +119,11 @@ Sending in large messages rather than many small ones is the single biggest
 throughput lever — a few hundred kilobytes per `send` is a reasonable target for
 bulk transfer.
 
+Where framing is yours to choose, `connection.max_unsegmented_len()` gives the
+largest message that still travels in one packet. It is the value the two ends
+negotiated rather than a constant, so it accounts for a peer offering a smaller
+MTU. Going one byte past it costs a whole second packet.
+
 ## Development
 
 ```bash
