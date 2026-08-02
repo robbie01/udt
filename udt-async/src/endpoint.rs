@@ -19,8 +19,7 @@ use crate::batch::{BatchIo, Inbound, RecvBuffers};
 use crate::conn::{Connecting, Connection, RECV_BACKLOG, SEND_BACKLOG, SendReq};
 use crate::driver;
 use crate::util::{
-    Mutex, RwLock, configure_udp_buffers, lock, next_socket_id, now_us, outgoing_bind_addr,
-    sockaddr_to_peer_addr,
+    Mutex, RwLock, configure_udp_buffers, lock, next_socket_id, now_us, sockaddr_to_peer_addr,
 };
 
 /// The path MTU assumed by default: 1500 bytes, standard Ethernet.
@@ -291,13 +290,17 @@ impl Endpoint {
     /// message queued there travels with the handshake and reaches the peer a
     /// round trip before the connection is otherwise usable.
     ///
-    /// The connection gets its own kernel socket, so it is unaffected by other
-    /// traffic on this endpoint.
+    /// The connection sends from this endpoint's own address, the one
+    /// [`local_addr`](Self::local_addr) reports and that a peer would dial. It
+    /// does not take a fresh port, which would open a second pinhole in the
+    /// local firewall and make the source a peer sees disagree with the address
+    /// it was told — the thing that matters most for reaching a peer that has
+    /// no listener of its own.
     ///
     /// # Errors
     ///
-    /// Fails here if the address cannot be resolved or a socket cannot be
-    /// bound. A handshake that never completes is reported by awaiting the
+    /// Fails here if the address cannot be resolved. A handshake that never
+    /// completes is reported by awaiting the
     /// [`Connecting`], as [`ErrorKind::TimedOut`].
     ///
     /// [`ErrorKind::TimedOut`]: std::io::ErrorKind::TimedOut
@@ -307,12 +310,6 @@ impl Endpoint {
 
     async fn connect_inner(&self, peer: impl ToSocketAddrs) -> io::Result<Connecting> {
         let peer = resolve(peer).await?;
-        let std_sock = std::net::UdpSocket::bind(outgoing_bind_addr(self.inner.local_addr, peer))?;
-        std_sock.set_nonblocking(true)?;
-        configure_udp_buffers(&std_sock, self.inner.cfg.mss);
-        let socket = Arc::new(UdpSocket::from_std(std_sock)?);
-        let local_addr = socket.local_addr()?;
-
         let conn = ProtoConnection::new_active(
             next_socket_id(),
             random_isn(),
@@ -320,33 +317,9 @@ impl Endpoint {
             now_us(),
             self.inner.cfg.congestion,
         );
-        let (send_tx, send_rx) = mpsc::channel::<SendReq>(SEND_BACKLOG);
-        let (recv_tx, recv_rx) = flume::bounded::<Bytes>(RECV_BACKLOG);
-        let (connected_tx, connected) = oneshot::channel::<()>();
-        let shared = driver::Shared::default();
-        tokio::spawn(driver::run_owned(
-            conn,
-            socket,
-            peer,
-            send_rx,
-            recv_tx,
-            Some(connected_tx),
-            shared.clone(),
-        ));
+        let (socket, connected) = spawn_shared(&self.inner, conn, peer);
 
-        Ok(Connecting {
-            conn: Some(Connection {
-                send_tx,
-                recv_rx,
-                peer_addr: peer,
-                local_addr,
-                reason: shared.reason,
-                stats: shared.stats,
-                max_unsegmented: shared.max_unsegmented,
-            }),
-            connected,
-            gate: None,
-        })
+        Ok(Connecting { conn: Some(socket), connected, gate: None })
     }
 
     /// Connects to a peer that is calling this at the same time.
@@ -613,6 +586,7 @@ async fn run_reader(ep: Arc<EndpointInner>) {
                 // it there. The cache short-circuits the common case of a run
                 // of datagrams for one connection.
                 let mut fanout: Vec<mpsc::Sender<Inbound>> = Vec::new();
+                let mut unaddressed = false;
                 let route = match &cached {
                     Some((cached_id, tx)) if id != 0 && *cached_id == id => Some(tx.clone()),
                     _ => match ep.routes.read() {
@@ -622,6 +596,13 @@ async fn run_reader(ep: Arc<EndpointInner>) {
                                 Some(tx.clone())
                             }
                             Route::Unaddressed(list) => {
+                                // Names no connection, so it may equally be a
+                                // *new* one: a peer that already has a
+                                // connection here can dial another from the
+                                // same address, and its opening handshake
+                                // carries no id either. Offered to the listener
+                                // as well as to the connections, below.
+                                unaddressed = true;
                                 fanout.extend(list.iter().map(|(_, tx)| tx.clone()));
                                 fanout.pop()
                             }
@@ -633,6 +614,15 @@ async fn run_reader(ep: Arc<EndpointInner>) {
 
                 for extra in &fanout {
                     let _ = extra.try_send(datagram.clone());
+                }
+                // A datagram naming no connection could be opening a new one,
+                // whether or not this address already has some. The listener
+                // ignores anything that is not a handshake, and answers a
+                // conclusion it has already accepted from its own memory, so
+                // offering it costs nothing when it is neither.
+                if unaddressed && !offered_handshake {
+                    offered_handshake = true;
+                    handle_handshake(&ep, from, datagram.bytes.clone()).await;
                 }
                 match route {
                     Some(tx) => {

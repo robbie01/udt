@@ -91,13 +91,20 @@ pub struct Listener {
     /// Peers whose handshake completed, and the response to repeat if they
     /// ask again because ours went missing.
     ///
+    /// Keyed by the peer's socket id as well as its address, because one
+    /// address can hold several connections — that is the whole reason
+    /// [`Router`](crate::Router) keys on the id — and an address alone would
+    /// answer the second connection's conclusion with the first one's response.
+    /// A peer dialling twice from one port would get one connection and a
+    /// handshake that never completes.
+    ///
     /// Bounded, and evicted oldest-first. Nothing here is required for
     /// correctness — a peer that retransmits after eviction simply redoes the
     /// cookie exchange — so a cap costs nothing and keeps a long-lived
     /// listener from growing one entry per connection it has ever seen.
-    accepted: HashMap<PeerAddr, (u64, Handshake)>,
+    accepted: HashMap<(PeerAddr, u32), (u64, Handshake)>,
     /// Insertion order for `accepted`, for eviction.
-    accepted_order: VecDeque<PeerAddr>,
+    accepted_order: VecDeque<(PeerAddr, u32)>,
     /// Data received from a peer whose handshake has not completed yet, keyed
     /// by address, with the sequence number it claimed and when it arrived.
     early: HashMap<PeerAddr, EarlyHold>,
@@ -254,7 +261,9 @@ impl Listener {
             // still valid, so falling through would hand out a second
             // connection for the same peer every time our response went
             // missing.
-            if let Some((_, saved_resp)) = self.accepted.get(&addr).cloned() {
+            if let Some((_, saved_resp)) =
+                self.accepted.get(&(addr.clone(), hs.socket_id as u32)).cloned()
+            {
                 self.enc.clear();
                 codec::encode_handshake(&saved_resp, ts, hs.socket_id as u32, &mut self.enc);
                 out.push(ListenerEvent::SendTo { addr, data: self.enc.clone().freeze() });
@@ -312,7 +321,7 @@ impl Listener {
                     }
                 }
 
-                self.remember_accepted(addr.clone(), our_resp.clone(), now_us);
+                self.remember_accepted(addr.clone(), hs.socket_id as u32, our_resp.clone(), now_us);
 
                 self.enc.clear();
                 codec::encode_handshake(&our_resp, ts, hs.socket_id as u32, &mut self.enc);
@@ -333,9 +342,10 @@ impl Listener {
     /// handed a second connection. Cookies stop verifying after two minutes, so
     /// nothing older than that can cause it. The count cap is a backstop
     /// against a flood arriving faster than entries age out.
-    fn remember_accepted(&mut self, addr: PeerAddr, resp: Handshake, now_us: u64) {
-        if self.accepted.insert(addr.clone(), (now_us, resp)).is_none() {
-            self.accepted_order.push_back(addr);
+    fn remember_accepted(&mut self, addr: PeerAddr, peer_id: u32, resp: Handshake, now_us: u64) {
+        let key = (addr, peer_id);
+        if self.accepted.insert(key.clone(), (now_us, resp)).is_none() {
+            self.accepted_order.push_back(key);
         }
         while let Some(oldest) = self.accepted_order.front() {
             let expired = self

@@ -18,7 +18,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use udt_proto::{Connection, DisconnectReason, Event, SendOutcome, TransmitBuf};
 
-use crate::batch::{BatchIo, Inbound, RecvBuffers};
+use crate::batch::{BatchIo, Inbound};
 use crate::conn::SendReq;
 use crate::util::now_us;
 
@@ -263,7 +263,7 @@ impl Driver {
         // window *and* forge an address that ingress filtering drops. Without
         // this, the address came free.
         //
-        // `run_owned` has always checked, at its own recv; this is the same
+        // The owned-socket driver always checked at its own recv; this is the same
         // rule for connections that share an endpoint's socket.
         if datagram.from != self.peer {
             return;
@@ -312,84 +312,6 @@ impl Driver {
     /// Every application handle is gone: finish what is queued, then close.
     fn half_close(&mut self) {
         self.conn.half_close(now_us(), &mut self.tx, &mut self.events);
-    }
-}
-
-/// Drive a connection that owns its socket, reading it as well as writing it.
-pub(crate) async fn run_owned(
-    conn: Connection,
-    socket: Arc<UdpSocket>,
-    peer: SocketAddr,
-    mut send_rx: mpsc::Receiver<SendReq>,
-    recv_tx: flume::Sender<Bytes>,
-    connected_tx: Option<oneshot::Sender<()>>,
-    shared: Shared,
-) {
-    let Ok(io) = BatchIo::new(&socket) else { return };
-    let mut rx = RecvBuffers::new(&io);
-    let mut d = Driver::new(conn, socket, peer, recv_tx, connected_tx, io, shared);
-    let mut inbound: Vec<Inbound> = Vec::new();
-
-    // Send the opening handshake.
-    d.conn.on_timer(now_us(), &mut d.tx, &mut d.events);
-
-    loop {
-        d.flush().await;
-        if d.done {
-            return;
-        }
-        let deadline = d.deadline();
-
-        tokio::select! {
-            result = d.io.recv_batch(&d.socket, &mut rx.storage, &mut rx.metas) => {
-                let mut count = match result {
-                    Ok(n) => n,
-                    Err(e) if crate::util::is_transient(&e) => continue,
-                    Err(_) => return,
-                };
-                // One call may return several datagrams via recvmmsg, and each
-                // buffer several more coalesced by receive offload. Where the
-                // platform has neither, this loop keeps one wakeup from costing
-                // one packet.
-                loop {
-                    for i in 0..count {
-                        if rx.metas[i].addr != d.peer {
-                            continue;
-                        }
-                        inbound.extend(rx.take_datagrams(i));
-                    }
-                    if inbound.len() >= RECV_DRAIN_CAP {
-                        break;
-                    }
-                    match d.io.try_recv_batch(&d.socket, &mut rx.storage, &mut rx.metas) {
-                        Ok(n) if n > 0 => count = n,
-                        _ => break,
-                    }
-                }
-                for datagram in inbound.drain(..) {
-                    d.on_inbound(datagram);
-                }
-                d.run_due_timers();
-            }
-            // Stop taking new work while a message waits for buffer space, so
-            // the channel carries backpressure to the application.
-            req = send_rx.recv(), if d.blocked.is_none() && !d.send_closed => {
-                match req {
-                    Some(req) => {
-                        d.handle_send(req);
-                        d.drain_sends(&mut send_rx);
-                    }
-                    None => {
-                        d.send_closed = true;
-                        d.half_close();
-                    }
-                }
-            }
-            _ = tokio::time::sleep_until(deadline) => {
-                d.conn.on_timer(now_us(), &mut d.tx, &mut d.events);
-                debug_tick(&d.conn, "owned");
-            }
-        }
     }
 }
 

@@ -66,6 +66,54 @@ mod tests {
         }
     }
 
+    /// An outbound connection sends from the endpoint's own address, not a
+    /// fresh ephemeral port.
+    ///
+    /// Taking a new port for each dial opens a second pinhole in the local
+    /// firewall and makes the source a peer observes disagree with the address
+    /// it was handed — which for a peer-to-peer system is most of the point of
+    /// having an endpoint at all. Checked from the far side as well as locally,
+    /// because only the peer's view proves what actually went on the wire.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_outbound_connection_sends_from_the_endpoint_port() {
+        let server_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_ep.local_addr();
+        let listener = server_ep.listen(4).unwrap();
+
+        let client_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_ep.local_addr();
+
+        let (server, client) = tokio::join!(async { listener.accept().await.unwrap() }, async {
+            client_ep.connect(server_addr).await.unwrap().await.unwrap()
+        });
+
+        assert_eq!(client.local_addr(), client_addr, "the dial took a different local address");
+        assert_eq!(server.peer_addr(), client_addr, "the peer saw a different source address");
+
+        // A second connection over the same endpoint shares it rather than
+        // taking yet another port.
+        let (server2, client2) = tokio::join!(async { listener.accept().await.unwrap() }, async {
+            client_ep.connect(server_addr).await.unwrap().await.unwrap()
+        });
+        assert_eq!(client2.local_addr(), client_addr);
+        assert_eq!(server2.peer_addr(), client_addr);
+
+        // And they are still distinct connections, told apart by socket id.
+        client.send(b"first").await.unwrap();
+        client2.send(b"second").await.unwrap();
+        let mut buf = vec![0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(5), server.recv(&mut buf))
+            .await
+            .expect("first connection timed out")
+            .unwrap();
+        assert_eq!(&buf[..n], b"first", "two connections on one port were commingled");
+        let n = tokio::time::timeout(Duration::from_secs(5), server2.recv(&mut buf))
+            .await
+            .expect("second connection timed out")
+            .unwrap();
+        assert_eq!(&buf[..n], b"second", "two connections on one port were commingled");
+    }
+
     // ── Scenario 1: new listener + new connector ─────────────────────────────
 
     #[tokio::test(flavor = "multi_thread")]

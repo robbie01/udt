@@ -1,7 +1,7 @@
 //! Small helpers shared by the connection and endpoint code.
 
 use std::io;
-use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::SocketAddr;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 pub(crate) use std::sync::{Mutex, MutexGuard, RwLock};
@@ -125,27 +125,4 @@ pub(crate) fn configure_udp_buffers(sock: &std::net::UdpSocket, mss: u32) {
     let s = socket2::SockRef::from(sock);
     let _ = s.set_recv_buffer_size(UDP_RCV_BUF_PKTS * mss as usize);
     let _ = s.set_send_buffer_size(UDP_SND_BUF);
-}
-
-/// Choose the local bind address for an outgoing `connect()` socket.
-///
-/// Reuses the endpoint's IP when it has a specific one, so outgoing traffic
-/// leaves from the same interface. Otherwise takes the wildcard address for
-/// the *peer's* family — binding `0.0.0.0` for an IPv6 peer would leave the
-/// socket deaf to the replies.
-pub(crate) fn outgoing_bind_addr(endpoint_addr: SocketAddr, peer: SocketAddr) -> SocketAddr {
-    match (endpoint_addr, peer) {
-        (SocketAddr::V4(la), SocketAddr::V4(_)) if !la.ip().is_unspecified() => {
-            SocketAddr::V4(SocketAddrV4::new(*la.ip(), 0))
-        }
-        (SocketAddr::V6(la), SocketAddr::V6(_)) if !la.ip().is_unspecified() => {
-            SocketAddr::V6(SocketAddrV6::new(*la.ip(), 0, 0, 0))
-        }
-        (_, SocketAddr::V4(_)) => {
-            SocketAddr::V4(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 0))
-        }
-        (_, SocketAddr::V6(_)) => {
-            SocketAddr::V6(SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, 0, 0, 0))
-        }
-    }
 }

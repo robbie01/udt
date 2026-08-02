@@ -163,28 +163,6 @@ impl BatchIo {
     }
 }
 
-impl BatchIo {
-    /// Non-blocking variant of [`recv_batch`](Self::recv_batch).
-    ///
-    /// On platforms without `recvmmsg` (macOS, Windows) a batch call returns a
-    /// single datagram, so callers loop on this to drain the socket rather than
-    /// paying a wakeup per packet. Returns `WouldBlock` once it is empty.
-    pub(crate) fn try_recv_batch(
-        &self,
-        sock: &UdpSocket,
-        storage: &mut [Vec<u8>],
-        metas: &mut [RecvMeta],
-    ) -> io::Result<usize> {
-        if let [buf] = storage {
-            let mut bufs = [IoSliceMut::new(buf.as_mut_slice())];
-            return self.state.recv(UdpSockRef::from(sock), &mut bufs, metas);
-        }
-        let mut bufs: Vec<IoSliceMut<'_>> =
-            storage.iter_mut().map(|b| IoSliceMut::new(b.as_mut_slice())).collect();
-        self.state.recv(UdpSockRef::from(sock), &mut bufs, metas)
-    }
-}
-
 /// A datagram as it came off the socket, with the one piece of IP-layer context
 /// the protocol cannot see for itself.
 ///
