@@ -126,3 +126,98 @@ pub(crate) fn configure_udp_buffers(sock: &std::net::UdpSocket, mss: u32) {
     let _ = s.set_recv_buffer_size(UDP_RCV_BUF_PKTS * mss as usize);
     let _ = s.set_send_buffer_size(UDP_SND_BUF);
 }
+
+/// Bind an endpoint's socket so that [`per_destination_socket`] can later join
+/// the same port.
+///
+/// Two sockets may share a port only if *both* asked to, so the flags have to be
+/// set here even though it is the other function that needs them.
+///
+/// The plain bind first is not redundant. With the flags set, binding a port
+/// something else already holds **succeeds**, so `Endpoint::bind` would stop
+/// reporting the conflict it reports today — and on macOS the newcomer takes
+/// the traffic rather than sharing it, which would turn a loud error into a
+/// silent hijack. Asking without them first keeps that error, and costs one
+/// socket created and dropped at startup.
+///
+/// Only when a port was actually named: with port 0 there is no conflict to
+/// detect, and re-binding the port the probe was given would be a race for no
+/// benefit.
+pub(crate) fn bind_endpoint_socket(addr: SocketAddr, mss: u32) -> io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let addr = if addr.port() == 0 {
+        addr
+    } else {
+        // Reports `AddrInUse` exactly as before if anything holds it.
+        let probe = std::net::UdpSocket::bind(addr)?;
+        let named = probe.local_addr()?;
+        drop(probe);
+        named
+    };
+    let domain = match addr {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+    let shareable = (|| {
+        let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+        sock.set_reuse_address(true)?;
+        #[cfg(unix)]
+        sock.set_reuse_port(true)?;
+        sock.bind(&addr.into())?;
+        io::Result::Ok(std::net::UdpSocket::from(sock))
+    })();
+    // A platform that refuses the flags is not a failure to bind: fall back to
+    // an ordinary socket and lose only the per-destination readers.
+    let sock = match shareable {
+        Ok(sock) => sock,
+        Err(_) => std::net::UdpSocket::bind(addr)?,
+    };
+    sock.set_nonblocking(true)?;
+    configure_udp_buffers(&sock, mss);
+    Ok(sock)
+}
+
+/// A second socket on `local` — the address an endpoint is already bound to —
+/// connected to `peer`, so the kernel delivers that peer's datagrams here
+/// instead of to the endpoint's own socket.
+///
+/// This is what lets one port be read by more than one task. A connected UDP
+/// socket names a full four-tuple, which is more specific than the endpoint's
+/// wildcard binding, and the kernel matches the most specific socket. Measured
+/// on macOS: the connected socket received its peer's datagrams and only those,
+/// while another peer's went to the wildcard. That is a different mechanism from
+/// `SO_REUSEPORT` load balancing, which macOS does not do at all — see the note
+/// in `CLAUDE.md` — and it is why the receive funnel can be widened here when it
+/// could not be widened that way.
+///
+/// `None` on any failure, and the caller must treat that as ordinary: nothing
+/// here is required for correctness. The connection stays routed through the
+/// endpoint's reader either way, so a platform that ignores the more specific
+/// binding, or refuses `SO_REUSEPORT`, simply keeps the behaviour it had.
+pub(crate) fn per_destination_socket(
+    local: SocketAddr,
+    peer: SocketAddr,
+    mss: u32,
+) -> Option<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    // Same family as the address actually bound, not as the peer: they agree
+    // for any peer this could reach, and the bind is what has to succeed.
+    let domain = match local {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+    let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).ok()?;
+    // Both, because the two platforms disagree about which one permits a second
+    // bind to a live port.
+    sock.set_reuse_address(true).ok()?;
+    #[cfg(unix)]
+    sock.set_reuse_port(true).ok()?;
+    sock.bind(&local.into()).ok()?;
+    // The connect is the whole point: it is what makes this binding more
+    // specific than the endpoint's, and so what the kernel matches first.
+    sock.connect(&peer.into()).ok()?;
+    sock.set_nonblocking(true).ok()?;
+    let sock: std::net::UdpSocket = sock.into();
+    configure_udp_buffers(&sock, mss);
+    Some(sock)
+}
