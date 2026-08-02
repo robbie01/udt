@@ -7,7 +7,7 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::Duration;
-    use udt_async::{Connection, Endpoint, EndpointConfig, SendOptions};
+    use udt_async::{Connection, DisconnectReason, Endpoint, EndpointConfig, SendOptions};
 
     const SMALL: &[u8] = b"hello, world!   "; // 16 bytes — single packet
     fn medium() -> Vec<u8> {
@@ -112,6 +112,64 @@ mod tests {
             .expect("second connection timed out")
             .unwrap();
         assert_eq!(&buf[..n], b"second", "two connections on one port were commingled");
+    }
+
+    /// Closing must be possible while the send buffer is full.
+    ///
+    /// Dropping a connection closes it gracefully: everything queued is
+    /// delivered first, so a drop part-way through a large transfer keeps
+    /// working until it lands. `shutdown` is the other choice, and it has to
+    /// reach the driver on its own channel — the driver stops reading send
+    /// requests while a message waits for buffer space, which is exactly the
+    /// state a caller wants to abandon.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_aborts_a_backed_up_connection() {
+        let server_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+        let addr = server_ep.local_addr();
+        let listener = server_ep.listen(4).unwrap();
+        let client_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+
+        let (server, client) = tokio::join!(async { listener.accept().await.unwrap() }, async {
+            client_ep.connect(addr).await.unwrap().await.unwrap()
+        });
+
+        // Push until the far side stops keeping up and a send blocks: the
+        // server never reads, so its receive queue and then the window fill.
+        let client = Arc::new(client);
+        let pusher = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move {
+                let payload = vec![0x5au8; 65536];
+                loop {
+                    if client.send(&payload).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The abort must not wait for any of that to drain.
+        tokio::time::timeout(Duration::from_secs(5), client.shutdown())
+            .await
+            .expect("shutdown blocked behind a full send buffer");
+
+        // The driver is gone, so sending is over.
+        assert!(client.send(b"after").await.is_err(), "sending survived a shutdown");
+        let _ = tokio::time::timeout(Duration::from_secs(5), pusher).await;
+
+        // And the peer was told, rather than being left to time out.
+        let mut buf = vec![0u8; 131072];
+        let reason = loop {
+            match tokio::time::timeout(Duration::from_secs(5), server.recv(&mut buf)).await {
+                Ok(Ok(_)) => continue,
+                Ok(Err(e)) => {
+                    break e.get_ref().and_then(|e| e.downcast_ref::<DisconnectReason>()).copied();
+                }
+                Err(_) => panic!("the peer was never told the connection ended"),
+            }
+        };
+        assert_eq!(reason, Some(DisconnectReason::Shutdown), "peer saw {reason:?}");
     }
 
     // ── Scenario 1: new listener + new connector ─────────────────────────────

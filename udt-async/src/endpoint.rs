@@ -486,6 +486,7 @@ fn spawn_shared(
 ) -> (Connection, oneshot::Receiver<()>) {
     let (datagram_tx, datagram_rx) = mpsc::channel::<Inbound>(DATAGRAM_BACKLOG);
     let (send_tx, send_rx) = mpsc::channel::<SendReq>(SEND_BACKLOG);
+    let (abort_tx, abort_rx) = mpsc::channel::<oneshot::Sender<()>>(1);
     let (recv_tx, recv_rx) = flume::bounded::<Bytes>(RECV_BACKLOG);
     let (connected_tx, connected) = oneshot::channel::<()>();
 
@@ -508,6 +509,7 @@ fn spawn_shared(
         peer,
         datagram_rx,
         send_rx,
+        abort_rx,
         recv_tx,
         Some(connected_tx),
         shared.clone(),
@@ -516,6 +518,7 @@ fn spawn_shared(
 
     let socket = Connection {
         send_tx,
+        abort_tx,
         recv_rx,
         peer_addr: peer,
         local_addr: ep.local_addr,

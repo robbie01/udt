@@ -65,8 +65,9 @@ pub(crate) const SEND_BACKLOG: usize = 256;
 /// Concurrent receivers each get whole messages, but which task gets which is
 /// unspecified.
 ///
-/// Dropping it closes the connection once anything already sent has
-/// been acknowledged.
+/// Dropping it closes the connection once anything already sent has been
+/// acknowledged; [`shutdown`](Self::shutdown) abandons that instead, which is
+/// the only way out while the send buffer is full.
 ///
 /// [`UdpSocket`]: tokio::net::UdpSocket
 pub struct Connection {
@@ -88,6 +89,12 @@ pub struct Connection {
     /// all five causes arrive as one `BrokenPipe`, and a peer closing cleanly
     /// reads the same as one that stopped answering.
     pub(crate) reason: Arc<OnceLock<DisconnectReason>>,
+    /// Carries an abort to the driver, and a way for it to say it has stopped.
+    ///
+    /// Its own channel rather than a [`SendReq`]: the driver stops reading send
+    /// requests while a message waits for buffer space, and being unable to
+    /// cancel a transfer that is backed up is the case this exists for.
+    pub(crate) abort_tx: mpsc::Sender<oneshot::Sender<()>>,
     /// Largest message that travels in one packet, fixed once the handshake
     /// settles it. Its own slot rather than a field of `stats`, which is only
     /// republished on driver wakeups and so can be absent when a freshly
@@ -168,6 +175,31 @@ impl Connection {
 
     fn closed(&self) -> io::Error {
         closed_with(self.reason.get().copied())
+    }
+
+    /// Closes now, discarding anything still queued, and waits for the driver
+    /// to stop.
+    ///
+    /// Dropping a connection closes it too, but gracefully: everything already
+    /// queued is delivered first, so a drop with a large transfer outstanding
+    /// keeps working until it lands or the connection times out. This is the
+    /// other choice — abandon it — and the only one available while the send
+    /// buffer is full, since that is where a drop would wait longest.
+    ///
+    /// Returns nothing, deliberately. UDT's shutdown is a single unacknowledged
+    /// packet, so "the peer knows" is not something any implementation can
+    /// report; awaiting this means the packet reached the socket and the
+    /// driver has stopped, which is all there is to know. **For whether the
+    /// data arrived, use [`flush`](Self::flush) before closing** — that is the
+    /// call with an answer, and it fails with the disconnect reason if the
+    /// connection ended first.
+    ///
+    /// Idempotent: closing an already-closed connection does nothing.
+    pub async fn shutdown(&self) {
+        let (notify, done) = oneshot::channel();
+        if self.abort_tx.send(notify).await.is_ok() {
+            let _ = done.await;
+        }
     }
 
     /// Sends a message, preserving order relative to earlier sends.

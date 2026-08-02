@@ -80,6 +80,10 @@ struct Driver {
     /// the send buffer drains. The close is idempotent but makes no progress
     /// after the first call, so re-running it only spins.
     send_closed: bool,
+    /// Same latch as `send_closed`, for the abort channel: once the last
+    /// `Connection` is gone its receiver resolves to `None` for ever, and an
+    /// unguarded arm reading it would spin the wind-down at full tilt.
+    abort_closed: bool,
     /// A message the send buffer had no room for. While one is held the driver
     /// stops taking send requests, so backpressure reaches the application
     /// through its channel rather than data being dropped.
@@ -111,6 +115,7 @@ impl Driver {
             recv_tx,
             connected_tx,
             send_closed: false,
+            abort_closed: false,
             blocked: None,
             pending_flush: None,
             shared,
@@ -323,6 +328,7 @@ pub(crate) async fn run_shared(
     peer: SocketAddr,
     mut datagrams: mpsc::Receiver<Inbound>,
     mut send_rx: mpsc::Receiver<SendReq>,
+    mut abort_rx: mpsc::Receiver<oneshot::Sender<()>>,
     recv_tx: flume::Sender<Bytes>,
     connected_tx: Option<oneshot::Sender<()>>,
     shared: Shared,
@@ -372,6 +378,21 @@ pub(crate) async fn run_shared(
                         d.shutdown_when_drained();
                     }
                 }
+            }
+            // No guard on the queue being clear: aborting while a message
+            // waits for buffer space is the whole point, and that is exactly
+            // when the send arm above is closed for business.
+            notify = abort_rx.recv(), if !d.abort_closed => {
+                let Some(notify) = notify else {
+                    d.abort_closed = true;
+                    continue;
+                };
+                d.conn.shutdown(now_us(), &mut d.tx, &mut d.events);
+                // Before breaking, or the packet that tells the peer is still
+                // sitting in the transmit buffer when this task goes away.
+                d.flush().await;
+                let _ = notify.send(());
+                break;
             }
             _ = tokio::time::sleep_until(deadline) => {
                 d.conn.on_timer(now_us(), &mut d.tx, &mut d.events);
