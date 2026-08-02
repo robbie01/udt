@@ -495,10 +495,17 @@ fn handshake_completes_over_a_clean_link() {
 
 #[test]
 fn handshake_completes_when_half_the_packets_are_lost() {
+    let mut total = 0u64;
     for seed in 0..8 {
         let mut sim = Sim::new(LinkConfig::lossy(0.5), seed);
         sim.connect();
+        total += sim.now - 1_000_000;
     }
+    // And it completes *quickly*, which is the whole reason a rendezvous keeps
+    // the front-loaded backoff that dialling a listener does not. Handing it
+    // the flat 250ms schedule instead doubles this: 1438ms mean against 725ms.
+    let mean = total / 8;
+    assert!(mean < 1_000_000, "rendezvous took {mean}us on average to connect through 50% loss");
 }
 
 #[test]

@@ -151,26 +151,46 @@ const BLACK_HOLE_MIN_US: u64 = 500_000;
 /// Ten rather than a tighter multiple because the cost of waiting is only that
 /// a dead peer lingers, while the cost of being too eager is killing a live one.
 const EXP_HARD_TIMEOUT_US: u64 = 10 * KEEPALIVE_US;
-/// Handshake retransmit backoff, in µs, then `HS_RESEND_US` thereafter.
+/// Handshake retransmit backoff for a *rendezvous*, in µs, then
+/// [`HS_RESEND_US`] thereafter.
 ///
 /// A flat 250 ms — which is what the C++ reference uses — costs a full quarter
 /// second every time an opening packet is dropped. That is routine rather than
-/// exceptional on a path where a stateful firewall must see outbound traffic
-/// before it will pass inbound: over IPv6 there is no NAT to punch, but the
-/// filter still has to open, so the first packets in *both* directions are
-/// dropped and a rendezvous needs several exchanges before anything gets
-/// through. Front-loading the retries opens the pinhole in tens of
-/// milliseconds instead of hundreds.
+/// exceptional here, because both peers sit behind a stateful firewall that
+/// must see outbound traffic before it will pass inbound: over IPv6 there is no
+/// NAT to punch, but the filter still has to open, so the first packets in
+/// *both* directions are dropped and a rendezvous needs several exchanges
+/// before anything gets through. Front-loading the retries opens the pinhole in
+/// tens of milliseconds instead of hundreds.
 ///
-/// It costs nothing on a clean path: the handshake completes long before the
-/// later attempts would fire.
+/// **This is a rendezvous schedule, not a general one.** Dialling a listener
+/// has no pinhole to open — the client's own filter opens on the packet it is
+/// sending, and a listener is reachable by definition — so a reply that has not
+/// come back is either still in flight or genuinely lost, and retrying before
+/// one round trip has passed can only duplicate. Measured over a clean path: it
+/// cost four handshake packets at 50 ms and eight at 300 ms, where two are
+/// needed. [`hs_interval_us`] therefore hands this schedule only to a
+/// rendezvous.
 const HS_BACKOFF_US: [u64; 4] = [25_000, 50_000, 100_000, 175_000];
-/// Steady-state handshake retransmit interval once the backoff is exhausted.
+/// Steady-state handshake retransmit interval once any backoff is exhausted,
+/// and the whole schedule for a connection to a listener.
 const HS_RESEND_US: u64 = 250_000;
 
-/// Interval before handshake attempt number `attempts`.
-fn hs_interval_us(attempts: u32) -> u64 {
-    HS_BACKOFF_US.get(attempts as usize).copied().unwrap_or(HS_RESEND_US)
+/// How long to wait after the `attempts`-th copy of a handshake leg before
+/// sending another, where `attempts` counts copies already sent.
+///
+/// Zero for the first, because nothing has been sent and there is nothing to
+/// wait for. That is what puts a packet on the wire the moment a connection is
+/// created, rather than one interval later — which, with the clock starting
+/// near zero, is what a connection opened early in a process's life used to do.
+fn hs_interval_us(mode: ConnMode, attempts: u32) -> u64 {
+    let Some(prior) = attempts.checked_sub(1) else {
+        return 0;
+    };
+    match mode {
+        ConnMode::Rendezvous => HS_BACKOFF_US.get(prior as usize).copied().unwrap_or(HS_RESEND_US),
+        ConnMode::Active => HS_RESEND_US,
+    }
 }
 
 /// How a connection was opened.
@@ -188,9 +208,10 @@ enum ConnState {
         mode: ConnMode,
         conn_req: Handshake,
         last_req_us: u64,
-        /// Handshake retransmissions sent since the last state change; indexes
-        /// [`HS_BACKOFF_US`]. Reset whenever the request type advances, so each
-        /// leg of a rendezvous gets the same fast opening retries.
+        /// Copies of `conn_req` already sent. Zero means "nothing yet, so send
+        /// now"; from one it indexes [`HS_BACKOFF_US`] for a rendezvous. Reset
+        /// whenever the request type advances, so each leg of a rendezvous gets
+        /// the same fast opening retries.
         attempts: u32,
         deadline_us: u64,
         last_peer_hs: Option<Handshake>,
@@ -512,7 +533,7 @@ impl Connection {
         c.state = ConnState::Connecting {
             mode: ConnMode::Active,
             conn_req: req,
-            last_req_us: 0,
+            last_req_us: now_us,
             attempts: 0,
             deadline_us: now_us + 30_000_000,
             last_peer_hs: None,
@@ -548,7 +569,7 @@ impl Connection {
         c.state = ConnState::Connecting {
             mode: ConnMode::Rendezvous,
             conn_req: req,
-            last_req_us: 0,
+            last_req_us: now_us,
             attempts: 0,
             deadline_us: now_us + 30_000_000,
             last_peer_hs: None,
@@ -776,16 +797,16 @@ impl Connection {
         match &self.state {
             ConnState::Closed => return,
             ConnState::Connecting {
+                mode,
                 deadline_us,
                 last_req_us,
                 conn_req,
                 attempts,
                 last_peer_hs,
-                ..
             } => {
                 let deadline = *deadline_us;
                 let last = *last_req_us;
-                let gap = hs_interval_us(*attempts);
+                let gap = hs_interval_us(*mode, *attempts);
                 let req = conn_req.clone();
                 let peer_hs = last_peer_hs.clone();
                 if now_us > deadline {
@@ -1089,10 +1110,14 @@ impl Connection {
         // demoted to the ordinary path. It costs one duplicate handshake
         // packet, which the peer already tolerates: it is retransmitted until
         // answered, and both roles ignore a repeat of one they have acted on.
-        if let ConnState::Connecting { last_req_us, last_peer_hs, .. } = &mut self.state
+        //
+        // Expressed by clearing the attempt count rather than the timestamp,
+        // because this has no clock to compare against: nothing sent means no
+        // interval to wait, whatever the clock's origin happens to be.
+        if let ConnState::Connecting { attempts, last_peer_hs, .. } = &mut self.state
             && last_peer_hs.is_some()
         {
-            *last_req_us = 0;
+            *attempts = 0;
         }
         true
     }
@@ -1315,8 +1340,8 @@ impl Connection {
     pub fn next_deadline_us(&self) -> Option<u64> {
         match &self.state {
             ConnState::Closed => None,
-            ConnState::Connecting { last_req_us, deadline_us, attempts, .. } => {
-                Some((*last_req_us + hs_interval_us(*attempts)).min(*deadline_us))
+            ConnState::Connecting { mode, last_req_us, deadline_us, attempts, .. } => {
+                Some((*last_req_us + hs_interval_us(*mode, *attempts)).min(*deadline_us))
             }
             ConnState::Connected => {
                 let mut t = self.next_ack_us.min(self.next_snd_us);
@@ -1776,8 +1801,13 @@ impl Connection {
                     } = &mut self.state
                     {
                         *conn_req = new_req.clone();
-                        *last_req_us = 0; // resend immediately
-                        *attempts = 0;
+                        // The conclusion is pushed below, so this leg has just
+                        // been sent. Zeroing it instead — "resend immediately"
+                        // — made the timer send a second copy microseconds
+                        // later, which is not a retry of anything: the first
+                        // copy has not had time to be lost yet.
+                        *last_req_us = now_us;
+                        *attempts = 1;
                         // Kept so a message queued *after* the challenge can
                         // still be emitted early: the conclusion is resent
                         // until the peer answers, and riding one of those
@@ -1830,8 +1860,11 @@ impl Connection {
                     } = &mut self.state
                     {
                         *conn_req = new_req.clone();
-                        *last_req_us = 0;
-                        *attempts = 0;
+                        // Sent below, so the retry clock starts now. See the
+                        // active branch: zero here bought a duplicate, not a
+                        // retry.
+                        *last_req_us = now_us;
+                        *attempts = 1;
                         *last_peer_hs = Some(hs.clone());
                     }
                     // Rendezvous has no listener to hold anything: the peer
