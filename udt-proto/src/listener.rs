@@ -460,7 +460,7 @@ mod tests {
             SendOutcome::Queued
         );
         // Forty seconds of virtual time. Nothing goes out, and the connection
-        // eventually gives up reporting `PathMtu` — "the path did not carry any
+        // eventually gives up reporting `PathUnusable` — "the path did not carry any
         // full-size packet, retry with a smaller MTU" — when in truth no packet
         // was ever offered to the path at all.
         for step in 1..4000u64 {

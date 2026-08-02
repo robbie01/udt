@@ -250,11 +250,19 @@ pub enum DisconnectReason {
     /// Nothing this side sent ever reached the peer, though the peer is
     /// answering.
     ///
-    /// Almost always the path cannot carry packets of the negotiated size:
-    /// control packets are small and get through, so the connection completes
-    /// its handshake, and then every full-size data packet is silently
-    /// discarded somewhere in the middle. Retry with a smaller MTU.
-    PathMtu,
+    /// Control packets get through — the handshake completed and the peer keeps
+    /// replying — while every data packet is discarded somewhere in the middle.
+    /// The usual cause is a path that cannot carry the negotiated packet size,
+    /// which is why the connection halves it and starts again; this is reported
+    /// only once that has been tried all the way down to a 108-byte MTU, below
+    /// anything a real path can be, and still nothing arrived.
+    ///
+    /// So there is nothing left to tune. It is a diagnosis, not an instruction:
+    /// lowering the configured MTU cannot help, because far smaller was already
+    /// tried. Distinguished from [`Timeout`](Self::Timeout) because a peer that
+    /// is answering is not an absent one, and the difference is worth having in
+    /// a log.
+    PathUnusable,
 }
 
 impl std::fmt::Display for DisconnectReason {
@@ -266,9 +274,8 @@ impl std::fmt::Display for DisconnectReason {
                 "peer sent something unusable, or rejected the handshake"
             }
             DisconnectReason::LocalClose => "connection closed locally",
-            DisconnectReason::PathMtu => {
-                "the path did not carry any full-size packet, though the peer answered — \
-                 retry with a smaller MTU"
+            DisconnectReason::PathUnusable => {
+                "the peer answered but nothing this side sent arrived, at any packet size"
             }
         };
         f.write_str(s)
@@ -693,7 +700,7 @@ impl Connection {
         // Clamped here rather than by each caller, so there is no third path
         // to get it wrong. The listener passed this straight through: a peer
         // advertising zero left `max_flight` at zero, so `pack_data` refused
-        // every packet for ever and the connection then reported `PathMtu` --
+        // every packet for ever and the connection then reported `PathUnusable` --
         // "the path did not carry any full-size packet" -- having never offered
         // one. A negative value became 4_294_967_295 and switched flow control
         // off until the peer's first full ACK replaced it.
@@ -1015,7 +1022,7 @@ impl Connection {
                     return;
                 }
                 self.state = ConnState::Closed;
-                out.push(Event::Disconnected(DisconnectReason::PathMtu));
+                out.push(Event::Disconnected(DisconnectReason::PathUnusable));
                 return;
             }
 

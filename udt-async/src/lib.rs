@@ -116,10 +116,9 @@ pub use udt_proto::ConnectionStats;
 /// match conn.recv(buf).await {
 ///     Ok(n) => { let _ = n; }
 ///     Err(e) => match e.get_ref().and_then(|e| e.downcast_ref::<DisconnectReason>()) {
-///         // The peer is reachable and the path will carry a smaller packet,
-///         // so reconnect with a lower `EndpointConfig::mtu`.
-///         Some(DisconnectReason::PathMtu) => {}
-///         // Anything else: the connection is over.
+///         // The peer closed cleanly; anything queued arrived.
+///         Some(DisconnectReason::Shutdown) => {}
+///         // Anything else: the connection is over, for a reason worth logging.
 ///         _ => {}
 ///     },
 /// }
@@ -129,4 +128,9 @@ pub use udt_proto::ConnectionStats;
 /// The error's [`kind`](std::io::Error::kind) is the coarse hint for code that
 /// matches on kinds; several causes have no exact one, which is why the reason
 /// itself travels with it.
+///
+/// These are diagnoses, not instructions. Recovery the transport can do it has
+/// already done by the time one of these is reported — see
+/// [`PathUnusable`](DisconnectReason::PathUnusable), which is what is left when
+/// halving the packet size all the way to the floor did not help.
 pub use udt_proto::DisconnectReason;

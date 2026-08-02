@@ -84,10 +84,9 @@ pub struct Connection {
     /// Why the connection ended, once it has.
     ///
     /// Written by the driver as it exits and read by every method that can
-    /// report a closed connection. Without it all five causes arrive as one
-    /// `BrokenPipe`, and an application cannot tell a peer closing cleanly from
-    /// a path that will not carry its packets — which are opposite decisions:
-    /// one says stop, the other says retry with a smaller MTU.
+    /// report a closed connection, which attaches it to the error. Without it
+    /// all five causes arrive as one `BrokenPipe`, and a peer closing cleanly
+    /// reads the same as one that stopped answering.
     pub(crate) reason: Arc<OnceLock<DisconnectReason>>,
     /// Largest message that travels in one packet, fixed once the handshake
     /// settles it. Its own slot rather than a field of `stats`, which is only
@@ -131,7 +130,7 @@ pub(crate) fn closed_with(reason: Option<DisconnectReason>) -> io::Error {
         DisconnectReason::LocalClose => io::ErrorKind::BrokenPipe,
         DisconnectReason::Timeout => io::ErrorKind::TimedOut,
         DisconnectReason::PeerError => io::ErrorKind::InvalidData,
-        DisconnectReason::PathMtu => io::ErrorKind::Other,
+        DisconnectReason::PathUnusable => io::ErrorKind::Other,
     };
     // The message comes from the reason's own `Display`, so there is one
     // wording rather than two that can drift apart.
