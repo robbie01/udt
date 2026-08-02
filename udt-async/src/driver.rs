@@ -77,7 +77,7 @@ struct Driver {
     /// so without this the arm that reads it stays permanently ready and the
     /// loop turns as fast as the thread allows for the whole wind-down --
     /// measured at 363,000 iterations a second, one core per connection, until
-    /// the send buffer drains. `half_close` is idempotent but makes no progress
+    /// the send buffer drains. The close is idempotent but makes no progress
     /// after the first call, so re-running it only spins.
     send_closed: bool,
     /// A message the send buffer had no room for. While one is held the driver
@@ -310,8 +310,8 @@ impl Driver {
     }
 
     /// Every application handle is gone: finish what is queued, then close.
-    fn half_close(&mut self) {
-        self.conn.half_close(now_us(), &mut self.tx, &mut self.events);
+    fn shutdown_when_drained(&mut self) {
+        self.conn.shutdown_when_drained(now_us(), &mut self.tx, &mut self.events);
     }
 }
 
@@ -369,7 +369,7 @@ pub(crate) async fn run_shared(
                     }
                     None => {
                         d.send_closed = true;
-                        d.half_close();
+                        d.shutdown_when_drained();
                     }
                 }
             }

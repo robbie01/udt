@@ -403,9 +403,13 @@ pub struct Connection {
     snd_sacked: SndLossList,
     snd_last_ack: SeqNo,
     snd_curr_seq: SeqNo,
-    /// When true, the application has finished sending (send channel closed). We
-    /// send a Shutdown once the send buffer drains (all data acknowledged).
-    snd_half_closed: bool,
+    /// The application has finished sending, so a `Shutdown` goes out once the
+    /// send buffer drains.
+    ///
+    /// Not a half-close in the TCP sense — the protocol has no such thing, and
+    /// the `Shutdown` this ends in ends both directions. See
+    /// [`Connection::shutdown_when_drained`].
+    shutdown_pending: bool,
 
     rcv_buf: Option<RecvBuffer>,
     rcv_loss: RcvLossList,
@@ -644,7 +648,7 @@ impl Connection {
             snd_sacked: SndLossList::new(LOSS_LIST_RESERVE),
             snd_last_ack: SeqNo::new(0),
             snd_curr_seq: SeqNo::new(0),
-            snd_half_closed: false,
+            shutdown_pending: false,
             rcv_buf: None,
             rcv_loss: RcvLossList::new(DEFAULT_FLIGHT_FLAG_SIZE as usize),
             ack_win: AckWindow::new(),
@@ -879,8 +883,8 @@ impl Connection {
             }
         }
 
-        // Graceful half-close: shut down once the send buffer drains.
-        if self.snd_half_closed && self.snd_buf_is_empty() {
+        // Asked to close once everything queued was acknowledged; it now has been.
+        if self.shutdown_pending && self.snd_buf_is_empty() {
             self.shutdown(now_us, tx, out);
             return;
         }
@@ -1388,7 +1392,8 @@ impl Connection {
 
     /// Closes immediately, telling the peer and discarding anything unsent.
     ///
-    /// Use [`half_close`](Self::half_close) to let queued data drain first.
+    /// Use [`shutdown_when_drained`](Self::shutdown_when_drained) to let queued
+    /// data drain first.
     pub fn shutdown(&mut self, now_us: u64, tx: &mut TransmitBuf, out: &mut Vec<Event>) {
         if !matches!(self.state, ConnState::Connected) {
             return;
@@ -1403,14 +1408,19 @@ impl Connection {
     /// Returns without closing if data is still outstanding; the shutdown then
     /// happens inside a later [`on_timer`](Self::on_timer). Incoming messages
     /// keep arriving until then.
-    pub fn half_close(&mut self, now_us: u64, tx: &mut TransmitBuf, out: &mut Vec<Event>) {
+    pub fn shutdown_when_drained(
+        &mut self,
+        now_us: u64,
+        tx: &mut TransmitBuf,
+        out: &mut Vec<Event>,
+    ) {
         if !matches!(self.state, ConnState::Connected) {
             return;
         }
         if self.snd_buf.as_ref().map(|b| b.is_empty()).unwrap_or(true) {
             self.shutdown(now_us, tx, out);
         } else {
-            self.snd_half_closed = true;
+            self.shutdown_pending = true;
         }
     }
 
