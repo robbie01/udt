@@ -126,6 +126,22 @@ produced a wrong conclusion every time it has been used as evidence.
   for a macOS client. Multiple sockets sharing a source port would still
   parallelise `sendmsg`, and that half is unexplored.
 
+- **A *connected* socket on the same port does get its own peer's datagrams,
+  and it does not help.** Different mechanism from the above: a connected UDP
+  socket names a four-tuple, which is more specific than the endpoint's
+  binding, so the kernel matches it first. Verified on macOS — the connected
+  socket received its peer's traffic and only that, the wildcard kept the rest.
+  So the funnel *can* be widened this way. It was built (see the revert of
+  `87c63ab` for the code) and reverted, because it bought nothing: interleaved
+  A/B on a shared endpoint gave 407/382/253/154 MB/s at n=1/2/4/8 without and
+  440/438/269/159 with, inside the run-to-run spread, while the gap to separate
+  endpoints stayed put. **The receive funnel is not what limits a shared
+  endpoint.** The send side still shares one socket and is the unexamined half;
+  `UDP_SND_BUF` sizing already moved that number 997→313 MB/s once. Note also
+  that sharing a port needs the reuse flags on the endpoint's own socket, which
+  silently turns a second `bind` to a live port into a hijack unless a plain
+  bind is attempted first.
+
 ## The C++ references
 
 They live on the `harness` branch, which references this one **by path**, so it

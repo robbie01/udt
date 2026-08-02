@@ -19,8 +19,7 @@ use crate::batch::{BatchIo, Inbound, RecvBuffers};
 use crate::conn::{Connecting, Connection, RECV_BACKLOG, SEND_BACKLOG, SendReq};
 use crate::driver;
 use crate::util::{
-    Mutex, RwLock, bind_endpoint_socket, lock, next_socket_id, now_us, per_destination_socket,
-    sockaddr_to_peer_addr,
+    Mutex, RwLock, configure_udp_buffers, lock, next_socket_id, now_us, sockaddr_to_peer_addr,
 };
 
 /// The path MTU assumed by default: 1500 bytes, standard Ethernet.
@@ -255,7 +254,9 @@ impl Endpoint {
     /// As [`bind`](Self::bind).
     pub async fn bind_with(addr: impl ToSocketAddrs, cfg: EndpointConfig) -> io::Result<Self> {
         let addr = resolve(addr).await?;
-        let std_sock = bind_endpoint_socket(addr, cfg.mss)?;
+        let std_sock = std::net::UdpSocket::bind(addr)?;
+        std_sock.set_nonblocking(true)?;
+        configure_udp_buffers(&std_sock, cfg.mss);
         let socket = Arc::new(UdpSocket::from_std(std_sock)?);
         let local_addr = socket.local_addr()?;
 
@@ -493,19 +494,6 @@ fn spawn_shared(
         routes.insert(socket_id, peer, datagram_tx);
     }
 
-    // A second socket on the same port, connected to this peer, so the kernel
-    // hands us its datagrams directly rather than through the one reader every
-    // connection on this endpoint shares. Both feed the same channel, so
-    // whichever the kernel picks reaches the same driver: the route registered
-    // above is what makes this an optimisation rather than a requirement, and
-    // what makes a platform that ignores the more specific binding simply keep
-    // the behaviour it had.
-    if let Some(sock) = per_destination_socket(ep.local_addr, peer, ep.cfg.mss)
-        && let Ok(sock) = UdpSocket::from_std(sock)
-    {
-        tokio::spawn(run_peer_reader(sock, peer, Arc::clone(ep)));
-    }
-
     let udp = Arc::clone(&ep.socket);
     let owner = Arc::clone(ep);
     let shared = driver::Shared::default();
@@ -673,97 +661,6 @@ async fn run_reader(ep: Arc<EndpointInner>) {
     }
 }
 
-/// Read one peer's own socket, routing what arrives exactly as the endpoint's
-/// reader would.
-///
-/// This is the half of the endpoint's work that does not have to be shared. The
-/// endpoint's reader serves every connection on the port from one task, so its
-/// `recvmmsg` is a funnel; a peer with its own connected socket is read by its
-/// own task instead, and on macOS — where `SO_REUSEPORT` will not spread load
-/// across identical sockets at all — this is the only way that funnel widens.
-///
-/// It routes rather than feeding one connection, because the four-tuple it is
-/// bound to does not name one. Two connections to the same peer share an
-/// address pair — that is what the socket id is for — so a socket connected to
-/// that peer receives both, and handing everything to whichever connection
-/// happened to create it starves the other. Routing also means two of these on
-/// one four-tuple are merely wasteful rather than wrong, so no bookkeeping is
-/// needed to prevent them.
-///
-/// Sends are not its business: those leave by the endpoint's socket, which
-/// shares this one's port, so a peer sees one source address either way.
-async fn run_peer_reader(socket: UdpSocket, peer: SocketAddr, ep: Arc<EndpointInner>) {
-    let Ok(io) = BatchIo::new(&socket) else { return };
-    let mut rx = RecvBuffers::new(&io);
-    loop {
-        let count = match io.recv_batch(&socket, &mut rx.storage, &mut rx.metas).await {
-            Ok(n) => n,
-            Err(e) if crate::util::is_transient(&e) => continue,
-            Err(_) => return,
-        };
-        if ep.is_spent() {
-            return;
-        }
-        for i in 0..count {
-            // Connected, so the kernel has already filtered by source. Checked
-            // anyway: it is what every route below is keyed on.
-            if rx.metas[i].addr != peer {
-                continue;
-            }
-            let mut offered_handshake = false;
-            for datagram in rx.take_datagrams(i) {
-                PEER_READ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let mut fanout: Vec<mpsc::Sender<Inbound>> = Vec::new();
-                let mut unaddressed = false;
-                let route = match ep.routes.read() {
-                    Ok(routes) => match routes.route(&datagram.bytes, &peer) {
-                        Route::Connection(tx) => Some(tx.clone()),
-                        Route::Unaddressed(list) => {
-                            unaddressed = true;
-                            fanout.extend(list.iter().map(|(_, tx)| tx.clone()));
-                            fanout.pop()
-                        }
-                        Route::Unknown => None,
-                    },
-                    Err(_) => None,
-                };
-                for extra in &fanout {
-                    let _ = extra.try_send(datagram.clone());
-                }
-                if unaddressed && !offered_handshake {
-                    offered_handshake = true;
-                    handle_handshake(&ep, peer, datagram.bytes.clone()).await;
-                }
-                match route {
-                    Some(tx) => {
-                        if let Err(mpsc::error::TrySendError::Full(d)) = tx.try_send(datagram)
-                            && tx.send(d).await.is_err()
-                        {
-                            return;
-                        }
-                    }
-                    None => {
-                        if !offered_handshake {
-                            offered_handshake = true;
-                            handle_handshake(&ep, peer, datagram.bytes).await;
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Datagrams that arrived on a per-destination socket rather than the
-/// endpoint's own, process-wide.
-///
-/// Only the tests read it. The whole mechanism is an optimisation the kernel
-/// may decline — the endpoint's reader serves the connection either way — so
-/// without a count there is no way to tell "the kernel routed it here" from
-/// "the socket was never created", and both look like a passing test.
-pub(crate) static PEER_READ: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 /// Feed a datagram from an unrouted peer to the listener, if there is one.
 async fn handle_handshake(ep: &Arc<EndpointInner>, from: SocketAddr, datagram: Bytes) {
     let mut events = Vec::new();
@@ -810,61 +707,5 @@ async fn handle_handshake(ep: &Arc<EndpointInner>, from: SocketAddr, datagram: B
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::Ordering;
-
-    /// The per-destination socket has to actually carry traffic.
-    ///
-    /// Everything here is arranged so that failing to create one, or a kernel
-    /// that ignores the more specific binding, costs nothing but speed — which
-    /// means every other test passes whether this works or not. Only a count of
-    /// what arrived that way can tell the two apart.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_connection_reads_its_own_socket() {
-        let server_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
-        let addr = server_ep.local_addr();
-        let listener = server_ep.listen(4).unwrap();
-        let client_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
-
-        let before = PEER_READ.load(Ordering::Relaxed);
-        let (server, client) = tokio::join!(async { listener.accept().await.unwrap() }, async {
-            client_ep.connect(addr).await.unwrap().await.unwrap()
-        });
-
-        // Enough that the reply cannot all ride the handshake.
-        for _ in 0..8 {
-            client.send(&[7u8; 4096]).await.unwrap();
-            let mut buf = vec![0u8; 8192];
-            let n = server.recv(&mut buf).await.unwrap();
-            server.send(&buf[..n]).await.unwrap();
-            client.recv(&mut buf).await.unwrap();
-        }
-
-        let read = PEER_READ.load(Ordering::Relaxed) - before;
-        assert!(
-            read > 0,
-            "no datagram reached a per-destination socket, so the port was never widened"
-        );
-    }
-
-    /// Sharing the port must not cost the error that says a port is taken.
-    ///
-    /// `SO_REUSEPORT` makes a second bind to a live port *succeed*, and on macOS
-    /// the newcomer takes the traffic rather than sharing it — so without care
-    /// this change would turn a loud failure into a silent hijack.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn binding_a_taken_port_still_fails() {
-        let held = Endpoint::bind("127.0.0.1:0").await.unwrap();
-        let addr = held.local_addr();
-        let err = match Endpoint::bind(addr).await {
-            Err(e) => e,
-            Ok(_) => panic!("a taken port was bound twice"),
-        };
-        assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "wrong error for a taken port: {err}");
     }
 }
