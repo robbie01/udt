@@ -583,7 +583,6 @@ mod tests {
         use udt_async::DisconnectReason;
 
         let (server, client) = new_listener_pair("127.0.0.1:0".parse().unwrap()).await;
-        assert_eq!(client.disconnect_reason(), None, "a live connection has no reason yet");
 
         // The peer going away cleanly is a shutdown, and it reads as one.
         drop(client);
@@ -593,11 +592,13 @@ mod tests {
             .expect("recv should not hang after the peer closed")
             .expect_err("recv should fail once the peer has gone");
 
+        // The reason rides the error, so the failure a caller is already
+        // holding is the whole answer — no second call to ask what went wrong.
+        let reason = err.get_ref().and_then(|e| e.downcast_ref::<DisconnectReason>()).copied();
         assert_eq!(
-            server.disconnect_reason(),
+            reason,
             Some(DisconnectReason::Shutdown),
-            "a clean peer close should be reported as one, got {:?}",
-            server.disconnect_reason()
+            "a clean peer close should be reported as one, got {reason:?} from {err}"
         );
         assert_eq!(
             err.kind(),

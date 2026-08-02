@@ -118,44 +118,27 @@ fn empty_check(buf: &[u8]) -> io::Result<()> {
 
 /// Turn a recorded reason into the error a caller sees.
 ///
-/// The kinds are a coarse hint for code that matches on them; the precise
-/// answer is [`Connection::disconnect_reason`], which loses nothing.
+/// The [`DisconnectReason`] travels *inside* the error rather than being left
+/// somewhere for the caller to ask about afterwards, so the failure already in
+/// hand is the whole answer. See the re-export in `lib.rs` for how a caller
+/// reads it back.
 pub(crate) fn closed_with(reason: Option<DisconnectReason>) -> io::Error {
-    let (kind, msg) = match reason {
-        Some(DisconnectReason::Shutdown) => {
-            (io::ErrorKind::ConnectionAborted, "peer closed the connection")
-        }
-        Some(DisconnectReason::LocalClose) => {
-            (io::ErrorKind::BrokenPipe, "connection closed locally")
-        }
-        Some(DisconnectReason::Timeout) => (io::ErrorKind::TimedOut, "peer stopped responding"),
-        Some(DisconnectReason::PeerError) => {
-            (io::ErrorKind::InvalidData, "peer sent something unusable, or rejected the handshake")
-        }
-        Some(DisconnectReason::PathMtu) => (
-            io::ErrorKind::Other,
-            "the path did not carry any full-size packet, though the peer answered — \
-             retry with a smaller MTU",
-        ),
-        None => (io::ErrorKind::BrokenPipe, "connection closed"),
+    let Some(reason) = reason else {
+        return io::Error::new(io::ErrorKind::BrokenPipe, "connection closed");
     };
-    io::Error::new(kind, msg)
+    let kind = match reason {
+        DisconnectReason::Shutdown => io::ErrorKind::ConnectionAborted,
+        DisconnectReason::LocalClose => io::ErrorKind::BrokenPipe,
+        DisconnectReason::Timeout => io::ErrorKind::TimedOut,
+        DisconnectReason::PeerError => io::ErrorKind::InvalidData,
+        DisconnectReason::PathMtu => io::ErrorKind::Other,
+    };
+    // The message comes from the reason's own `Display`, so there is one
+    // wording rather than two that can drift apart.
+    io::Error::new(kind, reason)
 }
 
 impl Connection {
-    /// Why the connection ended, or `None` while it is still up.
-    ///
-    /// The errors returned by [`send`](Self::send) and [`recv`](Self::recv)
-    /// carry a matching [`io::ErrorKind`], but several causes have no exact kind
-    /// and this does not lose them. [`DisconnectReason::PathMtu`] in particular
-    /// is worth acting on: the peer is reachable and the path will carry a
-    /// smaller packet, so reconnecting with a lower
-    /// [`EndpointConfig::mtu`](crate::EndpointConfig::mtu) is likely to work
-    /// where retrying unchanged will not.
-    pub fn disconnect_reason(&self) -> Option<DisconnectReason> {
-        self.reason.get().copied()
-    }
-
     /// A snapshot of the connection's protocol state.
     ///
     /// Round-trip estimate, congestion window, what is in flight, what is
@@ -185,7 +168,7 @@ impl Connection {
     }
 
     fn closed(&self) -> io::Error {
-        closed_with(self.disconnect_reason())
+        closed_with(self.reason.get().copied())
     }
 
     /// Sends a message, preserving order relative to earlier sends.

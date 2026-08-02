@@ -257,6 +257,28 @@ pub enum DisconnectReason {
     PathMtu,
 }
 
+impl std::fmt::Display for DisconnectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            DisconnectReason::Shutdown => "peer closed the connection",
+            DisconnectReason::Timeout => "peer stopped responding",
+            DisconnectReason::PeerError => {
+                "peer sent something unusable, or rejected the handshake"
+            }
+            DisconnectReason::LocalClose => "connection closed locally",
+            DisconnectReason::PathMtu => {
+                "the path did not carry any full-size packet, though the peer answered — \
+                 retry with a smaller MTU"
+            }
+        };
+        f.write_str(s)
+    }
+}
+
+/// So an IO layer can put one *inside* the error it returns, rather than
+/// keeping it somewhere for the caller to go and ask for afterwards.
+impl std::error::Error for DisconnectReason {}
+
 /// Result of offering a message to [`Connection::send_msg`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendOutcome {

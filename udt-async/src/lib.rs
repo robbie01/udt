@@ -104,5 +104,29 @@ pub use udt_proto::MAX_EARLY_MESSAGES;
 pub use udt_proto::CcKind;
 /// A snapshot of protocol state — see [`Connection::stats`].
 pub use udt_proto::ConnectionStats;
-/// Why a connection ended — see [`Connection::disconnect_reason`].
+/// Why a connection ended.
+///
+/// Attached to the [`io::Error`](std::io::Error) that reports the failure,
+/// rather than left on the connection for a caller to ask about afterwards —
+/// so the failure already in hand is the whole answer:
+///
+/// ```no_run
+/// use udt_async::DisconnectReason;
+/// # async fn f(conn: udt_async::Connection, buf: &mut [u8]) {
+/// match conn.recv(buf).await {
+///     Ok(n) => { let _ = n; }
+///     Err(e) => match e.get_ref().and_then(|e| e.downcast_ref::<DisconnectReason>()) {
+///         // The peer is reachable and the path will carry a smaller packet,
+///         // so reconnect with a lower `EndpointConfig::mtu`.
+///         Some(DisconnectReason::PathMtu) => {}
+///         // Anything else: the connection is over.
+///         _ => {}
+///     },
+/// }
+/// # }
+/// ```
+///
+/// The error's [`kind`](std::io::Error::kind) is the coarse hint for code that
+/// matches on kinds; several causes have no exact one, which is why the reason
+/// itself travels with it.
 pub use udt_proto::DisconnectReason;
