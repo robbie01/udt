@@ -56,6 +56,13 @@
 //! than many small ones is the single biggest throughput lever — a few hundred
 //! kilobytes per `send` is a reasonable target for bulk transfer.
 //!
+//! At those sizes the copy in and out of a `&[u8]` starts to matter, so every
+//! send and receive has a `_bytes` form taking or returning an owned [`Bytes`]
+//! instead: [`Connection::send_bytes`], [`Connection::recv_bytes`] and their
+//! `try_` and `_with` variants. The three choices — waiting or not, borrowed or
+//! owned, with delivery options or without — are independent, so all twelve
+//! combinations exist.
+//!
 //! # Feature flags
 //!
 //! * `tokio` *(enabled by default)* — the Tokio driver, everything documented
@@ -81,6 +88,11 @@ mod driver;
 mod endpoint;
 mod util;
 
+/// The owned buffer the `_bytes` sends and receives use.
+///
+/// Re-exported because half the message API names it, and a caller should not
+/// have to take a dependency on `bytes` — at a matching version — to use it.
+pub use bytes::Bytes;
 pub use conn::{Connecting, Connection, SendOptions};
 pub use endpoint::{
     DEFAULT_MTU, Endpoint, EndpointConfig, Listener, MAX_PAYLOAD_SIZE, max_payload_for_mtu,

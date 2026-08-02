@@ -243,7 +243,7 @@ impl Connection {
     /// [`ErrorKind::WouldBlock`]: std::io::ErrorKind::WouldBlock
     /// [`ErrorKind::BrokenPipe`]: std::io::ErrorKind::BrokenPipe
     pub fn try_send(&self, buf: &[u8]) -> io::Result<()> {
-        self.try_send_with(buf, SendOptions::new())
+        self.try_send_bytes_with(Bytes::copy_from_slice(buf), SendOptions::new())
     }
 
     /// [`try_send`](Self::try_send) with the options of
@@ -253,9 +253,27 @@ impl Connection {
     ///
     /// As [`try_send`](Self::try_send).
     pub fn try_send_with(&self, buf: &[u8], opts: SendOptions) -> io::Result<()> {
-        empty_check(buf)?;
-        let req = opts.into_req(Bytes::copy_from_slice(buf));
-        self.send_tx.try_send(req).map_err(|e| match e {
+        self.try_send_bytes_with(Bytes::copy_from_slice(buf), opts)
+    }
+
+    /// [`try_send`](Self::try_send) of an owned buffer, avoiding a copy.
+    ///
+    /// # Errors
+    ///
+    /// As [`try_send`](Self::try_send).
+    pub fn try_send_bytes(&self, buf: Bytes) -> io::Result<()> {
+        self.try_send_bytes_with(buf, SendOptions::new())
+    }
+
+    /// [`try_send_bytes`](Self::try_send_bytes) with the options of
+    /// [`send_with`](Self::send_with).
+    ///
+    /// # Errors
+    ///
+    /// As [`try_send`](Self::try_send).
+    pub fn try_send_bytes_with(&self, buf: Bytes, opts: SendOptions) -> io::Result<()> {
+        empty_check(&buf)?;
+        self.send_tx.try_send(opts.into_req(buf)).map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => {
                 io::Error::new(io::ErrorKind::WouldBlock, "send queue full")
             }
@@ -298,8 +316,18 @@ impl Connection {
     ///
     /// [`ErrorKind::WouldBlock`]: std::io::ErrorKind::WouldBlock
     pub fn try_recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let msg = self.try_recv_bytes()?;
+        Ok(copy_into(&msg, buf))
+    }
+
+    /// [`try_recv`](Self::try_recv) as an owned buffer, avoiding a copy.
+    ///
+    /// # Errors
+    ///
+    /// As [`try_recv`](Self::try_recv).
+    pub fn try_recv_bytes(&self) -> io::Result<Bytes> {
         match self.recv_rx.try_recv() {
-            Ok(msg) => Ok(copy_into(&msg, buf)),
+            Ok(msg) => Ok(msg),
             Err(flume::TryRecvError::Empty) => {
                 Err(io::Error::new(io::ErrorKind::WouldBlock, "no message ready"))
             }
@@ -487,12 +515,36 @@ impl Connecting {
     ///
     /// As [`try_send`](Self::try_send).
     pub fn try_send_with(&self, buf: &[u8], opts: SendOptions) -> io::Result<()> {
-        self.conn.as_ref().expect("polled to completion").try_send_with(buf, opts)
+        self.try_send_bytes_with(Bytes::copy_from_slice(buf), opts)
+    }
+
+    /// [`try_send`](Self::try_send) of an owned buffer, avoiding a copy.
+    ///
+    /// # Errors
+    ///
+    /// As [`try_send`](Self::try_send).
+    pub fn try_send_bytes(&self, buf: Bytes) -> io::Result<()> {
+        self.try_send_bytes_with(buf, SendOptions::new())
+    }
+
+    /// [`try_send_bytes`](Self::try_send_bytes) with the options of
+    /// [`Connection::send_with`].
+    ///
+    /// # Errors
+    ///
+    /// As [`try_send`](Self::try_send).
+    pub fn try_send_bytes_with(&self, buf: Bytes, opts: SendOptions) -> io::Result<()> {
+        self.conn.as_ref().expect("polled to completion").try_send_bytes_with(buf, opts)
     }
 
     /// The address being connected to.
     pub fn peer_addr(&self) -> SocketAddr {
         self.conn.as_ref().expect("polled to completion").peer_addr()
+    }
+
+    /// The local address the handshake is being sent from.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.conn.as_ref().expect("polled to completion").local_addr()
     }
 }
 
@@ -535,6 +587,50 @@ mod tests {
             SendReq::Data { ttl_ms, .. } => ttl_ms,
             _ => panic!("expected a data request"),
         }
+    }
+
+    /// The message API is a grid, and a grid with holes in it is worse than a
+    /// smaller API: the caller who wants the one missing combination has to
+    /// find out by failing to compile, then work out whether the gap is
+    /// deliberate. Every axis is independent here — waiting or not, borrowed or
+    /// owned, with options or without — so every combination exists.
+    ///
+    /// Referenced but never run: what is being asserted is that it type-checks.
+    #[test]
+    fn the_message_api_is_a_complete_grid() {
+        let _ = connection_grid;
+        let _ = connecting_grid;
+    }
+
+    async fn connection_grid(c: &Connection, buf: &mut [u8], owned: Bytes) {
+        let o = SendOptions::new();
+        // {'', try_} x {send, send_with} x {'', _bytes}
+        let _: io::Result<()> = c.send(buf).await;
+        let _: io::Result<()> = c.send_with(buf, o).await;
+        let _: io::Result<()> = c.send_bytes(owned.clone()).await;
+        let _: io::Result<()> = c.send_bytes_with(owned.clone(), o).await;
+        let _: io::Result<()> = c.try_send(buf);
+        let _: io::Result<()> = c.try_send_with(buf, o);
+        let _: io::Result<()> = c.try_send_bytes(owned.clone());
+        let _: io::Result<()> = c.try_send_bytes_with(owned, o);
+        // {'', try_} x {recv} x {'', _bytes}
+        let _: io::Result<usize> = c.recv(buf).await;
+        let _: io::Result<Bytes> = c.recv_bytes().await;
+        let _: io::Result<usize> = c.try_recv(buf);
+        let _: io::Result<Bytes> = c.try_recv_bytes();
+    }
+
+    /// The same, for what a handshake in flight can offer: sending only, and
+    /// only without waiting. See [`Connecting::try_send`] for why the other
+    /// halves of the grid would be meaningless there rather than merely absent.
+    fn connecting_grid(c: &Connecting, buf: &[u8], owned: Bytes) {
+        let o = SendOptions::new();
+        let _: io::Result<()> = c.try_send(buf);
+        let _: io::Result<()> = c.try_send_with(buf, o);
+        let _: io::Result<()> = c.try_send_bytes(owned.clone());
+        let _: io::Result<()> = c.try_send_bytes_with(owned, o);
+        let _: SocketAddr = c.peer_addr();
+        let _: SocketAddr = c.local_addr();
     }
 
     /// A deadline shorter than the wire's resolution must not become zero.
