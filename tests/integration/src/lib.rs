@@ -154,21 +154,56 @@ mod tests {
             .await
             .expect("shutdown blocked behind a full send buffer");
 
-        // The driver is gone, so sending is over.
-        assert!(client.send(b"after").await.is_err(), "sending survived a shutdown");
-        let _ = tokio::time::timeout(Duration::from_secs(5), pusher).await;
-
-        // And the peer was told, rather than being left to time out.
-        let mut buf = vec![0u8; 131072];
-        let reason = loop {
-            match tokio::time::timeout(Duration::from_secs(5), server.recv(&mut buf)).await {
-                Ok(Ok(_)) => continue,
-                Ok(Err(e)) => {
-                    break e.get_ref().and_then(|e| e.downcast_ref::<DisconnectReason>()).copied();
-                }
-                Err(_) => panic!("the peer was never told the connection ended"),
+        // The driver is gone, so sending is over. Allowed a moment: `shutdown`
+        // returns as the driver breaks out of its loop, and the send channel
+        // closes a hair later when the driver's end of it drops.
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            while client.send(b"after").await.is_ok() {
+                tokio::task::yield_now().await;
             }
-        };
+        })
+        .await;
+        assert!(closed.is_ok(), "sending survived a shutdown");
+        let _ = tokio::time::timeout(Duration::from_secs(5), pusher).await;
+        // Held until here on purpose: dropping the peer would close the
+        // connection from the other side and prove nothing about `shutdown`.
+        drop(server);
+    }
+
+    /// And the peer is told, rather than being left to time out.
+    ///
+    /// Asserted on a quiet connection, deliberately. UDT's shutdown is a single
+    /// unacknowledged packet, so on a path whose buffers are overflowing — which
+    /// is the state the test above deliberately creates — it is exactly as
+    /// droppable as anything else, and nothing retransmits it. Asserting its
+    /// arrival there was a test that could only be flaky, and was: it passed on
+    /// macOS and failed on Linux, where the larger buffers make the backlog at
+    /// the moment of the abort that much deeper.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_tells_the_peer() {
+        let server_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+        let addr = server_ep.local_addr();
+        let listener = server_ep.listen(4).unwrap();
+        let client_ep = Endpoint::bind("127.0.0.1:0").await.unwrap();
+
+        let (server, client) = tokio::join!(async { listener.accept().await.unwrap() }, async {
+            client_ep.connect(addr).await.unwrap().await.unwrap()
+        });
+
+        client.send(b"one").await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = server.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"one");
+
+        tokio::time::timeout(Duration::from_secs(5), client.shutdown())
+            .await
+            .expect("shutdown hung on an idle connection");
+
+        let err = tokio::time::timeout(Duration::from_secs(5), server.recv(&mut buf))
+            .await
+            .expect("the peer was never told the connection ended")
+            .expect_err("recv should fail once the peer has shut down");
+        let reason = err.get_ref().and_then(|e| e.downcast_ref::<DisconnectReason>()).copied();
         assert_eq!(reason, Some(DisconnectReason::Shutdown), "peer saw {reason:?}");
     }
 
